@@ -2,7 +2,8 @@
 Library for generating robot vacuum scenarios.
 """
 
-model scenic.simulators.webots.model
+model scenic.simulators.webots.model    
+
 
 import numpy as np
 import trimesh
@@ -11,7 +12,6 @@ import random
 param numToys = 0
 param duration = 10
 
-## Class Definitions ##
 
 class Vacuum(WebotsObject):
     webotsName: "IROBOT_CREATE"
@@ -19,7 +19,10 @@ class Vacuum(WebotsObject):
     width: 0.335
     length: 0.335
     height: 0.07
-    customData: str(DiscreteRange(0, 2**32 - 1)) # Random seed for robot controller
+    customData:  "../../vacuum.scenic"
+    Supervisor: True
+    controller: "scenic_supervisor"
+    resetController: False
 
 # Floor uses builtin Webots floor to keep Vacuum Sensors from breaking
 # Not actually linked to WebotsObject because Webots floor is 2D

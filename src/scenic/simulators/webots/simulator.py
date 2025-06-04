@@ -77,6 +77,18 @@ class WebotsSimulation(Simulation):
         # directory to store proto files for adhoc webots objects
         self.tmpMeshDir = tempfile.mkdtemp()
 
+        self.left_motor = self.supervisor.getDevice("right wheel motor")
+        self.right_motor = self.supervisor.getDevice("left wheel motor")
+
+        self.left_motor.setPosition(float('inf'))
+        self.right_motor.setPosition(float('inf'))
+
+        self.left_motor.setVelocity(0)
+        self.right_motor.setVelocity(0)
+        print("motor velocity set")
+
+        self.actions = dict()
+
         timestep = supervisor.getBasicTimeStep() / 1000 if timestep is None else timestep
 
         super().__init__(scene, timestep=timestep, **kwargs)
@@ -205,9 +217,22 @@ class WebotsSimulation(Simulation):
             elif obj.resetController:
                 webotsObj.restartController()
 
-    def step(self):
+    def step(self): # action should be some low level control commands for the robot
+      
+        print("step was called : ")
         ms = round(1000 * self.timestep)
+        
+        print(f"Action was {self.actions}")
+
+        self.left_motor.setVelocity(self.actions[0]) # Here lets just pass an array with values for each motor
+        self.right_motor.setVelocity(self.actions[1])
         self.supervisor.step(ms)
+        print("motor velocity set with values")
+        print(self.left_motor.getVelocity(), self.right_motor.getVelocity())
+        print("/n")
+  
+        #self.supervisor.step(ms)
+        return [],[],[],[],[]
 
     def getProperties(self, obj, properties):
         webotsObj = getattr(obj, "webotsObject", None)
@@ -256,6 +281,18 @@ class WebotsSimulation(Simulation):
 
     def _getAdhocObjectName(self, i: int) -> str:
         return f"SCENIC_ADHOC_{i}"
+    
+    # Need to figure out how to do this
+
+    def get_reward(self): # "any dummy for now will be okay"
+        return 1
+    
+    def get_info(self):
+        return {}
+    
+    def get_obs(self):
+        return {}
+
 
 
 def getFieldSafe(webotsObject, fieldName):
@@ -292,3 +329,4 @@ def isPhysicsEnabled(webotsObject):
     if isinstance(webotsObject.webotsAdhoc, dict):
         return webotsObject.webotsAdhoc.get("physics", True)
     raise TypeError(f"webotsAdhoc must be None or a dictionary")
+

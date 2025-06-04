@@ -1,70 +1,48 @@
-from datetime import datetime
-import json
-from pathlib import Path
-import random
-import time
+from scenic.gym import ScenicGymEnv
+import scenic
+from scenic.simulators.newtonian_gym import NewtonianSimulator
+from scenic.simulators.webots import WebotsSimulator
+import numpy as np
+import gymnasium as gym
+import os
 
 from controller import Supervisor
-import numpy
 
-import scenic
-from scenic.simulators.webots import WebotsSimulator
-
-# HELPER DATA STRUCTURES & FUNCTIONS
-
-
-def getFilename(duration: int, numToys: int, iteration: int) -> str:
-    return f"vacuum_d{str(duration).zfill(2)}_t{str(numToys).zfill(3)}_i{str(iteration).zfill(2)}.json"
-
-
-# CONSTANTS
-
-SEED = 44
-# how many times perform simulations?
-ITERATION = 25  # Value used in CAV23 paper is 25
-# how long to run simulation for (minutes)
-DURATION = 5  # Value used in CAV23 paper is 5
-# number of toys to simulate
-NUM_TOYS_LIST = [0, 1, 2, 4, 8, 16]
-
-# save logs to `logs`
-output_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-output_dir.mkdir(parents=True, exist_ok=True)
-
+# Can use this and maybe do some synchronization with the robot controller
+ 
+print("Begining Supervisor Script")
 supervisor = Supervisor()
-path = supervisor.getCustomData()
+print("Supervisor node collected")
+simulator = WebotsSimulator(supervisor)
 
-for numToys in NUM_TOYS_LIST:
-    print(f"Loading Scenic scenario {path}")
-    params = {
-        "numToys": numToys,  # how many toys to place
-        "duration": DURATION,  # how long to run simulation for (minute)
-    }
-    scenario = scenic.scenarioFromFile(path, params=params)
-    for i in range(ITERATION):
-        simulator = WebotsSimulator(supervisor)
+# So maybe I can actually set some of the device controls here
 
-        iter_seed = SEED + i
-        filename = getFilename(duration=DURATION, numToys=numToys, iteration=i + 1)
-        if (output_dir / filename).is_file():
-            # print(f"Skipping simulation for {numToys} toys, #{i + 1} iteration because the file already exists")
-            continue
-        print("Calculate", filename)
+prefix = scenic.__file__[:-22]
+print(prefix)
+#prefix = "\c:\Users\ksv14\Downloads\TEMP\test\.venv\scenic\src"
 
-        ts = datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
+print(prefix + "examples/webots/vacuum/vacuum.scenic")
+scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scenic",
+                                   model="scenic.simulators.webots.model",
+                               mode2D=False)
 
-        random.seed(iter_seed)
-        numpy.random.seed(iter_seed)
+print("Creating env")
+env = ScenicGymEnv(scenario, simulator, None, max_steps=100,) # max_step is max step for an episode
+print("Env was created")
+env.reset()
+print("Env Reset")
+episode_over = False
 
-        scene, _ = scenario.generate(maxIterations=float("inf"))
-        sim_results = simulator.simulate(scene, timestep=0.25, verbosity=2).result
+while not episode_over:
 
-        s = json.dumps({"params": params, "results": sim_results.records}, indent=4)
-        with open(output_dir / filename, "x") as f:
-            f.write(s)
+    v1 = np.random.randint(0,5)
+    v2 = np.random.randint(0,5)
+    action = [v1,v2]
+    # edit
+    
+    observation, reward, terminated, truncated, info = env.step(action=action)
+    print(observation)
+    episode_over = terminated or truncated
 
-        time.sleep(1)
+env.close()
 
-        supervisor.worldReload()
-
-supervisor.simulationQuit(0)
