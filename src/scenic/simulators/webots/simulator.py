@@ -30,7 +30,6 @@ from scenic.core.vectors import Vector
 from scenic.simulators.webots.utils import ENU, WebotsCoordinateSystem
 from controller import DistanceSensor
 
-
 class WebotsSimulator(Simulator):
     """`Simulator` object for Webots.
 
@@ -79,6 +78,8 @@ class WebotsSimulation(Simulation):
         # directory to store proto files for adhoc webots objects
         self.tmpMeshDir = tempfile.mkdtemp()
 
+        self.supervisor_node = self.supervisor.getSelf()
+
         self.left_motor = self.supervisor.getDevice("right wheel motor")
         self.right_motor = self.supervisor.getDevice("left wheel motor")
 
@@ -96,11 +97,14 @@ class WebotsSimulation(Simulation):
 
         self.left_motor.setVelocity(0)
         self.right_motor.setVelocity(0)
+
+
+        self.covered_spaces = []
         print("motor velocity set")
 
 
         self.enable_sensors = False
-        self.actions = dict()
+        self.actions = {}
 
         super().__init__(scene, timestep=timestep, **kwargs)
 
@@ -132,11 +136,13 @@ class WebotsSimulation(Simulation):
             protoName = (
                 "ScenicObjectWithPhysics" if isPhysicsEnabled(obj) else "ScenicObject"
             )
+          
             print("TESTING DELETE THIS LINE") # Temporary fix, not sure if this is the right way to do this? hmm
             print(objFilePath, type(objFilePath))
             objFilePath = str(objFilePath).replace("\\", "\\\\")
             print(objFilePath)
             print("TESTING COMPLETE")
+
             protoDef = dedent(
                 f"""
                 DEF {name} {protoName} {{
@@ -238,14 +244,13 @@ class WebotsSimulation(Simulation):
     def step(self): # action should be some low level control commands for the robot
         ms = round(1000 * self.timestep)
         if self.enable_sensors: 
-            print(f"Action was {self.actions}")
-
+          #  print(f"Action was {self.actions}")
             self.left_motor.setVelocity(self.actions[0]) # Here lets just pass an array with values for each motor
             self.right_motor.setVelocity(self.actions[1])
             self.supervisor.step(ms)
-            print("motor velocity set with values")
-            print(self.left_motor.getVelocity(), self.right_motor.getVelocity())
-            print("/n")
+          #  print("motor velocity set with values")
+          #  print(self.left_motor.getVelocity(), self.right_motor.getVelocity())
+          #  print("/n")
   
         #self.supervisor.step(ms)
         else:
@@ -259,7 +264,7 @@ class WebotsSimulation(Simulation):
             self.right_wheel_sensor.enable(ms)
             self.enable_sensors = True
 
-        return []
+        return [] # I don't actually think anything needs to be returned here? 
 
     def getProperties(self, obj, properties):
         webotsObj = getattr(obj, "webotsObject", None)
@@ -312,17 +317,29 @@ class WebotsSimulation(Simulation):
     # Need to figure out how to do this
 
     def get_reward(self): # "any dummy for now will be okay"
-        return 1
+        pos = np.array(self.supervisor_node.getPosition()[:2])
+        pos = np.round(pos, decimals=2)
+        print(pos.shape)
+        print(f"position was {pos},: {type(pos)}")
+        if [pos[0],pos[1]] not in self.covered_spaces:
+            self.covered_spaces.append([pos[0],pos[1]])
+            reward = 1
+        else:
+            reward = 0
+        return reward
     
     def get_info(self):
-        
         return {}
      
     def get_obs(self):
         if (isinstance(self.actions, dict)):
-            return {}
+            return [0,0,0,0,0,0,0,0]
         else:
-            return {"velocity_left":self.actions[0], 
+            return [self.actions[0], self.actions[1], self.sensor_left.getValue(), self.sensor_right.getValue(), 
+                    self.sensor_front_right.getValue(), self.sensor_front_left.getValue(),
+                    self.left_wheel_sensor.getValue(), self.right_wheel_sensor.getValue()]
+        
+            """return {"velocity_left":self.actions[0], 
                 "velocity_right":self.actions[1], 
                 "sensor_left":self.sensor_left.getValue(),
                 "sensor_right":self.sensor_right.getValue(),
@@ -330,7 +347,7 @@ class WebotsSimulation(Simulation):
                 "sensor_front_left" : self.sensor_front_left.getValue(),
                 "left_wheel_sensor" : self.left_wheel_sensor.getValue(),
                 "right_wheel_sensor": self.right_wheel_sensor.getValue()
-                } 
+                } """ 
 
 
 
