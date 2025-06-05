@@ -4,6 +4,7 @@ from scenic.simulators.newtonian_gym import NewtonianSimulator
 from scenic.simulators.webots import WebotsSimulator
 
 import gymnasium as gym
+from stable_baselines3 import PPO
 import os
 
 from controller import Supervisor,robot
@@ -29,19 +30,25 @@ scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scen
 
 
 action_space = gym.spaces.Box(low=0.0, high=16.129,shape=(2,))
+observation_space = gym.spaces.Box(low=0, high=float('inf'),shape=(8,))
 
+env = ScenicGymEnv(scenario, 
+                   simulator, 
+                   None, 
+                   max_steps=100, 
+                   action_space=action_space,
+                   observation_space=observation_space) # max_step is max step for an episode
 
-env = ScenicGymEnv(scenario, simulator, None, max_steps=100) # max_step is max step for an episode
-env.reset()
-episode_over = False
-
-while not episode_over:
-
-
-    action = action_space.sample() 
-    observation, reward, terminated, truncated, info = env.step(action=action)
-    print(observation)
-    episode_over = terminated or truncated
+for _ in range(10):
+    env.reset()
+    env.step([0,0])
+    episode_over = False
+    while not episode_over:
+        action = action_space.sample() 
+        observation, reward, terminated, truncated, info = env.step(action=action)
+        print(f"reward: {reward}")
+        episode_over = terminated or truncated
 
 env.close()
+
 
