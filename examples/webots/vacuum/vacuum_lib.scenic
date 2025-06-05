@@ -40,6 +40,7 @@ class Wall(WebotsObject):
     height: 0.5
     color: [0.627, 0.627, 0.627]
 
+
 class DiningTable(WebotsObject):
     webotsAdhoc: {'physics': True}
     shape: MeshShape.fromFile(localPath("../../../assets/meshes/dining_table.obj.bz2"))
@@ -87,7 +88,7 @@ class Toy(WebotsObject):
     length: 0.1
     height: 0.1
     density: 100
-    color: [1, 0.502, 0]
+    color: [1, 0.502, 1]
 
 class BlockToy(Toy):
     shape: BoxShape()
