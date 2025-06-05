@@ -2,11 +2,11 @@ from scenic.gym import ScenicGymEnv
 import scenic
 from scenic.simulators.newtonian_gym import NewtonianSimulator
 from scenic.simulators.webots import WebotsSimulator
-import numpy as np
+
 import gymnasium as gym
 import os
 
-from controller import Supervisor
+from controller import Supervisor,robot
 
 # Can use this and maybe do some synchronization with the robot controller
  
@@ -24,22 +24,21 @@ print(prefix)
 print(prefix + "examples/webots/vacuum/vacuum.scenic")
 scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scenic",
                                    model="scenic.simulators.webots.model",
-                               mode2D=False)
+                                   mode2D=False)
 
-print("Creating env")
-env = ScenicGymEnv(scenario, simulator, None, max_steps=100,) # max_step is max step for an episode
-print("Env was created")
+
+
+action_space = gym.spaces.Box(low=0.0, high=16.129,shape=(2,))
+
+
+env = ScenicGymEnv(scenario, simulator, None, max_steps=100) # max_step is max step for an episode
 env.reset()
-print("Env Reset")
 episode_over = False
 
 while not episode_over:
 
-    v1 = np.random.randint(0,5)
-    v2 = np.random.randint(0,5)
-    action = [v1,v2]
-    # edit
-    
+
+    action = action_space.sample() 
     observation, reward, terminated, truncated, info = env.step(action=action)
     print(observation)
     episode_over = terminated or truncated
