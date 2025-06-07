@@ -21,6 +21,7 @@ from os import path
 import tempfile
 from textwrap import dedent
 
+import numpy as np
 import trimesh
 
 from scenic.core.regions import MeshVolumeRegion
@@ -74,7 +75,7 @@ class WebotsSimulation(Simulation):
         self.nextAdHocObjectId = 1
         self.usedObjectNames = defaultdict(lambda: 0)
 
-        timestep = supervisor.getBasicTimeStep() / 1000 if timestep is None else timestep
+        self.timestep = supervisor.getBasicTimeStep() / 1000 if timestep is None else timestep
         # directory to store proto files for adhoc webots objects
         self.tmpMeshDir = tempfile.mkdtemp()
 
@@ -98,13 +99,13 @@ class WebotsSimulation(Simulation):
         self.left_motor.setVelocity(0)
         self.right_motor.setVelocity(0)
 
-
         self.covered_spaces = []
-        print("motor velocity set")
-
 
         self.enable_sensors = False
-        self.actions = {}
+        self.actions = [0,0]
+        self.observation =np.zeros(8) # TODO Need to fix obs and initialziation
+        self.ms = round(1000 * self.timestep)
+
 
         super().__init__(scene, timestep=timestep, **kwargs)
 
@@ -113,6 +114,8 @@ class WebotsSimulation(Simulation):
 
         # Reset Webots simulation
         self.supervisor.simulationResetPhysics()
+
+
 
     def createObjectInSimulator(self, obj):
         if not hasattr(obj, "webotsName"):
@@ -137,11 +140,8 @@ class WebotsSimulation(Simulation):
                 "ScenicObjectWithPhysics" if isPhysicsEnabled(obj) else "ScenicObject"
             )
           
-            print("TESTING DELETE THIS LINE") # Temporary fix, not sure if this is the right way to do this? hmm
-            print(objFilePath, type(objFilePath))
-            objFilePath = str(objFilePath).replace("\\", "\\\\")
-            print(objFilePath)
-            print("TESTING COMPLETE")
+ 
+            objFilePath = str(objFilePath).replace("\\", "\\\\")# Temporary fix, not sure if this is the right way to do this? hmm
 
             protoDef = dedent(
                 f"""
@@ -242,29 +242,27 @@ class WebotsSimulation(Simulation):
                 webotsObj.restartController()
 
     def step(self): # action should be some low level control commands for the robot
-        ms = round(1000 * self.timestep)
-        if self.enable_sensors: 
-          #  print(f"Action was {self.actions}")
-            self.left_motor.setVelocity(self.actions[0]) # Here lets just pass an array with values for each motor
-            self.right_motor.setVelocity(self.actions[1])
-            self.supervisor.step(ms)
-          #  print("motor velocity set with values")
-          #  print(self.left_motor.getVelocity(), self.right_motor.getVelocity())
-          #  print("/n")
-  
-        #self.supervisor.step(ms)
-        else:
-            self.sensor_right.enable(ms)
-            self.sensor_front_right.enable(ms)
+        if not self.enable_sensors:
+                self.init_step()
+        self.left_motor.setVelocity(self.actions[0]) 
+        self.right_motor.setVelocity(self.actions[1])
+      
+        self.observation = [self.actions[0], self.actions[1], self.sensor_left.getValue(), self.sensor_right.getValue(), 
+                            self.sensor_front_right.getValue(), self.sensor_front_left.getValue(),
+                            self.left_wheel_sensor.getValue(), self.right_wheel_sensor.getValue()]
+        self.supervisor.step(self.ms)
 
-            self.sensor_front_left.enable(ms)
-            self.sensor_left.enable(ms)
+    def init_step(self):
+        self.sensor_right.enable(self.ms)
+        self.sensor_front_right.enable(self.ms)
 
-            self.left_wheel_sensor.enable(ms)
-            self.right_wheel_sensor.enable(ms)
-            self.enable_sensors = True
+        self.sensor_front_left.enable(self.ms)
+        self.sensor_left.enable(self.ms)
 
-        return [] # I don't actually think anything needs to be returned here? 
+        self.left_wheel_sensor.enable(self.ms)
+        self.right_wheel_sensor.enable(self.ms)
+        self.enable_sensors = True
+
 
     def getProperties(self, obj, properties):
         webotsObj = getattr(obj, "webotsObject", None)
@@ -332,23 +330,21 @@ class WebotsSimulation(Simulation):
         return {}
      
     def get_obs(self):
-        if (isinstance(self.actions, dict)):
-            return [0,0,0,0,0,0,0,0]
-        else:
-            return [self.actions[0], self.actions[1], self.sensor_left.getValue(), self.sensor_right.getValue(), 
-                    self.sensor_front_right.getValue(), self.sensor_front_left.getValue(),
-                    self.left_wheel_sensor.getValue(), self.right_wheel_sensor.getValue()]
-        
-            """return {"velocity_left":self.actions[0], 
-                "velocity_right":self.actions[1], 
-                "sensor_left":self.sensor_left.getValue(),
-                "sensor_right":self.sensor_right.getValue(),
-                "sensor_front_right": self.sensor_front_right.getValue(),
-                "sensor_front_left" : self.sensor_front_left.getValue(),
-                "left_wheel_sensor" : self.left_wheel_sensor.getValue(),
-                "right_wheel_sensor": self.right_wheel_sensor.getValue()
-                } """ 
+        return self.observation
+    
+        """return {"velocity_left":self.actions[0], 
+            "velocity_right":self.actions[1], 
+            "sensor_left":self.sensor_left.getValue(),
+            "sensor_right":self.sensor_right.getValue(),
+            "sensor_front_right": self.sensor_front_right.getValue(),
+            "sensor_front_left" : self.sensor_front_left.getValue(),
+            "left_wheel_sensor" : self.left_wheel_sensor.getValue(),
+            "right_wheel_sensor": self.right_wheel_sensor.getValue()
+            } """ 
 
+    def reset(self):
+        super().reset()
+        self.init_step()
 
 
 def getFieldSafe(webotsObject, fieldName):
