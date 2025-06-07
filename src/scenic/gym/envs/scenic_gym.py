@@ -81,8 +81,6 @@ class ScenicGymEnv(gym.Env):
             observation, info = next(self.loop) # not doing self.scene.send(action) just yet
         else:
             observation, info = self.loop.throw(ResetException())
-
-
         return observation, info
         
     def step(self, action):
