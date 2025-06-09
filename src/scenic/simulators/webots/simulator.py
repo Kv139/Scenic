@@ -31,6 +31,7 @@ from scenic.core.vectors import Vector
 from scenic.simulators.webots.utils import ENU, WebotsCoordinateSystem
 from controller import DistanceSensor
 
+
 class WebotsSimulator(Simulator):
     """`Simulator` object for Webots.
 
@@ -98,14 +99,14 @@ class WebotsSimulation(Simulation):
 
         self.left_motor.setVelocity(0)
         self.right_motor.setVelocity(0)
+        self.velocity_ranges = [0,16.129]
 
         self.covered_spaces = []
 
         self.enable_sensors = False
         self.actions = [0,0]
-        self.observation =np.zeros(8) # TODO Need to fix obs and initialziation
+        self.observation = np.zeros(8) # TODO Need to fix obs and initialziation
         self.ms = round(1000 * self.timestep)
-
 
         super().__init__(scene, timestep=timestep, **kwargs)
 
@@ -243,14 +244,33 @@ class WebotsSimulation(Simulation):
 
     def step(self): # action should be some low level control commands for the robot
         if not self.enable_sensors:
+               # print("Protections failed sensors were not initialized before calling") 
+               # TODO more elegant fix here, sensor need to be adaquetly initialized before the simlation begins stepping
                 self.init_step()
+
+        self.transform_vel()
         self.left_motor.setVelocity(self.actions[0]) 
         self.right_motor.setVelocity(self.actions[1])
-      
-        self.observation = [self.actions[0], self.actions[1], self.sensor_left.getValue(), self.sensor_right.getValue(), 
+        print(self.actions) 
+        # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
+        self.observation = np.array([self.actions[0], self.actions[1], self.sensor_left.getValue(), self.sensor_right.getValue(), # ensures that null values are not returned from unintialized sensors
                             self.sensor_front_right.getValue(), self.sensor_front_left.getValue(),
-                            self.left_wheel_sensor.getValue(), self.right_wheel_sensor.getValue()]
+                            self.left_wheel_sensor.getValue(), self.right_wheel_sensor.getValue()])
+            
+        """return {"velocity_left":self.actions[0], 
+            "velocity_right":self.actions[1], 
+            "sensor_left":self.sensor_left.getValue(),
+            "sensor_right":self.sensor_right.getValue(),
+            "sensor_front_right": self.sensor_front_right.getValue(),
+            "sensor_front_left" : self.sensor_front_left.getValue(),
+            "left_wheel_sensor" : self.left_wheel_sensor.getValue(),
+            "right_wheel_sensor": self.right_wheel_sensor.getValue()
+            } """
+        
+        #print(self.observation)
+
         self.supervisor.step(self.ms)
+
 
     def init_step(self):
         self.sensor_right.enable(self.ms)
@@ -261,6 +281,8 @@ class WebotsSimulation(Simulation):
 
         self.left_wheel_sensor.enable(self.ms)
         self.right_wheel_sensor.enable(self.ms)
+
+        self.supervisor.step(self.ms) # Need to step the simulation once after initializing the sensors!
         self.enable_sensors = True
 
 
@@ -307,23 +329,26 @@ class WebotsSimulation(Simulation):
         for i in range(1, self.nextAdHocObjectId):
             name = self._getAdhocObjectName(i)
             node = self.supervisor.getFromDef(name)
-            node.remove()
-
+            if node is not None: # ensure that the node actually exisits in the simulation before destroying it
+                node.remove()
+            self.step() # TODO this fixe crashing error on repeated reset calls! I DO NOT KNOW WHY.... temp fix, need to figure out underlying cause
+    
     def _getAdhocObjectName(self, i: int) -> str:
         return f"SCENIC_ADHOC_{i}"
-    
-    # Need to figure out how to do this
+
 
     def get_reward(self): # "any dummy for now will be okay"
         pos = np.array(self.supervisor_node.getPosition()[:2])
         pos = np.round(pos, decimals=2)
-        print(pos.shape)
-        print(f"position was {pos},: {type(pos)}")
+
+        #TODO penalize the robo for running into objects
+        #     need to devise better reward func!
         if [pos[0],pos[1]] not in self.covered_spaces:
             self.covered_spaces.append([pos[0],pos[1]])
             reward = 1
         else:
-            reward = 0
+            reward = -1
+        
         return reward
     
     def get_info(self):
@@ -331,20 +356,10 @@ class WebotsSimulation(Simulation):
      
     def get_obs(self):
         return self.observation
-    
-        """return {"velocity_left":self.actions[0], 
-            "velocity_right":self.actions[1], 
-            "sensor_left":self.sensor_left.getValue(),
-            "sensor_right":self.sensor_right.getValue(),
-            "sensor_front_right": self.sensor_front_right.getValue(),
-            "sensor_front_left" : self.sensor_front_left.getValue(),
-            "left_wheel_sensor" : self.left_wheel_sensor.getValue(),
-            "right_wheel_sensor": self.right_wheel_sensor.getValue()
-            } """ 
-
-    def reset(self):
-        super().reset()
-        self.init_step()
+        
+    def transform_vel(self): 
+        self.actions[0] *= self.velocity_ranges[0]
+        self.actions[1] *= self.velocity_ranges[1]
 
 
 def getFieldSafe(webotsObject, fieldName):
