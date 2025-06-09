@@ -35,7 +35,7 @@ env = ScenicGymEnv(scenario,
                    max_steps=1000, 
                    action_space=action_space,
                    observation_space=observation_space) # max_step is max step for an episode
-
+#TODO FIX THIS -> WARNING: DEF IROBOT_CREATE Create > HingeJoint CREATE_LEFT_WHEEL > RotationalMotor "left wheel motor": The requested velocity 260.145 exceeds 'maxVelocity' = 16.129.
 
 #check_env(env, skip_render_check=True)
 
