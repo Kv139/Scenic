@@ -25,8 +25,8 @@ scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scen
 
 
 action_space = gym.spaces.Box(low=-1.0, high=1.0 ,shape=(2,))  # Defines the possible actions of the agent
-observation_space = gym.spaces.Box(low=0, high=float('10000'),shape=(8,),dtype=np.float64) # defines the range of observations of the agent
-max_steps = 5000
+observation_space = gym.spaces.Box(low=np.array([-1,-1,0,0,0,0]), high=np.array([1,1,1,1,1,1]),shape=(6,),dtype=np.float64) # defines the range of observations of the agent
+max_steps = 1000
 env = ScenicGymEnv(scenario, 
                    simulator, 
                    render_mode=None, 
@@ -34,9 +34,7 @@ env = ScenicGymEnv(scenario,
                    action_space=action_space,
                    observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
 
-#TODO FIX THIS -> WARNING: DEF IROBOT_CREATE Create > HingeJoint CREATE_LEFT_WHEEL > RotationalMotor "left wheel motor": The requested velocity 260.145 exceeds 'maxVelocity' = 16.129.
-
-episodes=50
+episodes=20
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
