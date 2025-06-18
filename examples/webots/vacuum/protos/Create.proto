@@ -541,44 +541,72 @@ Robot {
     }
     DEF CREATE_CLIFF_SENSOR_RIGHT DistanceSensor {
       translation 0.07 -0.15 -0.0
-      rotation 0.707108 0 -0.707106 -3.14158
+      rotation 0.707108 0 -0.707106 0
       name "cliff_right"
       lookupTable [
-        0 4095 0
-        0.2 0 0
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
       ]
-      type "infra-red"
+      type "generic"
     }
     DEF CREATE_CLIFF_SENSOR_FRONT_RIGHT DistanceSensor {
       translation 0.15 -0.04 0
-      rotation 0.707108 0 -0.707106 -3.14158
+      rotation 0.707108 0 -0.707106 0
       name "cliff_front_right"
       lookupTable [
-        0 4095 0
-        0.2 0 0
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
       ]
-      type "infra-red"
+      type "generic"
     }
+
     DEF CREATE_CLIFF_SENSOR_FRONT_LEFT DistanceSensor {
       translation 0.15 0.04 0
-      rotation 0.707108 0 -0.707106 -3.14158
+      rotation 0.707108 0 -0.707106 0
       name "cliff_front_left"
       lookupTable [
-        0 4095 0
-        0.2 0 0
+        0  0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
       ]
-      type "infra-red"
+      type "generic"
     }
     DEF CREATE_CLIFF_SENSOR_LEFT DistanceSensor {
       translation 0.07 0.15 0.0
-      rotation 0.707108 0 -0.707106 -3.14158
+      rotation 0.707108 0 -0.707106 0
       name "cliff_left"
       lookupTable [
-        0 4095 0
-        0.2 0 0
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
       ]
-      type "infra-red"
+      type "generic"
     }
+
+        DEF CREATE_CLIFF_SENSOR_BACK DistanceSensor {
+      translation -0.16 0.0 0.0
+      rotation 0.0 0.131 -0.0991 3.14
+      name "cliff_back"
+      lookupTable [
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
+      ]
+      type "generic"
+    }
+    
   ]
   name IS name
   model "IRobot Create"
