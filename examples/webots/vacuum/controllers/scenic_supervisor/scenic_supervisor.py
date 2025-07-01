@@ -12,6 +12,8 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3 import SAC,PPO
 
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
+
 
 
  
@@ -27,7 +29,7 @@ scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scen
 
 
 action_space = gym.spaces.Box(low=-1.0, high=1.0 ,shape=(2,))  # Defines the possible actions of the agent
-observation_space = gym.spaces.Box(low=np.array([-1,-1,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1]),shape=(7,),dtype=np.float64) # defines the range of observations of the agent
+observation_space = gym.spaces.Box(low=np.array([-1,-1,0,0,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1,0,5.09,5.09]),shape=(9,),dtype=np.float64) # defines the range of observations of the agent
 max_steps = 5000
 env = ScenicGymEnv(scenario, 
                    simulator, 
@@ -38,16 +40,19 @@ env = ScenicGymEnv(scenario,
 
 env = Monitor(env)
 
-episodes=100
+episodes=200
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MlpPolicy", env, verbose=2, n_steps=10)  # Create an instance of an agent 
-#model.set_parameters("PPO_vacuum_agent")
+model = PPO("MlpPolicy", env, verbose=2,device='cpu', n_steps=1024)  # Create an instance of an agent 
+#model = PPO.load("PPO_vacuum_agent")
 model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-#model.save("PPO_vacuum_agent")                       # Save the model after training
+model.save("PPO_vacuum_agent")                       # Save the model after training
 
-print(f"episode rewards were {env.get_episode_rewards()}")
+mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=False)
+
+print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
+
 
 
 
