@@ -10,7 +10,7 @@ from controller import Supervisor
 
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3 import SAC,PPO
-
+from stable_baselines3.common.monitor import Monitor
 
  
 supervisor = Supervisor() # Collect the Supervisor node from the simulation
@@ -33,18 +33,26 @@ env = ScenicGymEnv(scenario,
                    max_steps=max_steps, 
                    action_space=action_space,
                    observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
+env = Monitor(env)
 
-episodes=20
+episodes= 40
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
 model = PPO("MlpPolicy", env, verbose=2) # Create an instance of an agent 
-model.set_parameters("PPO_vacuum_agent")
-model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-model.save("PPO_vacuum_agent")               # Save the model after training
-
-
-
+#model.set_parameters("PPO_vacuum_agent")   # make green when training ----------------
+model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps 
+model.save("PPO_vacuum_agent")               # Save the model after training; u want to make it green when testing--------------
+rewards_per_step = np.array(env.get_episode_rewards()) / np.array(env.get_total_steps())
+negative = False
+for i in range(len(rewards_per_step)):
+    if rewards_per_step[i] <= 0:
+        negative = True
+        break
+total_pc = 0
+for i in range(1, len(rewards_per_step)):
+    total_pc += (rewards_per_step[i] - rewards_per_step[i - 1]) / np.abs(rewards_per_step[i - 1])
+print("Average normalized percent difference: " + str(total_pc / (len(rewards_per_step) - 1)))
 
 
 
