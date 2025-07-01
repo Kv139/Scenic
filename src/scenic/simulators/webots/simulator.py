@@ -105,11 +105,18 @@ class WebotsSimulation(Simulation):
 
         self.covered_spaces = []
         self.invalid_action = False
+        self.total_reward = 0
 
         self.enable_sensors = False
         self.actions = [0,0]
         self.observation = np.zeros(7) # TODO Need to fix obs and initialziation
         self.ms = round(1000 * self.timestep)
+
+        self.room_width = 5.09    # meters — change as needed
+        self.room_length = 5.09   # meters — change as needed
+        self.granularity = 0.05    # meters (matches rounding precision)
+
+        self.total_spaces = int((self.room_width / self.granularity) * (self.room_length / self.granularity))
 
 
         super().__init__(scene, timestep=timestep, **kwargs)
@@ -321,41 +328,69 @@ class WebotsSimulation(Simulation):
 
     def destroy(self):
         # Destroy adhoc objects generated at the beginning of the simulation
+        print(f" total episode reward was {self.total_reward}")
+
         for i in range(1, self.nextAdHocObjectId):
             name = self._getAdhocObjectName(i)
             node = self.supervisor.getFromDef(name)
             if node is not None: # ensure that the node actually exisits in the simulation before destroying it
                 node.remove()
-            self.step() # TODO this fixe crashing error on repeated reset calls! I DO NOT KNOW WHY.... temp fix, need to figure out underlying cause
+            self.supervisor.step(self.ms) # TODO this fixe crashing error on repeated reset calls! I DO NOT KNOW WHY.... temp fix, need to figure out underlying cause
     
     def _getAdhocObjectName(self, i: int) -> str:
         return f"SCENIC_ADHOC_{i}"
+
+    def get_coverage_reward(self, granularity, pos, circle: bool):
+        if not circle:
+            if pos not in self.covered_spaces:
+                self.covered_spaces.append(pos)
+                return 1
+            else:
+                return 0
+        else:
+            reward = 0
+            #important parameter
+            radius = .335/2
+            x_range = np.arange(pos[0] - radius - granularity, pos[0] + radius + granularity, granularity)
+            y_range = np.arange(pos[1] - radius - granularity, pos[1] + radius + granularity, granularity)
+            x_range_combined, y_range_combined = np.meshgrid(x_range, y_range, indexing="xy")
+            mask = (x_range_combined - pos[0])**2 + (y_range_combined - pos[1])**2 <= radius**2
+            circle_points = [(x, y) for x, y in np.vstack((x_range_combined[mask], y_range_combined[mask])).T]
+            for point in circle_points:
+                if(point not in self.covered_spaces):
+                    reward += 1
+                    self.covered_spaces.append(point)
+            return reward * (len(self.covered_spaces) / self.total_spaces)
+    
 
 
     def get_reward(self): # "any dummy for now will be okay"
         """
         Calculate the reward based off of the current state
         """
-        pos = np.array(self.supervisor_node.getPosition()[:2])
-        pos = np.round(pos, decimals=2) 
-        #TODO penalize the robo for running into objects
-        #     need to devise better reward func!
-        #     having some issue understanding/working with
-        #     sensors
-        if [pos[0],pos[1]] not in self.covered_spaces:
-            self.covered_spaces.append([pos[0],pos[1]])
-            reward = 1
-        elif self.invalid_action:
+        pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
+        reward = 0
+        reward += self.get_coverage_reward(self.granularity, [pos[0], pos[1]], True)
+
+        if reward == 0:
+            reward += -1 
+        if self.invalid_action:
             reward = -100
             self.invalid_action = False
-        elif (np.any(self.observation[2:] < 0.1) ): # if any distance sensor is low penalize
-            reward = -10
-        elif (self.bumper_left == 1) or (self.bumper_right == 0):
-             reward = -10  #always penalize bumper ? 
-        else:
-            reward = -1 
 
-        print(self.observation,"\n" ,reward)
+        if np.all(self.observation[:2] > 0):
+            reward += .1 # small reward for driving forward
+
+        if (np.any(self.observation[2:] < 0.1) ): # if any distance sensor is low penalize
+            vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
+            reward += -abs(vm)/self.velocity_ranges[1]        
+        elif (self.bumper_left == 1) or (self.bumper_right == 1):
+            vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
+            reward += -abs(vm)/self.velocity_ranges[1]
+
+        self.total_reward += reward
+
+        print(self.observation,"\n" ,reward)  
         return reward
     
     def get_info(self):
