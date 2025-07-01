@@ -593,7 +593,7 @@ Robot {
       type "generic"
     }
 
-        DEF CREATE_CLIFF_SENSOR_BACK DistanceSensor {
+    DEF CREATE_CLIFF_SENSOR_BACK DistanceSensor {
       translation -0.16 0.0 0.0
       rotation 0.0 0.131 -0.0991 3.14
       name "cliff_back"
