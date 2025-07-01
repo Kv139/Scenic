@@ -20,6 +20,8 @@ back_wall = new Wall at (0, -wall_offset, 0.25), facing toward floor
 
 # Place vacuum on floor
 ego = new Vacuum on floor
+
+
 """
 
 # Create a "safe zone" around the vacuum so that it does not start stuck
