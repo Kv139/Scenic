@@ -11,6 +11,8 @@ from controller import Supervisor
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3 import SAC,PPO
 
+from stable_baselines3.common.monitor import Monitor
+
 
  
 supervisor = Supervisor() # Collect the Supervisor node from the simulation
@@ -34,16 +36,18 @@ env = ScenicGymEnv(scenario,
                    action_space=action_space,
                    observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
 
-episodes=20
+env = Monitor(env)
+
+episodes=100
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MlpPolicy", env, verbose=2) # Create an instance of an agent 
-model.set_parameters("PPO_vacuum_agent")
+model = PPO("MlpPolicy", env, verbose=2, n_steps=10)  # Create an instance of an agent 
+#model.set_parameters("PPO_vacuum_agent")
 model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-model.save("PPO_vacuum_agent")               # Save the model after training
+#model.save("PPO_vacuum_agent")                       # Save the model after training
 
-
+print(f"episode rewards were {env.get_episode_rewards()}")
 
 
 
