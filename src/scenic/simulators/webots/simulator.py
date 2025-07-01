@@ -117,16 +117,17 @@ class WebotsSimulation(Simulation):
         self.granularity = 0.05    # meters (matches rounding precision)
 
         self.total_spaces = int((self.room_width / self.granularity) * (self.room_length / self.granularity))
+        self.total_steps = 0
+        self.best_coverage = 0,0
+        self.collisions = 0
 
 
         super().__init__(scene, timestep=timestep, **kwargs)
 
     def setup(self):
         super().setup()
-
         # Reset Webots simulation
         self.supervisor.simulationResetPhysics()
-
 
 
     def createObjectInSimulator(self, obj):
@@ -259,14 +260,21 @@ class WebotsSimulation(Simulation):
                # TODO more elegant fix here, sensor need to be adaquetly initialized before the simlation begins stepping
                 self.init_step()
 
+        self.total_steps += 1
+
         # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
         self.observation = np.array([self.actions[0], self.actions[1], self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
-                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800])       
+                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800, self.pos[0], self.pos[1]])       
 
         self.transform_vel()
         self.left_motor.setVelocity(self.actions[0]) 
         self.right_motor.setVelocity(self.actions[1])
         self.supervisor.step(self.ms)
+
+        covered_count, converage_ratio = self.get_coverage_metric()
+       
+        if converage_ratio > self.best_coverage[1]:
+            self.best_coverage = covered_count, converage_ratio
 
 
     def init_step(self):
@@ -285,6 +293,8 @@ class WebotsSimulation(Simulation):
         self.sensor_back.enable(self.ms)
 
         self.supervisor.step(self.ms) # Need to step the simulation once after initializing the sensors!
+        pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
+        self.pos = pos # initialize the position
         self.enable_sensors = True
 
 
@@ -330,6 +340,9 @@ class WebotsSimulation(Simulation):
         # Destroy adhoc objects generated at the beginning of the simulation
         print(f" total episode reward was {self.total_reward}")
 
+        print(f"This is the metric: {self.metric()}")
+        print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%) \n")
+
         for i in range(1, self.nextAdHocObjectId):
             name = self._getAdhocObjectName(i)
             node = self.supervisor.getFromDef(name)
@@ -340,28 +353,52 @@ class WebotsSimulation(Simulation):
     def _getAdhocObjectName(self, i: int) -> str:
         return f"SCENIC_ADHOC_{i}"
 
-    def get_coverage_reward(self, granularity, pos, circle: bool):
-        if not circle:
-            if pos not in self.covered_spaces:
-                self.covered_spaces.append(pos)
-                return 1
-            else:
-                return 0
-        else:
-            reward = 0
-            #important parameter
-            radius = .335/2
-            x_range = np.arange(pos[0] - radius - granularity, pos[0] + radius + granularity, granularity)
-            y_range = np.arange(pos[1] - radius - granularity, pos[1] + radius + granularity, granularity)
-            x_range_combined, y_range_combined = np.meshgrid(x_range, y_range, indexing="xy")
-            mask = (x_range_combined - pos[0])**2 + (y_range_combined - pos[1])**2 <= radius**2
-            circle_points = [(x, y) for x, y in np.vstack((x_range_combined[mask], y_range_combined[mask])).T]
-            for point in circle_points:
-                if(point not in self.covered_spaces):
-                    reward += 1
-                    self.covered_spaces.append(point)
-            return reward * (len(self.covered_spaces) / self.total_spaces)
+    def get_coverage_reward(self, pos):
+        reward = 0
+        #important parameter
+        radius = .335/2
+        x_range = np.arange(pos[0] - radius - self.granularity, pos[0] + radius + self.granularity, self.granularity)
+        y_range = np.arange(pos[1] - radius - self.granularity, pos[1] + radius + self.granularity, self.granularity)
+        x_range_combined, y_range_combined = np.meshgrid(x_range, y_range, indexing="xy")
+        mask = (x_range_combined - pos[0])**2 + (y_range_combined - pos[1])**2 <= radius**2
+        circle_points = [
+            (
+                round(self.granularity * round(x / self.granularity), 3),
+                round(self.granularity * round(y / self.granularity), 3)
+            )
+            for x, y in np.vstack((x_range_combined[mask],
+                                y_range_combined[mask])).T
+        ]
+        for point in circle_points:
+            if(point not in self.covered_spaces):
+                reward += 1
+                self.covered_spaces.append(point)
+        return reward
     
+    def metric(self):
+
+        avg_reward = self.total_reward / self.total_steps if self.total_steps > 0 else 0
+        exploration = len(self.covered_spaces)
+        collision_rate = self.collisions / self.total_steps if self.total_steps > 0 else 0
+
+        score = avg_reward - 10 * collision_rate + 0.1 * exploration
+
+        return {
+            "total_reward": self.total_reward,
+            "average_reward": avg_reward,
+            "steps": self.total_steps,
+            "collision_count": self.collisions,
+            "exploration_score": exploration,
+            "final_score": score
+        }
+    
+    def get_coverage_metric(self):
+        # Number of unique positions visited
+        covered_count = len(self.covered_spaces)
+        # Coverage ratio (fraction of total spaces covered)
+        coverage_ratio = covered_count / self.total_spaces
+        # Optionally: return both count and percentage
+        return covered_count, coverage_ratio  
 
 
     def get_reward(self): # "any dummy for now will be okay"
@@ -369,8 +406,11 @@ class WebotsSimulation(Simulation):
         Calculate the reward based off of the current state
         """
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
+
+        self.pos = pos
+
         reward = 0
-        reward += self.get_coverage_reward(self.granularity, [pos[0], pos[1]], True)
+        reward += self.get_coverage_reward([pos[0], pos[1]])
 
         if reward == 0:
             reward += -1 
@@ -379,18 +419,18 @@ class WebotsSimulation(Simulation):
             self.invalid_action = False
 
         if np.all(self.observation[:2] > 0):
-            reward += .1 # small reward for driving forward
+            reward += .5 # small reward for driving forward
 
         if (np.any(self.observation[2:] < 0.1) ): # if any distance sensor is low penalize
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
-            reward += -abs(vm)/self.velocity_ranges[1]        
+            reward += -abs(vm)/self.velocity_ranges[1]
+            self.collisions += 1        
         elif (self.bumper_left == 1) or (self.bumper_right == 1):
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
             reward += -abs(vm)/self.velocity_ranges[1]
+            self.collisions += 1
 
         self.total_reward += reward
-
-        print(self.observation,"\n" ,reward)  
         return reward
     
     def get_info(self):
@@ -412,7 +452,6 @@ class WebotsSimulation(Simulation):
         """
         self.actions[0] = self.actions[0] * self.velocity_ranges[1] 
         self.actions[1] = self.actions[1] * self.velocity_ranges[1]
-
         if np.any(np.abs(self.actions) > 16.139):
             print("Error with velocity comp:")
             self.invalid_action = True
