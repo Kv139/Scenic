@@ -156,10 +156,12 @@ class WebotsSimulation(Simulation):
 
         self.enable_sensors = False
         self.actions = [0,0]
-        self.observation = np.zeros(7) # TODO Need to fix obs and initialziation
         self.ms = round(1000 * self.timestep)
 
-
+        array_size = int(4 + 2* (self.room_length / self.granularity))
+        print(f"Cleaned array size is {array_size}")
+        self.observation = {"sensor": np.zeros(7), "cleaned": np.zeros((array_size, array_size), dtype=bool)} # TODO Need to fix obs and initialziation
+        self.cleaned_array = np.zeros((array_size, array_size), dtype=bool)
         super().__init__(scene, timestep=timestep, **kwargs)
 
     def setup(self):
@@ -309,9 +311,11 @@ class WebotsSimulation(Simulation):
                 self.init_step()
 
         # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
-        self.observation = np.array([self.actions[0], self.actions[1], self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
-                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800])       
-
+        self.observation = {
+            "sensor": np.array([self.actions[0], self.actions[1], self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
+                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800]),       
+            "cleaned": self.cleaned_array
+        }
         self.transform_vel()
         self.left_motor.setVelocity(self.actions[0]) 
         self.right_motor.setVelocity(self.actions[1])
@@ -323,7 +327,7 @@ class WebotsSimulation(Simulation):
         if coverage_ratio > self.best_coverage[1]:
             self.best_coverage = covered_count, coverage_ratio
 
-        if np.any(self.observation[2:] < 0.1):
+        if np.any(self.observation["sensor"][2:] < 0.1):
             self.collisions += 1
         if(self.total_steps % 250 == 0) :
             print("Step: " + str(self.total_steps))
@@ -418,15 +422,17 @@ class WebotsSimulation(Simulation):
             self.supervisor.step(self.ms) # TODO this fixe crashing error on repeated reset calls! I DO NOT KNOW WHY.... temp fix, need to figure out underlying cause
     def _getAdhocObjectName(self, i: int) -> str:
         return f"SCENIC_ADHOC_{i}"
+    
+    def posToIdx(self, pos):
+        end = self.granularity * round((self.room_length / 2) / self.granularity) + 1
+        corner = np.array([end, end])
+        updated_pos = pos + corner
+        updated_pos /= self.granularity
+        updated_pos = updated_pos.astype(int)
+        return updated_pos
+        
 
-    def get_coverage_reward(self, granularity, pos, circle: bool):
-        if not circle:
-            if pos not in self.covered_spaces:
-                self.covered_spaces.append(pos)
-                return 1
-            else:
-                return 0
-        else:
+    def get_coverage_reward(self, granularity, pos):
             reward = 0
             #important parameter
             radius = .335/2
@@ -445,6 +451,9 @@ class WebotsSimulation(Simulation):
             for point in circle_points:
                 if(point not in self.covered_spaces):
                     reward += 1
+                    converted_pos = self.posToIdx(pos)
+                    #print(f"Indices are {converted_pos[0]} and {converted_pos[1]}")
+                    self.cleaned_array[converted_pos[0]][converted_pos[1]] = True
                     self.covered_spaces.append(point)
             if reward == 0:
                 reward -= .2
@@ -457,17 +466,15 @@ class WebotsSimulation(Simulation):
         """
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
         pos = tuple(pos.tolist())
-        reward = self.get_coverage_reward(self.granularity, [pos[0], pos[1]], True) * len(self.covered_spaces) / self.total_spaces
+        reward = self.get_coverage_reward(self.granularity, [pos[0], pos[1]]) * len(self.covered_spaces) / self.total_spaces
         
-        if (np.any(self.observation[2:] < 0.1) ): # if any distance sensor is low penalize
+        if (np.any(self.observation["sensor"][2:] < 0.1) ): # if any distance sensor is low penalize
             reward += -abs(np.mean(np.abs([self.actions[0], self.actions[1]]))) / self.velocity_ranges[1]
         elif (self.bumper_left == 1) or (self.bumper_right == 0):
              reward += -abs(np.mean(np.abs([self.actions[0], self.actions[1]]))) / self.velocity_ranges[1]
         if self.invalid_action:
             reward += -100
             self.invalid_action = False
-        if self.total_steps % 5 == 0:
-            print(reward)    
         self.total_reward += reward
         return reward
     def get_info(self):

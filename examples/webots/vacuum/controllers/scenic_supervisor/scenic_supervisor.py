@@ -27,8 +27,12 @@ scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scen
 
 
 action_space = gym.spaces.Box(low=-1.0, high=1.0 ,shape=(2,))  # Defines the possible actions of the agent
-observation_space = gym.spaces.Box(low=np.array([-1,-1,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1]),shape=(7,),dtype=np.float64) # defines the range of observations of the agent
-max_steps = 5000
+array_size = 1 #find in simulator.py by ctrl f'ing array_size
+observation_space = gym.spaces.Dict({
+    "sensor": gym.spaces.Box(low=np.array([-1,-1,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1]),shape=(7,),dtype=np.float64), # defines the range of observations of the agent
+    "cleaned": gym.spaces.MultiBinary((207, 207)) 
+})
+max_steps = 250
 env = ScenicGymEnv(scenario, 
                    simulator, 
                    render_mode=None, 
@@ -37,15 +41,22 @@ env = ScenicGymEnv(scenario,
                    observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
 env = Monitor(env)
 
-episodes= 40
+episodes= 5
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MlpPolicy", env, verbose=2) # Create an instance of an agent 
-#model.set_parameters("PPO_vacuum_agent")
+model = PPO("MultiInputPolicy", env, verbose=2) # Create an instance of an agent 
+model.set_parameters("PPO_vacuum_agent")
 model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-model.save("PPO_vacuum_agent")               # Save the model after training
+#model.save("PPO_vacuum_agent")               # Save the model after training
 
+episode_rewards = env.get_episode_rewards()
+print(episode_rewards)
+total_pc = 0
+for i in range(1, len(episode_rewards)):
+    total_pc += (episode_rewards[i] - episode_rewards[i - 1]) / np.abs(episode_rewards[i - 1])
+print("Average normalized percent difference: " + str(total_pc / (len(episode_rewards) - 1)))
+    
 # print(rewards_per_step)
 # print(env.get_episode_lengths())
 # current_streak = 0
@@ -65,14 +76,6 @@ model.save("PPO_vacuum_agent")               # Save the model after training
 #         current_streak = 1
 # if not converged:
 #     print("Did not converge within training episodes")
-episode_rewards = env.get_episode_rewards()
-print(episode_rewards)
-total_pc = 0
-for i in range(1, len(episode_rewards)):
-    total_pc += (episode_rewards[i] - episode_rewards[i - 1]) / np.abs(episode_rewards[i - 1])
-print("Average normalized percent difference: " + str(total_pc / (len(episode_rewards) - 1)))
-    
-
 
 
 

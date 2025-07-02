@@ -19,7 +19,7 @@ front_wall = new Wall at (0, wall_offset, 0.25), facing toward floor
 back_wall = new Wall at (0, -wall_offset, 0.25), facing toward floor
 
 # Place vacuum on floor
-ego = new Vacuum on floor
+ego = new Vacuum at (0, 0, 10), on floor, facing front_wall
 
 
 # Create a "safe zone" around the vacuum so that it does not start stuck
@@ -28,17 +28,15 @@ safe_zone = CircularRegion(ego.position, radius=1)
 # Create a dining room region where we will place dining room furniture
 dining_room_region = RectangularRegion(1.25 @ 0, 0, 2.5, 5).difference(safe_zone)
 
-# Place a table with 3 chairs around it, and one knocked over on the floor
-dining_table = new DiningTable contained in dining_room_region, on floor,
-    facing Range(0, 360 deg)
-"""
-chair_1 = new DiningChair behind dining_table by -0.1, on floor,
-                facing toward dining_table, with regionContainedIn dining_room_region
-chair_2 = new DiningChair ahead of dining_table by -0.1, on floor,
-                facing toward dining_table, with regionContainedIn dining_room_region
-chair_3 = new DiningChair left of dining_table by -0.1, on floor,
-                facing toward dining_table, with regionContainedIn dining_room_region
+# dining_table = new DiningTable contained in dining_room_region, on floor, facing Range(0, 360 deg), with size .1
 
+# chair_1 = new DiningChair behind dining_table by -0.1, on floor,
+#                 facing toward dining_table, with regionContainedIn dining_room_region
+# chair_2 = new DiningChair on chair_1,
+#                 facing toward dining_table, with regionContainedIn dining_room_region
+# chair_3 = new DiningChair left of dining_table by -0.1, on floor,
+#                 facing toward dining_table, with regionContainedIn dining_room_region
+"""
 fallen_orientation = Uniform((0, -90 deg, 0), (0, 90 deg, 0), (0, 0, -90 deg), (0, 0, 90 deg))
 
 chair_4 = new DiningChair contained in dining_room_region, facing fallen_orientation,

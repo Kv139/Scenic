@@ -1,0 +1,29 @@
+Game Start!
+training start
+0.97
+0.89
+0.96
+0.95
+0.91
+0.95
+Converged after 6 episodes.
+0.05
+0.94
+0.95
+0.87
+0.95
+0.94
+0.97
+Converged after 13 episodes.
+0.91
+Converged after 14 episodes.
+0.97
+Converged after 15 episodes.
+0.94
+Converged after 16 episodes.
+0.97
+Converged after 17 episodes.
+0.93
+Converged after 18 episodes.
+0.58
+0.98
