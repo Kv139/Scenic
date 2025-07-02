@@ -428,7 +428,7 @@ class WebotsSimulation(Simulation):
         if np.all(self.observation[:2] > 0):
             reward += .5 # small reward for driving forward
 
-        if (np.any(self.observation[2:9] < 0.12) ): # if any distance sensor is low penalize
+        if (np.any(self.observation[2:9] < 0.15) ): # if any distance sensor is low penalize
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
             reward += -abs(vm)/self.velocity_ranges[1]
             self.collisions += 1 
