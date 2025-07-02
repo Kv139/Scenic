@@ -96,6 +96,9 @@ class WebotsSimulation(Simulation):
         self.bumper_left = self.supervisor.getDevice("bumper_left")
         self.bumper_right = self.supervisor.getDevice("bumper_right")
 
+        self.sensor_actual_left = self.supervisor.getDevice("actual_left")
+        self.sensor_actual_right = self.supervisor.getDevice("actual_right")
+
         self.left_motor.setPosition(float('inf'))
         self.right_motor.setPosition(float('inf'))
 
@@ -109,18 +112,19 @@ class WebotsSimulation(Simulation):
 
         self.enable_sensors = False
         self.actions = [0,0]
-        self.observation = np.zeros(7) # TODO Need to fix obs and initialziation
+        self.observation = np.zeros(12) # TODO Need to fix obs and initialziation
         self.ms = round(1000 * self.timestep)
 
         self.room_width = 5.09    # meters — change as needed
         self.room_length = 5.09   # meters — change as needed
-        self.granularity = 0.05    # meters (matches rounding precision)
+        self.granularity = 0.1    # meters (matches rounding precision)
 
-        self.total_spaces = int((self.room_width / self.granularity) * (self.room_length / self.granularity))
-        self.total_steps = 0
+        self.total_spaces = self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
         self.best_coverage = 0,0
         self.collisions = 0
 
+        self.collision_safegaurd = 0
+ 
 
         super().__init__(scene, timestep=timestep, **kwargs)
 
@@ -146,8 +150,6 @@ class WebotsSimulation(Simulation):
             objFilePath = path.join(self.tmpMeshDir, f"{self.nextAdHocObjectId}.obj")
             trimesh.exchange.export.export_mesh(objectScaledMesh, objFilePath)
 
-
-
             name = self._getAdhocObjectName(self.nextAdHocObjectId)
             protoName = (
                 "ScenicObjectWithPhysics" if isPhysicsEnabled(obj) else "ScenicObject"
@@ -163,7 +165,6 @@ class WebotsSimulation(Simulation):
                 }}
                 """
             )
-
             rootNode = self.supervisor.getRoot()
             rootChildrenField = rootNode.getField("children")
             rootChildrenField.importMFNodeFromString(-1, protoDef)
@@ -262,10 +263,13 @@ class WebotsSimulation(Simulation):
 
         self.total_steps += 1
 
-        # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
-        self.observation = np.array([self.actions[0], self.actions[1], self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
-                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800, self.pos[0], self.pos[1]])       
-
+        self.observation = np.array([self.actions[0], self.actions[1], # velocity
+                                     self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, 
+                                     self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, 
+                                     self.sensor_back.getValue()/800, self.sensor_actual_left.getValue()/800,  
+                                     self.sensor_actual_right.getValue()/800, self.pos[0], self.pos[1],
+                                     len(self.covered_spaces)/ self.total_spaces])       
+    
         self.transform_vel()
         self.left_motor.setVelocity(self.actions[0]) 
         self.right_motor.setVelocity(self.actions[1])
@@ -291,6 +295,9 @@ class WebotsSimulation(Simulation):
         self.bumper_right.enable(self.ms)
 
         self.sensor_back.enable(self.ms)
+
+        self.sensor_actual_left.enable(self.ms)
+        self.sensor_actual_right.enable(self.ms)
 
         self.supervisor.step(self.ms) # Need to step the simulation once after initializing the sensors!
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
@@ -421,14 +428,20 @@ class WebotsSimulation(Simulation):
         if np.all(self.observation[:2] > 0):
             reward += .5 # small reward for driving forward
 
-        if (np.any(self.observation[2:] < 0.1) ): # if any distance sensor is low penalize
+        if (np.any(self.observation[2:9] < 0.12) ): # if any distance sensor is low penalize
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
             reward += -abs(vm)/self.velocity_ranges[1]
-            self.collisions += 1        
+            self.collisions += 1 
+            self.collision_safegaurd += 1       
         elif (self.bumper_left == 1) or (self.bumper_right == 1):
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
             reward += -abs(vm)/self.velocity_ranges[1]
             self.collisions += 1
+            self.collision_safegaurd +=1
+
+        if self.collision_safegaurd > 15:
+            reward += -100
+
 
         self.total_reward += reward
         return reward
@@ -458,6 +471,13 @@ class WebotsSimulation(Simulation):
             print(f"Actions: {self.actions[0], self.actions[1]}")
             self.actions[0] = 0
             self.actions[1] = 0 # set invalid action to 0 instead
+
+
+    def get_truncation(self):
+        if self.collision_safegaurd > 20:
+            return True
+        else:
+            return False
 
             
 

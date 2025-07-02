@@ -24,7 +24,8 @@ Robot {
     DEF BODY_SLOT Group {
       children IS bodySlot
     }
-    Shape {
+
+    Shape { 
       appearance DEF CREATE_APPEARANCE PBRAppearance {
         metalness 0
         roughness 0.2
@@ -592,7 +593,32 @@ Robot {
       ]
       type "generic"
     }
-
+    DEF CREATE_SENSOR_ACTUAL_LEFT DistanceSensor {
+      translation 0.07 0.15 0.0
+      rotation 0 0 1 1.5708
+      name "actual_left"
+      lookupTable [
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
+      ]
+      type "generic"
+    }
+    DEF CREATE_SENSOR_ACTUAL_RIGHT DistanceSensor {
+      translation 0.07 -0.15 0.0
+      rotation 0 0 -1 1.5708
+      name "actual_right"
+      lookupTable [
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
+      ]
+      type "generic"
+    }
     DEF CREATE_CLIFF_SENSOR_BACK DistanceSensor {
       translation -0.16 0.0 0.0
       rotation 0.0 0.131 -0.0991 3.14
