@@ -48,8 +48,8 @@ class ScenicGymEnv(gym.Env):
                 with self.simulator.simulateStepped(scene, maxSteps=self.max_steps) as simulation:
                     steps_taken = 0
                     # this first block before the while loop is for the first reset call
-                    done = lambda: not (simulation.result is None)
-                    truncated = lambda: (steps_taken >= self.max_steps) # TODO handle cases where it is done right on maxsteps
+                    done = lambda: not (simulation.result is None) or (simulation.get_truncation()) # allows for early truncation
+                    truncated = lambda: (steps_taken >= self.max_steps)  # TODO handle cases where it is done right on maxsteps
                     observation = simulation.get_obs()
                     info = simulation.get_info() 
                     actions = yield observation, info
