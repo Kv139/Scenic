@@ -120,10 +120,11 @@ class WebotsSimulation(Simulation):
         self.collisions = 0
         self.total_steps = 0
 
-        self.threshold = .80
-        #self.increment = .05
+        self.threshold = .5
+        self.increment = .05
         self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
 
+        self.previous_actions = np.zeros(2)
         self.collision_safegaurd = 0
  
 
@@ -263,6 +264,8 @@ class WebotsSimulation(Simulation):
                 self.init_step()
 
         self.total_steps += 1
+
+        self.previous_actions = [self.left_motor.getVelocity(), self.right_motor.getVelocity()]
 
         self.observation = np.array([self.actions[0], self.actions[1], # velocity
                                      self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, 
@@ -406,9 +409,9 @@ class WebotsSimulation(Simulation):
         return covered_count, coverage_ratio  
 
 
-    def get_reward(self): # "any dummy for now will be okay"
+    def get_reward(self): 
         """
-        Calculate the reward based off of the current state
+        Calculate the reward based off of new points covered in the space
         """
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
         self.pos = pos
@@ -419,9 +422,19 @@ class WebotsSimulation(Simulation):
         if self.invalid_action:
             reward = -100
             self.invalid_action = False
+        
+        """
+        Small incentives for smoother drivng behaviors
+        """
+
+        if (np.abs(self.actions[0] - self.actions[1]) < 1):
+            reward += .01 # small reward for driving forward or uniformly on both motors
+
+        if (np.sum([self.actions[0] - self.previous_actions[0], self.actions[1] - self.previous_actions[1]]) < 2):
+            reward += .01 # small reward for driving smoothly
 
         if np.all(self.observation[:2] > 0):
-            reward += .2 # small reward for driving forward
+            reward += .01 # small reward for driving forward
         
         if (np.any(self.observation[2:7] < 0.15) ) or (np.any(self.observation[7:9] < .05)): # if any distance sensor is low penalize
             self.collisions += 1 # total collisions per episode
