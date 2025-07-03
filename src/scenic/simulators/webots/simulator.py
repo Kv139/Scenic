@@ -140,9 +140,8 @@ class WebotsSimulation(Simulation):
         self.sensor_front_left = self.supervisor.getDevice("cliff_front_left")
 
         self.sensor_back = self.supervisor.getDevice("cliff_back")
-
-        self.bumper_left = self.supervisor.getDevice("bumper_left")
-        self.bumper_right = self.supervisor.getDevice("bumper_right")
+        self.sensor_actual_left = self.supervisor.getDevice("actual_left")
+        self.sensor_actual_right = self.supervisor.getDevice("actual_right")
 
         self.left_motor.setPosition(float('inf'))
         self.right_motor.setPosition(float('inf'))
@@ -188,8 +187,6 @@ class WebotsSimulation(Simulation):
             objFilePath = path.join(self.tmpMeshDir, f"{self.nextAdHocObjectId}.obj")
             trimesh.exchange.export.export_mesh(objectScaledMesh, objFilePath)
 
-
-
             name = self._getAdhocObjectName(self.nextAdHocObjectId)
             protoName = (
                 "ScenicObjectWithPhysics" if isPhysicsEnabled(obj) else "ScenicObject"
@@ -205,7 +202,6 @@ class WebotsSimulation(Simulation):
                 }}
                 """
             )
-
             rootNode = self.supervisor.getRoot()
             rootChildrenField = rootNode.getField("children")
             rootChildrenField.importMFNodeFromString(-1, protoDef)
@@ -345,10 +341,11 @@ class WebotsSimulation(Simulation):
         self.sensor_front_left.enable(self.ms)
         self.sensor_left.enable(self.ms)
 
-        self.bumper_left.enable(self.ms)
-        self.bumper_right.enable(self.ms)
 
         self.sensor_back.enable(self.ms)
+
+        self.sensor_actual_left.enable(self.ms)
+        self.sensor_actual_right.enable(self.ms)
 
         self.supervisor.step(self.ms) # Need to step the simulation once after initializing the sensors!
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
@@ -530,6 +527,13 @@ class WebotsSimulation(Simulation):
             return False
 
 
+
+
+    def get_truncation(self):
+        if self.collision_safegaurd > 20:
+            return True
+        else:
+            return False
 
             
 

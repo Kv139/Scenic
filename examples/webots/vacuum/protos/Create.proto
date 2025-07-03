@@ -24,7 +24,8 @@ Robot {
     DEF BODY_SLOT Group {
       children IS bodySlot
     }
-    Shape {
+
+    Shape { 
       appearance DEF CREATE_APPEARANCE PBRAppearance {
         metalness 0
         roughness 0.2
@@ -454,48 +455,7 @@ Robot {
       type "infra-red"
       channel 1
     }
-    DEF CREATE_BUMPER_LEFT TouchSensor {
-      rotation 0.844248 -0.378975 -0.378976 1.739314
-      name "bumper_left"
-      boundingObject DEF CREATE_BUMPER_BOUNDING_OBJECT Group {
-        children [
-          Transform {
-            translation -0.0780422 0 -0.148208
-            rotation 0 1 0 0.523599
-            children [
-              DEF CREATE_BUMPER_BOX Box {
-                size 0.082811 0.07 0.01
-              }
-            ]
-          }
-          Transform {
-            translation 0 0 -0.1675
-            children [
-              USE CREATE_BUMPER_BOX
-            ]
-          }
-          Transform {
-            translation 0.0780422 0 -0.148208
-            rotation 0 1 0 -0.523599
-            children [
-              USE CREATE_BUMPER_BOX
-            ]
-          }
-        ]
-      }
-      physics DEF CREATE_BUMPER_PHYSICS Physics {
-        density -1
-        mass 0.2
-        centerOfMass [0 0 -0.13]
-        inertiaMatrix [0.000240059 0.00106599 0.000989268, 0 0 0]
-      }
-    }
-    DEF CREATE_BUMPER_RIGHT TouchSensor {
-      rotation 0.302542 -0.673966 -0.673972 2.554029
-      name "bumper_right"
-      boundingObject USE CREATE_BUMPER_BOUNDING_OBJECT
-      physics USE CREATE_BUMPER_PHYSICS
-    }
+
     DEF CREATE_LED_ON LED {
       translation 0.0202 0.0617 0.0349
       children [
@@ -592,7 +552,32 @@ Robot {
       ]
       type "generic"
     }
-
+    DEF CREATE_SENSOR_ACTUAL_LEFT DistanceSensor {
+      translation 0.07 0.15 0.0
+      rotation 0 0 1 1.5708
+      name "actual_left"
+      lookupTable [
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
+      ]
+      type "generic"
+    }
+    DEF CREATE_SENSOR_ACTUAL_RIGHT DistanceSensor {
+      translation 0.07 -0.15 0.0
+      rotation 0 0 -1 1.5708
+      name "actual_right"
+      lookupTable [
+        0 0 0
+        0.2 200 0
+        0.4 400 0
+        0.6 600 0
+        0.8 800 0
+      ]
+      type "generic"
+    }
     DEF CREATE_CLIFF_SENSOR_BACK DistanceSensor {
       translation -0.16 0.0 0.0
       rotation 0.0 0.131 -0.0991 3.14

@@ -16,6 +16,8 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.evaluation import evaluate_policy
 
+import matplotlib.pyplot as plt
+
 
 
  
@@ -31,6 +33,7 @@ scenario = scenic.scenarioFromFile(prefix +  "examples/webots/vacuum/vacuum.scen
 
 
 action_space = gym.spaces.Box(low=-1.0, high=1.0 ,shape=(2,))  # Defines the possible actions of the agent
+<<<<<<< HEAD
 array_size = 1 #find in simulator.py by ctrl f'ing array_size
 observation_space = gym.spaces.Dict({
     "velocity": gym.spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), shape=(2,),dtype=np.float64),
@@ -40,6 +43,10 @@ observation_space = gym.spaces.Dict({
     #"cleaned": gym.spaces.MultiBinary((207, 207)) 
 })
 max_steps = 2000
+=======
+observation_space = gym.spaces.Box(low=np.array([-1,-1,0,0,0,0,0,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1,1,1,1,5.09,5.09]),shape=(12,),dtype=np.float64) # defines the range of observations of the agent
+max_steps = 10000
+>>>>>>> upstream/Kai/ScenicGym-checkpoint
 env = ScenicGymEnv(scenario, 
                    simulator, 
                    render_mode=None, 
@@ -91,6 +98,17 @@ print("Average normalized percent difference: " + str(total_pc / (len(episode_re
 
 
 
+episodic_rewards = env.get_episode_rewards
+
+fig,ax = plt.subplots()
+
+ax.scatter(len(episodic_rewards), episodic_rewards)
+
+ax.set(xlim=(np.min(episodic_rewards+100)),
+       ylim=(np.max(episodic_rewards+100)))
+plt.show()
+file_name = "MLP_policy" + str(total_timesteps)  + ".png"
+plt.save(file_name,format='png')
 
 
 
