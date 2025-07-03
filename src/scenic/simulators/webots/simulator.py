@@ -92,10 +92,6 @@ class WebotsSimulation(Simulation):
         self.sensor_front_left = self.supervisor.getDevice("cliff_front_left")
 
         self.sensor_back = self.supervisor.getDevice("cliff_back")
-
-        self.bumper_left = self.supervisor.getDevice("bumper_left")
-        self.bumper_right = self.supervisor.getDevice("bumper_right")
-
         self.sensor_actual_left = self.supervisor.getDevice("actual_left")
         self.sensor_actual_right = self.supervisor.getDevice("actual_right")
 
@@ -119,9 +115,10 @@ class WebotsSimulation(Simulation):
         self.room_length = 5.09   # meters — change as needed
         self.granularity = 0.1    # meters (matches rounding precision)
 
-        self.total_spaces = self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
+        self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
         self.best_coverage = 0,0
         self.collisions = 0
+        self.total_steps = 0
 
         self.collision_safegaurd = 0
  
@@ -291,8 +288,6 @@ class WebotsSimulation(Simulation):
         self.sensor_front_left.enable(self.ms)
         self.sensor_left.enable(self.ms)
 
-        self.bumper_left.enable(self.ms)
-        self.bumper_right.enable(self.ms)
 
         self.sensor_back.enable(self.ms)
 
@@ -426,21 +421,22 @@ class WebotsSimulation(Simulation):
             self.invalid_action = False
 
         if np.all(self.observation[:2] > 0):
-            reward += .5 # small reward for driving forward
+            reward += .1 # small reward for driving forward
 
-        if (np.any(self.observation[2:9] < 0.15) ): # if any distance sensor is low penalize
+        if (np.any(self.observation[2:7] < 0.15) ): # if any distance sensor is low penalize
             vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
             reward += -abs(vm)/self.velocity_ranges[1]
             self.collisions += 1 
-            self.collision_safegaurd += 1       
-        elif (self.bumper_left == 1) or (self.bumper_right == 1):
-            vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
-            reward += -abs(vm)/self.velocity_ranges[1]
+            self.collision_safegaurd += 1 
+        elif(np.any(self.observation[7:9] < .075)): # allow the side sensors to be closer that the front sensors
             self.collisions += 1
-            self.collision_safegaurd +=1
+            self.collision_safegaurd += 1
+            reward += -abs(np.mean(self.actions))
 
         if self.collision_safegaurd > 15:
             reward += -100
+
+        print(f" sensor data {self.observation[2:9]}")
 
 
         self.total_reward += reward
