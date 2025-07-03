@@ -11,7 +11,7 @@ class ResetException(Exception):
 
 class ScenicGymEnv(gym.Env):
     """
-    verifai_sampler now not an argument added in here, but one specified in the Scenic program
+    verifai_sampler now not an argument added in here, but one specified int he Scenic program
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4} # TODO placeholder, add simulator-specific entries
     
@@ -21,20 +21,24 @@ class ScenicGymEnv(gym.Env):
                  render_mode=None, 
                  max_steps = 1000,
                  observation_space : spaces.Dict = spaces.Dict(),
-                 action_space : spaces.Dict = spaces.Dict()): # empty string means just pure scenic???
+                 action_space : spaces.Dict = spaces.Dict(),
+                 record_scenic_sim_results : bool = True,
+                 feedback_fn : callable = lambda x: x): # empty string means just pure scenic???
 
         assert render_mode is None or render_mode in self.metadata["render_modes"]
 
         self.observation_space = observation_space
         self.action_space = action_space
         self.render_mode = render_mode
-        self.max_steps = max_steps
+        self.max_steps = max_steps - 1 # FIXME, what was this about again?
         self.simulator = simulator
         self.scenario = scenario
         self.simulation_results = []
 
         self.feedback_result = None
         self.loop = None
+        self.record_scenic_sim_results = record_scenic_sim_results
+        self.feedback_fn = feedback_fn
 
     def _make_run_loop(self):
 
@@ -44,8 +48,8 @@ class ScenicGymEnv(gym.Env):
                 with self.simulator.simulateStepped(scene, maxSteps=self.max_steps) as simulation:
                     steps_taken = 0
                     # this first block before the while loop is for the first reset call
-                    done = lambda: not (simulation.result is None)
-                    truncated = lambda: (steps_taken >= self.max_steps) # TODO handle cases where it is done right on maxsteps
+                    done = lambda: not (simulation.result is None) or (simulation.get_truncation()) # allows for early truncation
+                    truncated = lambda: (steps_taken >= self.max_steps)  # TODO handle cases where it is done right on maxsteps
                     observation = simulation.get_obs()
                     info = simulation.get_info() 
                     actions = yield observation, info
@@ -61,13 +65,14 @@ class ScenicGymEnv(gym.Env):
                         reward = simulation.get_reward()
 
                         if done():
-                            self.feedback_result = simulation.result
-                            self.simulation_results.append(simulation.result)
-                            simulation.destroy()
+                            self.feedback_result = self.feedback_fn(simulation.result)
+                            if self.record_scenic_sim_results:
+                                self.simulation_results.append(simulation.result)
+                            # simulation.destroy() # FIXME...might redundant?
                             actions = yield observation, reward, done(), truncated(), info
                             break # a little unclean right here
 
-                        actions = yield observation, reward, done(), truncated(), info
+                        actions = yield observation, reward, done(), done(), info
                         simulation.actions = actions # TODO add action dict to simulation interfaces
                         
             except ResetException:
@@ -81,6 +86,8 @@ class ScenicGymEnv(gym.Env):
             observation, info = next(self.loop) # not doing self.scene.send(action) just yet
         else:
             observation, info = self.loop.throw(ResetException())
+
+
         return observation, info
         
     def step(self, action):
@@ -99,4 +106,3 @@ class ScenicGymEnv(gym.Env):
 
     def close(self):
         self.simulator.destroy()
-

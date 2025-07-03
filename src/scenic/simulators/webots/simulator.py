@@ -153,6 +153,7 @@ class WebotsSimulation(Simulation):
 
         self.covered_spaces = []
         self.invalid_action = False
+        self.total_reward = 0
 
         self.enable_sensors = False
         self.actions = [0,0]
@@ -166,10 +167,8 @@ class WebotsSimulation(Simulation):
 
     def setup(self):
         super().setup()
-
         # Reset Webots simulation
         self.supervisor.simulationResetPhysics()
-
 
 
     def createObjectInSimulator(self, obj):
@@ -310,6 +309,8 @@ class WebotsSimulation(Simulation):
                # TODO more elegant fix here, sensor need to be adaquetly initialized before the simlation begins stepping
                 self.init_step()
 
+        self.total_steps += 1
+
         # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
         self.observation = {
             "sensor": np.array([self.actions[0], self.actions[1], self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
@@ -349,6 +350,8 @@ class WebotsSimulation(Simulation):
         self.sensor_back.enable(self.ms)
 
         self.supervisor.step(self.ms) # Need to step the simulation once after initializing the sensors!
+        pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
+        self.pos = pos # initialize the position
         self.enable_sensors = True
 
 
@@ -414,6 +417,11 @@ class WebotsSimulation(Simulation):
         print(f"This is the metric: {self.metric()}")
         print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%)")
         # Destroy adhoc objects generated at the beginning of the simulation
+        print(f" total episode reward was {self.total_reward}")
+
+        print(f"This is the metric: {self.metric()}")
+        print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%) \n")
+
         for i in range(1, self.nextAdHocObjectId):
             name = self._getAdhocObjectName(i)
             node = self.supervisor.getFromDef(name)
