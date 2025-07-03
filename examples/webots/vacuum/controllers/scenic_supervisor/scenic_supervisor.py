@@ -14,6 +14,8 @@ from stable_baselines3 import SAC,PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.evaluation import evaluate_policy
 
+import matplotlib.pyplot as plt
+
 
 
  
@@ -54,6 +56,17 @@ mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=Fal
 print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
 
 
+episodic_rewards = env.get_episode_rewards
+
+fig,ax = plt.subplots()
+
+ax.scatter(len(episodic_rewards), episodic_rewards)
+
+ax.set(xlim=(np.min(episodic_rewards+100)),
+       ylim=(np.max(episodic_rewards+100)))
+plt.show()
+file_name = "MLP_policy" + str(total_timesteps)  + ".png"
+plt.save(file_name,format='png')
 
 
 
