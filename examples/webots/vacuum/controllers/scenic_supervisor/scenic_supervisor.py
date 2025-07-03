@@ -15,10 +15,11 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.evaluation import evaluate_policy
 
 import matplotlib.pyplot as plt
+import time
 
 
+start = time.time()
 
- 
 supervisor = Supervisor() # Collect the Supervisor node from the simulation
 simulator = WebotsSimulator(supervisor) # Create an instance of the WebotsSImulator with the corresponding node
 
@@ -42,12 +43,12 @@ env = ScenicGymEnv(scenario,
 
 env = Monitor(env)
 
-episodes=200
+episodes=50
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MlpPolicy", env, verbose=2,device='cpu', n_steps=2048,seed=20)  # Create an instance of an agent 
-#model = PPO.load("PPO_vacuum_agent", env=env, verbose=2, device="cpu")
+model = PPO("MlpPolicy", env, verbose=2, seed=20)  # Create an instance of an agent 
+#model = PPO.load("PPO_vacuum_agent", env=env, verbose=2, device="cpu",n_steps=2048,use_sde=True)
 model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
 model.save("PPO_vacuum_agent")                       # Save the model after training
 
@@ -62,9 +63,12 @@ file_name = "MLP_policy" + str(total_timesteps)  + ".png"
 plt.savefig(file_name,format='png')
 plt.show()
 
-
-
 mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=3,render=False)
 
 print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
+
+
+end = time.time()
+
+print(f" training time was {end - start} for {total_timesteps} timesteps")
 
