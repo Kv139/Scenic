@@ -113,12 +113,16 @@ class WebotsSimulation(Simulation):
 
         self.room_width = 5.09    # meters — change as needed
         self.room_length = 5.09   # meters — change as needed
-        self.granularity = 0.1    # meters (matches rounding precision)
+        self.granularity = 0.2    # meters (matches rounding precision)
 
-        self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
+
         self.best_coverage = 0,0
         self.collisions = 0
         self.total_steps = 0
+
+        self.threshold = .80
+        #self.increment = .05
+        self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 
 
         self.collision_safegaurd = 0
  
@@ -288,7 +292,6 @@ class WebotsSimulation(Simulation):
         self.sensor_front_left.enable(self.ms)
         self.sensor_left.enable(self.ms)
 
-
         self.sensor_back.enable(self.ms)
 
         self.sensor_actual_left.enable(self.ms)
@@ -408,38 +411,34 @@ class WebotsSimulation(Simulation):
         Calculate the reward based off of the current state
         """
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
-
         self.pos = pos
 
         reward = 0
         reward += self.get_coverage_reward([pos[0], pos[1]])
 
-        if reward == 0:
-            reward += -1 
         if self.invalid_action:
             reward = -100
             self.invalid_action = False
 
         if np.all(self.observation[:2] > 0):
-            reward += .1 # small reward for driving forward
+            reward += .2 # small reward for driving forward
+        
+        if (np.any(self.observation[2:7] < 0.15) ) or (np.any(self.observation[7:9] < .05)): # if any distance sensor is low penalize
+            self.collisions += 1 # total collisions per episode
+            self.collision_safegaurd += 1  # total sequential collisions
+            reward += -np.mean(np.abs(self.actions))
+        else:
+            self.collision_safegaurd = 0 # reset after no contact for a timestep
 
-        if (np.any(self.observation[2:7] < 0.15) ): # if any distance sensor is low penalize
-            vm = np.mean(np.abs([self.actions[0], self.actions[1]]))
-            reward += -abs(vm)/self.velocity_ranges[1]
-            self.collisions += 1 
-            self.collision_safegaurd += 1 
-        elif(np.any(self.observation[7:9] < .075)): # allow the side sensors to be closer that the front sensors
-            self.collisions += 1
-            self.collision_safegaurd += 1
-            reward += -abs(np.mean(self.actions))
+        if len(self.covered_spaces)/ self.total_spaces > self.threshold:
+            reward += 100 + self.threshold * (100) # slowly scale the reward signal up with more coverage
+            self.threshold += self.increment
 
         if self.collision_safegaurd > 15:
-            reward += -100
-
-        print(f" sensor data {self.observation[2:9]}")
-
+            reward += -10
 
         self.total_reward += reward
+        
         return reward
     
     def get_info(self):
@@ -469,7 +468,7 @@ class WebotsSimulation(Simulation):
             self.actions[1] = 0 # set invalid action to 0 instead
 
 
-    def get_truncation(self):
+    def get_truncation(self): # monitor for early truncatioon
         if self.collision_safegaurd > 20:
             return True
         else:
