@@ -19,11 +19,7 @@ front_wall = new Wall at (0, wall_offset, 0.25), facing toward floor
 back_wall = new Wall at (0, -wall_offset, 0.25), facing toward floor
 
 # Place vacuum on floor
-<<<<<<< HEAD
-ego = new Vacuum at (0, 0, 10), on floor, facing front_wall
-=======
-ego = new Vacuum on floor, at (0,0,0)
->>>>>>> upstream/Kai/ScenicGym-checkpoint
+ego = new Vacuum at (0, 0, 10), on floor
 
 
 # Create a "safe zone" around the vacuum so that it does not start stuck

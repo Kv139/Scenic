@@ -44,24 +44,6 @@ def otf(message):
         print(message, file=f)
 
 episodes = 0
-last_reward = None
-current_streak = 0
-def checkConvergence(avg_reward):
-    global episodes
-    global last_reward
-    global current_streak
-    ptf(avg_reward)
-    epsilon = 0.1
-    episodes += 1
-    streak_threshold = 5
-    if(episodes != 1 and abs(last_reward - avg_reward) <= epsilon):
-        current_streak += 1
-        if(current_streak >= streak_threshold):
-            ptf("Converged after " + str(episodes) + " episodes.")
-    else:
-        current_streak = 0
-    last_reward = avg_reward
-
 
 class WebotsSimulator(Simulator):
     """`Simulator` object for Webots.
@@ -111,7 +93,6 @@ class WebotsSimulation(Simulation):
         self.room_length = 5.09   # meters — change as needed
         self.granularity = 0.05    # meters (matches rounding precision)
         self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 - 4 #-4 for each of the corners
-        print(f"New: {self.total_spaces}, old: {int((self.room_width/self.granularity)**2)}")
         self.total_reward = 0
         self.total_steps = 0
         self.collisions = 0
@@ -158,11 +139,13 @@ class WebotsSimulation(Simulation):
         self.actions = [0,0]
         self.ms = round(1000 * self.timestep)
 
-        array_size = int(4 + 2* (self.room_length / self.granularity))
-        print(f"Cleaned array size is {array_size}")
-        self.observation = {"velocity": np.zeros(2), "sensor": np.zeros(5), "position": np.zeros(2)} # TODO Need to fix obs and initialziation
-        #"cleaned": np.zeros((array_size, array_size), dtype=bool)
-        self.cleaned_array = np.zeros((array_size, array_size), dtype=bool)
+        self.sectional_coverage = np.zeros(16)
+        self.observation = {
+            "velocity": np.zeros(2), 
+            "sensor": np.zeros(7),
+            "position": np.zeros(2), "sectional_coverage":np.zeros(16),
+            "current_section": 0
+        } # TODO Need to fix obs and initialziation
         super().__init__(scene, timestep=timestep, **kwargs)
 
     def setup(self):
@@ -307,14 +290,16 @@ class WebotsSimulation(Simulation):
                 self.init_step()
 
         self.total_steps += 1
-
+        pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity)
         # TODO Normalize observation space, docmumnet sensor value ranges, and signals for crashing etc...
         self.observation = {
             "velocity": np.array([self.actions[0], self.actions[1]]),
             "sensor": np.array([self.sensor_left.getValue()/800, self.sensor_right.getValue()/800, # ensures that null values are not returned from unintialized sensors
-                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800]),       
-            "position": np.array([self.pos[0], self.pos[1]])
-            #"cleaned": self.cleaned_array
+                self.sensor_front_right.getValue()/800, self.sensor_front_left.getValue()/800, self.sensor_back.getValue()/800, self.sensor_actual_left.getValue()/800,  
+                                     self.sensor_actual_right.getValue()/800]),       
+            "position": np.array(pos),
+            "sectional_coverage": self.sectional_coverage / (self.total_spaces / 16),
+            "current_section": self.posToIdx(pos)
         }
         self.transform_vel()
         self.left_motor.setVelocity(self.actions[0]) 
@@ -325,11 +310,12 @@ class WebotsSimulation(Simulation):
         if coverage_ratio > self.best_coverage[1]:
             self.best_coverage = covered_count, coverage_ratio
 
-        if np.any(self.observation["sensor"] < 0.1):
+        if np.any(self.observation["sensor"][:5] < 0.1):
             self.collisions += 1
-        if(self.total_steps % 250 == 0) :
+        if(self.total_steps % 500 == 0) :
             print("Step: " + str(self.total_steps))
             print(f"Actions: {self.actions[0], self.actions[1]}")
+            print(f"Observations: {self.observation}")
 
     def init_step(self):
         """
@@ -410,8 +396,9 @@ class WebotsSimulation(Simulation):
         }
 
     def destroy(self):
-        for point in self.covered_spaces:
-            ptf(point)
+        global episodes
+        episodes += 1
+        print(f"Episode number: {episodes}")
         print(f"This is the metric: {self.metric()}")
         print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%)")
         # Destroy adhoc objects generated at the beginning of the simulation
@@ -430,12 +417,17 @@ class WebotsSimulation(Simulation):
         return f"SCENIC_ADHOC_{i}"
     
     def posToIdx(self, pos):
-        end = self.granularity * round((self.room_length / 2) / self.granularity) + 1
-        corner = np.array([end, end])
-        updated_pos = pos + corner
-        updated_pos /= self.granularity
-        updated_pos = updated_pos.astype(int)
-        return updated_pos
+        idx = np.array([0, 0])
+        for i in range(0, 2):
+            if(pos[i] <= self.room_width / 4 * -1):
+                idx[i] = 0
+            elif(pos[i] <= 0):
+                idx[i] = 1
+            elif(pos[i] <= self.room_width / 4):
+                idx[i] = 2
+            else:
+                idx[i] = 3
+        return 4 * idx[0] + idx[1]
         
 
     def get_coverage_reward(self, granularity, pos):
@@ -457,12 +449,10 @@ class WebotsSimulation(Simulation):
             for point in circle_points:
                 if(point not in self.covered_spaces):
                     reward += 1
-                    converted_pos = self.posToIdx(pos)
-                    #print(f"Indices are {converted_pos[0]} and {converted_pos[1]}")
-                    self.cleaned_array[converted_pos[0]][converted_pos[1]] = True
                     self.covered_spaces.append(point)
+                    self.sectional_coverage[self.posToIdx(pos)] += 1
             if reward == 0:
-                reward -= .1
+                reward += -.001
             return reward
         
 
@@ -472,24 +462,22 @@ class WebotsSimulation(Simulation):
         """
         pos = self.granularity * np.round(np.array(self.supervisor_node.getPosition()[:2]) / self.granularity) #need to verify
         pos = tuple(pos.tolist())
-        reward = self.get_coverage_reward(self.granularity, [pos[0], pos[1]]) * len(self.covered_spaces) / self.total_spaces
+        reward = self.get_coverage_reward(self.granularity, [pos[0], pos[1]])
         
         if np.all(self.observation["velocity"] > 0):
-            reward += .25 # small reward for driving forwa
+            reward += .1 # small reward for driving forwa
         
-        if (np.any(self.observation["sensor"] < 0.1) ): # if any distance sensor is low penalize
-            reward += -abs(np.mean(np.abs([self.actions[0], self.actions[1]]))) / self.velocity_ranges[1]
+        if (np.any(self.observation["sensor"][:5] < 0.1) ): # if any distance sensor is low penalize
+            reward += -1
             self.collision_safeguard += 1
-        elif (self.bumper_left == 1) or (self.bumper_right == 0):
-             reward += -abs(np.mean(np.abs([self.actions[0], self.actions[1]]))) / self.velocity_ranges[1]
-             self.collision_safeguard += 1
         else:
             self.collision_safeguard = 0
-        if self.collision_safeguard >= 15:
-            reward += -50    
+        if self.collision_safeguard >= 90:
+            reward += -100
         
         if self.invalid_action:
             reward += -100
+            print("Invalid action")
             self.invalid_action = False
         self.total_reward += reward
         return reward
@@ -521,21 +509,10 @@ class WebotsSimulation(Simulation):
             self.actions[1] = 0 # set invalid action to 0 instead
     
     def get_truncation(self):
-        if self.collision_safeguard > 20:
+        if self.collision_safeguard > 100:
             return True
         else:
             return False
-
-
-
-
-    def get_truncation(self):
-        if self.collision_safegaurd > 20:
-            return True
-        else:
-            return False
-
-            
 
 def getFieldSafe(webotsObject, fieldName):
     """Get field from webots object. Return null if no such field exists.
