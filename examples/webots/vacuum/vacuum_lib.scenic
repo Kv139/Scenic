@@ -15,7 +15,7 @@ param duration = 10
 
 class Vacuum(WebotsObject):
     webotsName: "IROBOT_CREATE"
-    shape: CylinderShape()
+    shape: MeshShape.fromFile(localPath("../../../assets/meshes/Create.proto_BODY_SLOT.obj.bz2"))
     width: 0.335
     length: 0.335
     height: 0.07
@@ -30,7 +30,7 @@ class Vacuum(WebotsObject):
 # Not actually linked to WebotsObject because Webots floor is 2D
 class Floor(Object):
     width: 5
-    length: 3
+    length: 5
     height: 0.01
     position: (0,0,-0.005)
     color: [0.785, 0.785, 0.785]
@@ -41,7 +41,6 @@ class Wall(WebotsObject):
     length: 0.04
     height: 0.5
     color: [0.627, 0.627, 0.627]
-
 
 
 class floor_test(WebotsObject):
