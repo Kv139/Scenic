@@ -93,29 +93,42 @@ class WebotsSimulation(Simulation):
             directly; e.g. :scenic:`simulation().supervisor.setLabel({...})`.
     """
     def __init__(self, scene, supervisor, coordinateSystem=ENU, *, timestep, **kwargs):
-        self.best_coverage = 0,0
-        self.room_width = 5.    # meters — change as needed
-        self.room_length = 5.   # meters — change as needed
-        self.granularity = 0.05    # meters (matches rounding precision)
+        #room data
+        self.room_width = 5.    
+        self.room_length = 5.   
+        self.granularity = 0.05    
         self.total_spaces = (2 * np.floor(self.room_width / (2*self.granularity)) + 1)**2 - 4 #-4 for each of the corners
-        self.total_reward = 0
-        self.total_steps = 0
+        self.obj_dims = []
+        
+        #collisions & collision detection
         self.collisions = 0
         self.collision_safeguard = 0
+        self.prox_checks = []
+        self.spheres = []
         
+        #metrics and rewards
+        self.best_coverage = 0,0
+        self.covered_spaces = []
+        self.invalid_action = False
+        self.total_reward = 0
+        
+        #simulation data
         self.time_elapsed = 0
+        self.total_reward = 0
+        self.total_steps = 0
+        
+        #i dont know
         self.supervisor = supervisor
         self.coordinateSystem = coordinateSystem
         self.mode2D = scene.compileOptions.mode2D
         self.nextAdHocObjectId = 1
         self.usedObjectNames = defaultdict(lambda: 0)
-
         self.timestep = supervisor.getBasicTimeStep() / 1000 if timestep is None else timestep
         # directory to store proto files for adhoc webots objects
         self.tmpMeshDir = tempfile.mkdtemp()
-
         self.supervisor_node = self.supervisor.getSelf()
 
+        #device inputs
         self.left_motor = self.supervisor.getDevice("right wheel motor")
         self.right_motor = self.supervisor.getDevice("left wheel motor")
 
@@ -136,14 +149,11 @@ class WebotsSimulation(Simulation):
         self.right_motor.setVelocity(0)
         self.velocity_ranges = [0,16.129]
 
-        self.covered_spaces = []
-        self.invalid_action = False
-        self.total_reward = 0
-
         self.enable_sensors = False
         self.actions = [0,0]
         self.ms = round(1000 * self.timestep)
 
+        #observation space
         self.sectional_coverage = np.zeros(16)
         self.observation = {
             "velocity": np.zeros(2), 
@@ -151,15 +161,15 @@ class WebotsSimulation(Simulation):
             "position": np.zeros(2),
             # "sectional_coverage":np.zeros(16),
             # "current_section": 0
-        } # TODO Need to fix obs and initialziation
-        self.prox_checks = []
-        self.spheres = []
+        } # TODO Need to fix obs and initialziation        
+        
         super().__init__(scene, timestep=timestep, **kwargs)
 
     def setup(self):
         super().setup()
         # Reset Webots simulation
         self.supervisor.simulationResetPhysics()
+        self.compute_total_tiles()
 
 
     def createObjectInSimulator(self, obj):
@@ -282,6 +292,18 @@ class WebotsSimulation(Simulation):
                 controllerField.setSFString(obj.controller)
             elif obj.resetController:
                 webotsObj.restartController()
+        if hasattr(obj, 'width') and hasattr(obj, 'length'):
+            self.obj_dims.append((float(obj.width), float(obj.length)))
+            
+    def compute_total_tiles(self):
+        room_area = self.room_width * self.room_length
+        object_area = sum(width * length for width, length in self.obj_dims)
+        cleanable_area = room_area - object_area
+
+        tile_area = self.granularity ** 2
+        total_tiles = int(cleanable_area / tile_area)
+        self.total_spaces = total_tiles
+        print(f"Computed total cleanable tiles: {total_tiles}")
                 
     def get_coverage_metric(self):
         # Number of unique positions visited
