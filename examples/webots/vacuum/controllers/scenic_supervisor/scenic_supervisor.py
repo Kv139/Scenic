@@ -41,7 +41,7 @@ observation_space = gym.spaces.Dict({
     #"sectional_coverage": gym.spaces.Box(low=np.zeros(16), high=np.ones(16), shape=(16,),dtype=np.float64),
     # "current_section": gym.spaces.Box(low=np.array([0]), high=np.array([15]), shape=(1,),dtype=int)
 })
-max_steps = 1000
+max_steps = 10000
 env = ScenicGymEnv(scenario, 
                    simulator, 
                    render_mode=None, 
@@ -50,17 +50,18 @@ env = ScenicGymEnv(scenario,
                    observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
 env = Monitor(env)
 
-episodes= 2
+episodes= 20
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MultiInputPolicy", env, verbose=2) # Create an instance of an agent 
-model.set_parameters("PPO_vacuum_agent")
-model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
+model = PPO("MultiInputPolicy", env, verbose=2, learning_rate=0.0002,ent_coef=0.05)
+# Create an instance of an agent 
+model.set_parameters("PPO_vacuum_agent") # Load the parameters of a previously trained agent
+#model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
 #model.save("PPO_vacuum_agent")               # Save the model after training
 
-#mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=False, deterministic=False)
-#print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
+mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=5,render=False, deterministic=False)
+print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
 
 episodic_rewards = env.get_episode_rewards()
 print(episodic_rewards)
