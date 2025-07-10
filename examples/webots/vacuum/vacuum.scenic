@@ -4,6 +4,13 @@ Generate a room for the i-roomba create vacuum
 
 from vacuum_lib import *
 
+param verifaiSamplerType = 'ce'
+
+param is_couch = False
+
+# x = VerifaiRange(1,5)
+# y = VerifaiRange(1,5)
+
 ## Scene Layout ##
 
 # Create room region and set it as the workspace
@@ -21,21 +28,14 @@ back_wall = new Wall at (0, -wall_offset, 0.25), facing toward floor
 # Place vacuum on floor
 ego = new Vacuum on floor, at (0,0,0)
 
-record distance to left_wall as left_wall_distance
-record distance to right_wall as right_wall_distance
-record distance to front_wall as front_wall_distance
-record distance to back_wall as back_wall_distance
+if globalParameters.is_couch == True:
+    couch = new Couch ahead of left_wall by 0.335,
+            on floor, facing away from left_wall
+
 
 """
-monitor RewardMonitor():
-    while True:
-        d = distance from ego to left_wall > .05
-        wait
 
-require monitor RewardMonitor()
 
-"""
-"""
 # Create a "safe zone" around the vacuum so that it does not start stuck
 safe_zone = CircularRegion(ego.position, radius=1)
 
@@ -64,8 +64,7 @@ mutate chair_1, chair_2, chair_3
 # Create a living room region where we will place living room furniture
 living_room_region = RectangularRegion(-1.25 @ 0, 0, 2.5, 5).difference(safe_zone)
 
-couch = new Couch ahead of left_wall by 0.335,
-            on floor, facing away from left_wall
+
 
 coffee_table = new CoffeeTable ahead of couch by 0.336,
             on floor, facing away from couch
@@ -73,17 +72,11 @@ coffee_table = new CoffeeTable ahead of couch by 0.336,
 # Add some noise to the positions of the couch and coffee table
 mutate couch, coffee_table
 
-toy_stack = new BlockToy on floor
-toy_stack = new BlockToy on toy_stack
-toy_stack = new BlockToy on toy_stack
 
 # Spawn some toys
-for _ in range(globalParameters.numToys):
-    new Toy on floor
+
 
 ## Simulation Setup ##
 #terminate after globalParameters.duration * 500 seconds
 record (ego.x, ego.y) as VacuumPosition
 """
-
-#Need to implement monitors here to ensure early stopping for given cases
