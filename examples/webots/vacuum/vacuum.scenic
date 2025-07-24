@@ -5,8 +5,8 @@ from scenic.core.external_params import VerifaiRange
 
 from vacuum_lib import *
 from itertools import combinations
-no_verifai = False
-param verifaiSamplerType = 'bo'
+no_verifai = True
+param verifaiSamplerType = 'mab'
 dnev = 1.59576912 # double normal ev, |[-dnev, dnev]| has the same ev as |N(0, 1)|
 dpi = 6.28318531
 
