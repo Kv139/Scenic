@@ -36,18 +36,6 @@ from trimesh.creation import box
 import math, numpy as np
 from trimesh.proximity import closest_point
 from trimesh.proximity import ProximityQuery
-file_path = "../../../../../../output.txt"
-
-def ptf(message):
-    #adds onto the file
-    with open(file_path, 'a') as f:
-        print(message, file=f)
-        
-def otf(message):
-    #wipes the file and prints message
-    with open(file_path, 'w') as f:
-        print(message, file=f)
-
 episodes = 0
 saved_stepcount = 0
 class WebotsSimulator(Simulator):
@@ -74,7 +62,6 @@ class WebotsSimulator(Simulator):
             raise RuntimeError("Webots world does not contain a WorldInfo node")
         system = worldInfo.getField("coordinateSystem").getSFString()
         self.coordinateSystem = WebotsCoordinateSystem(system)
-        print("testing output")
 
     def createSimulation(self, scene, **kwargs):
         self.episode_count += 1
@@ -298,10 +285,8 @@ class WebotsSimulation(Simulation):
             if "SCENIC_ADHOC7" in name:
                 for i in range(4):
                     self.obj_dims.append((0.1, 0.1))
-                #print("Counted 4 table legs only")
             else:
                 self.obj_dims.append((float(obj.width), float(obj.length)))
-                #print(f"Subtracted full area for: {name}")
             
             
     def compute_total_tiles(self):
@@ -458,13 +443,10 @@ class WebotsSimulation(Simulation):
         global episodes
         episodes += 1
         print(f"Episode number: {episodes}")
-        print(f"This is the metric: {self.metric()}")
-        print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%)")
+        #print(f"This is the metric: {self.metric()}")
+        #print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%)")
         # Destroy adhoc objects generated at the beginning of the simulation
-        print(f" total episode reward was {self.total_reward}")
-
-        print(f"This is the metric: {self.metric()}")
-        print(f"Covered {self.best_coverage[0]} cells out of {self.total_spaces} ({self.best_coverage[1]*100:.2f}%) \n")
+        #print(f" total episode reward was {self.total_reward}")
 
         for i in range(1, self.nextAdHocObjectId):
             name = self._getAdhocObjectName(i)
@@ -571,7 +553,17 @@ class WebotsSimulation(Simulation):
         """
         Any information about the system/state that should be retained
         """
-        return {}
+        cleaned_cells = len(self.covered_spaces)
+        total_cleanable_tiles = self.total_spaces
+        coverage_percent = (cleaned_cells / total_cleanable_tiles) * 100 if total_cleanable_tiles > 0 else 0
+
+        return {
+            "cleaned_cells": cleaned_cells,
+            "total_cleanable_tiles": total_cleanable_tiles,
+            "coverage": coverage_percent,
+            "collisions": self.collisions
+        }
+     
      
     def get_obs(self):
         """
@@ -588,13 +580,13 @@ class WebotsSimulation(Simulation):
         self.actions[1] = self.actions[1] * self.velocity_ranges[1]
 
         if np.any(np.abs(self.actions) > self.velocity_ranges[1]):
-            #print("Error with velocity comp:")
+            print("Error with velocity comp:")
             self.invalid_action = True
-            #print(f"Actions: {self.actions[0], self.actions[1]}")
             self.actions[0] = 0
             self.actions[1] = 0 # set invalid action to 0 instead
     
     def get_truncation(self):
+        return False
         if self.collision_safeguard > 50:
             return True
         else:

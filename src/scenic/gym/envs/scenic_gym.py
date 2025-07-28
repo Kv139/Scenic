@@ -20,7 +20,8 @@ def write_csv(name, coverage, collisions):
     row = [name] + list(coverage) + list(collisions)
     columns = ["name"] + [f"coverage_{i}" for i in range(len(coverage))] + [f"collisions_{i}" for i in range(len(collisions))]
     df = pd.DataFrame([row], columns=columns)
-    df.to_csv(file_path, index=False, mode='a', header=columns)
+    df.to_csv(file_path, index=False, mode='a', header=False)
+    print("saved data to csv")
 class ResetException(Exception):
     def __init__(self):
         super().__init__("Resetting")
@@ -57,27 +58,22 @@ class ScenicGymEnv(gym.Env):
         self.feedback_fn = feedback_fn
         
         #CHANGEABLE STUFF, CHECK BEFORE EACH RUN ALSO CHECK THAT THE BUFFER IS EMPTY
-        self.training_method = "EL"
-        self.use_plr = True
+        self.training_method = "Random"
+        self.use_plr = False
         self.use_verifai = False
+        self.buffer_p = 0.5 # probability of resampling
         #Random: default
         #LP: Prioritized level replay based off learning potential
-        #GAE: Generalized advantage estimation NOTE I HAVEN"T ADDED VEIRFAI + GAE YET
         #EL: episode length, probability distribution based off inverse of episode length, need termination
         
         #changeable stuff for saving data to csv
         self.save_to_csv = True # whether to save data to csv
         self.run_name = "default_run" # name of the run, used for saving data to csv
         self.total_episodes = 10 # total number of episodes to run, used for saving data to csv
-        self.is_continuation = False # are you reloading the buffer form the disk
-        self.buffer_p = 0.5 # probability of resampling
         
         #load arrays
-        self.buffer_filenames = np.load("../../../../../../buffer/buffer_filenames.npy") if self.is_continuation else np.array([]) # filenames of the scenes in the buffer its redundant and will delete if have extra time or code feels too messy
-        self.buffer_learning_potential =  np.load("../../../../../../buffer/buffer_learning_potential.npy") if self.is_continuation else np.array([]) # learning potential of the scenes in the buffer note that for easy genrealization, this is juts the prioritiy weights, whether it be LP or GAE
-        self.buffer_last_reward =  np.load("../../../../../../buffer/buffer_last_reward.npy") if self.is_continuation else np.array([]) # last reward of the scenes in the buffer
-        if(self.is_continuation):
-            print(f"loaded files: {self.buffer_filenames}, learning potential: {self.buffer_learning_potential}, last reward: {self.buffer_last_reward}")
+        self.resampling_weights =  np.array([]) # resamling weights of scenes in the buffer
+        self.buffer_last_reward = np.array([]) # last reward of the scenes in the buffer(for lp)
         
         #extra variables for the run loop
         self.working_index = -1
@@ -85,10 +81,10 @@ class ScenicGymEnv(gym.Env):
         self.counting_reward = 0
         self.steps_taken = 0
         
-        if self.use_plr and self.training_method not in ("EL", "LP", "GAE"):
+        if self.use_plr and self.training_method not in ("EL", "LP"):
             raise ValueError(
                 f"use_plr=True but training_method={self.training_method!r}. "
-                "Must be one of 'LP' or 'GAE' if use_plr is enabled."
+                "Must be one of 'LP' or 'EL' if use_plr is enabled."
             )
         
         #information recording
@@ -103,18 +99,18 @@ class ScenicGymEnv(gym.Env):
                 #sample or resample scenes
                 if not self.use_plr:
                     scene, _ = self.scenario.generate(feedback=self.feedback_result)
-                elif self.training_method == "LP" and len(self.buffer_learning_potential) != len(self.buffer_last_reward):
-                    # finish sampling doubled scene
+                elif self.training_method == "LP" and len(self.resampling_weights) != len(self.buffer_last_reward):
+                    # resample scene
                     self.flag = 0
-                    self.working_index = len(self.buffer_filenames) - 1
+                    self.working_index = len(self.buffer_last_reward) - 1
                     with open(f"../../../../../../buffer/scene_{self.working_index}.bin", "rb") as f:
                         scene = self.scenario.sceneFromBytes(f.read())
                     print("Double sampling")
-                elif self.use_plr and self.is_resampling and len(self.buffer_filenames) > 0:
+                elif self.use_plr and self.is_resampling and len(self.resampling_weights) > 0:
                     # resample from buffer
                     self.flag = 1
-                    prob_distribution = self.buffer_learning_potential / np.sum(self.buffer_learning_potential)
-                    self.working_index = np.random.choice(len(self.buffer_filenames), p=prob_distribution)
+                    prob_distribution = self.resampling_weights / np.sum(self.resampling_weights)
+                    self.working_index = np.random.choice(len(self.resampling_weights), p=prob_distribution)
                     with open(f"../../../../../../buffer/scene_{self.working_index}.bin", "rb") as f:
                         scene = self.scenario.sceneFromBytes(f.read())
                     print(f"Resampling from buffer with index {self.working_index}")
@@ -122,10 +118,9 @@ class ScenicGymEnv(gym.Env):
                     # sample new scene
                     self.flag = 2
                     scene, _ = self.scenario.generate(feedback=self.feedback_result)
-                    with open(f"../../../../../../buffer/scene_{len(self.buffer_filenames)}.bin", "wb") as f:
+                    with open(f"../../../../../../buffer/scene_{len(self.resampling_weights)}.bin", "wb") as f:
                         f.write(self.scenario.sceneToBytes(scene=scene))
-                    self.buffer_filenames = np.append(self.buffer_filenames, len(self.buffer_filenames))
-                    self.working_index = len(self.buffer_filenames) - 1
+                    self.working_index = len(self.resampling_weights)
                     print(f"Sampling new scene with index {self.working_index}")
                 
                 self.counting_reward = 0
@@ -165,14 +160,14 @@ class ScenicGymEnv(gym.Env):
                         simulation.actions = actions # TODO add action dict to simulation interfaces
                     print("Exitedwhile loop")
             except ResetException:
-                print("reset exception caught")
+                
+                if len(self.episode_coverages) == self.total_episodes and self.save_to_csv:
+                    write_csv(self.run_name, self.episode_coverages, self.episode_collisions)
+                    print("reset exception caught")
                 print(f"Episode coverages: {self.episode_coverages}")
                 print(f"Mean and std of coverages: {np.mean(self.episode_coverages)} and {np.std(self.episode_coverages)}")
                 print(f"Episode collisions: {self.episode_collisions}")
                 print(f"Mean and std of collisions: {np.mean(self.episode_collisions)} and {np.std(self.episode_collisions)}")
-                if len(self.episode_coverages) == self.total_episodes and self.save_to_csv:
-                    print("saved data to csv")
-                    write_csv(np.concatenate([np.array([f"{self.run_name}"]), self.episode_coverages, self.episode_collisions]))
                 continue
 
     def reset(self, seed=None, options=None): # TODO will setting seed here conflict with VerifAI's setting of seed?
@@ -221,53 +216,36 @@ class ScenicGymEnv(gym.Env):
             print("TOTAL REWRAD is 0! suspiciosu!")
         #log rewards and learning potential
         if self.flag == 0:
-            #double sampling
+            #double sampling, so we know we are using LP
             if(self.working_index >= len(self.buffer_last_reward)):
                 print(f"Warning: working index {self.working_index} is out of bounds for buffer_last_reward with length {len(self.buffer_last_reward)}")
             else:
                 lp = abs(total_reward - self.buffer_last_reward[self.working_index]) + 1e-8
                 if self.use_verifai:
                     self.feedback_result = -lp
-                self.buffer_learning_potential = np.append(self.buffer_learning_potential, lp)
+                self.resampling_weights = np.append(self.resampling_weights, lp)
                 self.buffer_last_reward[self.working_index] = total_reward
                 print("finished double sampling")
         elif self.flag == 1:
             #resampling
-            if(self.working_index >= len(self.buffer_last_reward)):
-                print(f"Warning: working index {self.working_index} is out of bounds for buffer_last_reward with length {len(self.buffer_last_reward)}")
-            elif self.training_method == "LP":
+            if self.training_method == "LP":
                 lp = abs(total_reward - self.buffer_last_reward[self.working_index]) + 1e-8
                 if self.use_verifai:
                     self.feedback_result = -lp
-                self.buffer_learning_potential[self.working_index] = lp
+                self.resampling_weights[self.working_index] = lp
                 self.buffer_last_reward[self.working_index] = total_reward
-            elif self.training_method == "GAE":
-                lp = total_reward
-                self.buffer_learning_potential[self.working_index] = lp
             elif self.training_method == "EL":
-                lp = 1 / (self.steps_taken + 100)
+                inverse_reward = 1 / (self.steps_taken + 100)
                 if(self.steps_taken <= 50):
-                    lp = 0
-                self.buffer_learning_potential[self.working_index] = lp
+                    inverse_reward = 0
+                self.resampling_weights[self.working_index] = inverse_reward
             else:
                 print("BIG ISSUE, resmaled but not special PLR")
         else:
             if self.training_method == "LP":
                 self.buffer_last_reward = np.append(self.buffer_last_reward, total_reward)
-            elif self.training_method == "GAE":
-                lp = total_reward
-                self.buffer_learning_potential = np.append(self.buffer_learning_potential, lp)
             elif self.training_method == "EL":
-                lp = 1 / (self.steps_taken + 100)
+                inverse_reward = 1 / (self.steps_taken + 100)
                 if(self.steps_taken <= 50):
-                    lp = 0
-                self.buffer_learning_potential = np.append(self.buffer_learning_potential, lp)
-                self.buffer_last_reward = np.append(self.buffer_last_reward, total_reward)
-            else:
-                print("BIG ISSUE, resampled but not special PLR")
-            print("appened last reward")
-        print(self.buffer_learning_potential)
-        np.save("../../../../../../buffer/buffer_filenames.npy", self.buffer_filenames)
-        np.save("../../../../../../buffer/buffer_learning_potential.npy", self.buffer_learning_potential)
-        np.save("../../../../../../buffer/buffer_last_reward.npy", self.buffer_last_reward)
-        print("Saved buffer data to disk")
+                    inverse_reward = 0
+                self.resampling_weights = np.append(self.resampling_weights, inverse_reward)
