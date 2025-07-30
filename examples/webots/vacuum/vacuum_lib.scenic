@@ -12,7 +12,7 @@ import random
 
 class Vacuum(WebotsObject):
     webotsName: "IROBOT_CREATE"
-    shape: MeshShape.fromFile(localPath("../../../assets/meshes/Create.proto_BODY_SLOT.obj.bz2"))
+    shape: CylinderShape()
     width: 0.335
     length: 0.335
     height: 0.07
@@ -41,7 +41,7 @@ class Wall(WebotsObject):
     color: [0.627, 0.627, 0.627]
 
 class DiningTable(WebotsObject):
-    webotsAdhoc: {'physics': True}
+    webotsAdhoc: {'physics': False}
     shape: MeshShape.fromFile(localPath("../../../assets/meshes/dining_table.obj.bz2"))
     width: Range(0.7, 1.5)
     length: Range(0.7, 1.5)
@@ -50,7 +50,7 @@ class DiningTable(WebotsObject):
     color: [0.403, 0.278, 0.212]
 
 class DiningChair(WebotsObject):
-    webotsAdhoc: {'physics': True}
+    webotsAdhoc: {'physics': False}
     shape: MeshShape.fromFile(localPath("../../../assets/meshes/dining_chair.obj.bz2"), initial_rotation=(180 deg, 0, 0))
     width: 0.4
     length: 0.4
@@ -81,7 +81,7 @@ class CoffeeTable(WebotsObject):
     color: [0.404, 0.278, 0.212]
 
 class Toy(WebotsObject):
-    webotsAdhoc: {'physics': True}
+    webotsAdhoc: {'physics': False}
     shape: Uniform(BoxShape(), CylinderShape(), ConeShape(), SpheroidShape())
     width: 0.1
     length: 0.1
