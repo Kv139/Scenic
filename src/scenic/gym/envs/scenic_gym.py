@@ -65,14 +65,14 @@ class ScenicGymEnv(gym.Env):
                         reward = simulation.get_reward()
 
                         if done():
-                            self.feedback_result = self.feedback_fn(simulation.result)
+                            self.feedback_result = simulation.sampler_feedback()
                             if self.record_scenic_sim_results:
                                 self.simulation_results.append(simulation.result)
                             # simulation.destroy() # FIXME...might redundant?
                             actions = yield observation, reward, done(), truncated(), info
                             break # a little unclean right here
 
-                        actions = yield observation, reward, done(), done(), info
+                        actions = yield observation, reward, done(), truncated(), info
                         simulation.actions = actions # TODO add action dict to simulation interfaces
                         
             except ResetException:
