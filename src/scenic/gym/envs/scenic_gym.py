@@ -18,9 +18,10 @@ setDebuggingOptions(verbosity=2)
 file_path = "../../../../../output.csv"
 point_file_path = "../../../../../points.csv"
 
-def write_csv(name, coverage, collisions, rewards):
+def write_csv(name, coverage, collisions, discrete_collisions, rewards):
     rows = [[f"coverage_{name}"] + list(coverage),
             [f"collisions_{name}"] + list(collisions),
+            [f"discrete collisions_{name}"] + list(discrete_collisions),
             [f"rewards_{name}"] + list(rewards)
             ]
     df = pd.DataFrame(rows)
@@ -114,6 +115,7 @@ class ScenicGymEnv(gym.Env):
         #information recording
         self.episode_coverages = []  
         self.episode_collisions = []  
+        self.episode_discrete_collisions = []
         self.episode_rewards = []
         self.timewise_points = None
 
@@ -193,13 +195,15 @@ class ScenicGymEnv(gym.Env):
                     print("Exitedwhile loop")
             except ResetException:
                 if self.total_steps_taken >= self.total_steps and self.save_to_csv:
-                    write_csv(self.run_name, self.episode_coverages, self.episode_collisions, self.episode_rewards)
+                    write_csv(self.run_name, self.episode_coverages, self.episode_collisions, self.episode_discrete_collisions, self.episode_rewards)
                 print("reset exception caught")
                 print(f"Episode coverages: {self.episode_coverages}")
                 print(f"Mean and std of coverages: {np.mean(self.episode_coverages)} and {np.std(self.episode_coverages)}")
                 print(f"Episode collisions: {self.episode_collisions}")
                 print(f"Mean and std of collisions: {np.mean(self.episode_collisions)} and {np.std(self.episode_collisions)}")
-                print(f"Excel splittable: {np.mean(self.episode_coverages)},{np.std(self.episode_coverages)},{np.mean(self.episode_collisions)},{np.std(self.episode_collisions)}")
+                print(f"Episode discrete collisions: {self.episode_discrete_collisions}")
+                print(f"Mean and std of discrete collisions: {np.mean(self.episode_discrete_collisions)} and {np.std(self.episode_discrete_collisions)}")
+                print(f"Excel splittable: {np.mean(self.episode_coverages)},{np.std(self.episode_coverages)},{np.mean(self.episode_collisions)},{np.std(self.episode_collisions)},{np.mean(self.episode_discrete_collisions)},{np.std(self.episode_discrete_collisions)}")
                 continue
 
     def reset(self, seed=None, options=None): # TODO will setting seed here conflict with VerifAI's setting of seed?
@@ -223,6 +227,7 @@ class ScenicGymEnv(gym.Env):
         if terminated or truncated:
             self.episode_coverages.append(info.get("coverage", 0))
             self.episode_collisions.append(info.get("collisions", 0))
+            self.episode_discrete_collisions.append(info.get("discrete_collisions", 0))
             self.episode_rewards.append(self.counting_reward)
         
         return observation, reward, terminated, truncated, info

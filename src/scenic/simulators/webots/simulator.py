@@ -91,6 +91,8 @@ class WebotsSimulation(Simulation):
         
         #collisions & collision detection
         self.collisions = 0
+        self.discrete_collisions = 0
+        self.colliding = False
         self.collision_safeguard = 0
         self.inter_penalty = False
         self.prox_checks = []
@@ -524,8 +526,12 @@ class WebotsSimulation(Simulation):
             reward += -1
             self.collision_safeguard += 1
             self.collisions += 1
+            if not self.colliding:
+                self.colliding = True
+                self.discrete_collisions += 1
         else:
             self.collision_safeguard = 0
+            self.colliding = False
         if self.collision_safeguard >= 40 and not self.inter_penalty:
             reward += -100
             self.inter_penalty = True
@@ -549,7 +555,8 @@ class WebotsSimulation(Simulation):
             "cleaned_cells": cleaned_cells,
             "total_cleanable_tiles": total_cleanable_tiles,
             "coverage": coverage_percent,
-            "collisions": self.collisions
+            "collisions": self.collisions,
+            "discrete_collisions": self.discrete_collisions
         }
      
      

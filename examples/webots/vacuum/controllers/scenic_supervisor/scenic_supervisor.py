@@ -62,10 +62,10 @@ if(raw["supervisor"]["base_model"] != "na"):
     model.set_parameters(raw["supervisor"]["base_model"]) # Load the parameters of a previously trained agent
 if(raw["supervisor"]["is_training"]):
     model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-    model.save(model.save(raw["supervisor"]["model_name"]))               # Save the model after training
+    model.save(raw["supervisor"]["model_name"])            # Save the model after training
 
 if(not raw["supervisor"]["is_training"]):
-    mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=False, deterministic=False)
+    mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=3,render=False, deterministic=False)
     print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
 
 env.env.logScores()
@@ -84,7 +84,7 @@ ax.stem(range(len(episodic_rewards)), episodic_rewards)
 
 file_name = "PPO_policy" + str(total_timesteps)  + ".png"
 plt.savefig(file_name,format='png')
-#plt.show()
+plt.show()
 
 
 end = time.time()
