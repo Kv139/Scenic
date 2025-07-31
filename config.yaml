@@ -1,0 +1,25 @@
+scenic:
+  verifaiSamplerType: 'mab'
+  is_easy: False
+  is_medium: False
+  is_hard: True
+
+supervisor:
+  base_model: "7_19 - Corrected Penalty 50 + 50 Resampling.zip"
+  model_name: "hi"
+  max_steps: 10000
+  episodes: 50
+  is_training: True
+
+simulator:
+  truncate: True
+
+training:
+  training_method: "EL"
+  use_plr: False
+  use_verifai: False
+  buffer_p: 0.5
+  output_to_csv: False
+  
+
+

@@ -33,6 +33,8 @@ from controller import DistanceSensor
 
 from trimesh.creation import box
 
+import yaml
+
 import math, numpy as np
 from trimesh.proximity import closest_point
 from trimesh.proximity import ProximityQuery
@@ -148,6 +150,10 @@ class WebotsSimulation(Simulation):
             "sensor": np.zeros(7),
             "position": np.zeros(2),
         } # TODO Need to fix obs and initialziation        
+        
+        with open("../../../../../config.yaml") as f:
+            raw = yaml.safe_load(f)
+        self.truncate = raw["simulator"]["truncate"]
         
         super().__init__(scene, timestep=timestep, **kwargs)
 
@@ -568,7 +574,9 @@ class WebotsSimulation(Simulation):
             self.actions[1] = 0 # set invalid action to 0 instead
     
     def get_truncation(self):
-        return False
+        if(not self.truncate):
+            return False
+        
         if self.collision_safeguard > 50:
             return True
         else:

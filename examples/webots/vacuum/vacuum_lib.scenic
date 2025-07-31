@@ -93,7 +93,7 @@ class CoffeeTable(WebotsObject):
     color: [0.404, 0.278, 0.212]
 
 class Toy(WebotsObject):
-    webotsAdhoc: {'physics': False}
+    webotsAdhoc: {'physics': True}
     shape: Uniform(BoxShape(), CylinderShape(), ConeShape(), SpheroidShape())
     width: 0.1
     length: 0.1

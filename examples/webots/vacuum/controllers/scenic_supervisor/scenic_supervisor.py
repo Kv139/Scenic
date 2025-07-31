@@ -19,6 +19,10 @@ from stable_baselines3.common.evaluation import evaluate_policy
 import matplotlib.pyplot as plt
 import time
 
+import yaml
+with open("../../../../../config.yaml") as f:
+    raw = yaml.safe_load(f)
+
 start = time.time()
 
 supervisor = Supervisor() # Collect the Supervisor node from the simulation
@@ -39,7 +43,7 @@ observation_space = gym.spaces.Dict({
     "sensor": gym.spaces.Box(low=np.array([0,0,0,0,0,0,0]), high=np.array([1,1,1,1,1,1,1]),shape=(7,),dtype=np.float64), # defines the range of observations of the agent
     "position": gym.spaces.Box(low=np.array([-2.6, -2.6]), high=np.array([2.6, 2.6]), shape=(2,),dtype=np.float64),
 })
-max_steps = 10000
+max_steps = raw["supervisor"]["max_steps"]
 env = ScenicGymEnv(scenario, 
                 simulator, 
                 render_mode=None, 
@@ -48,18 +52,21 @@ env = ScenicGymEnv(scenario,
                 observation_space=observation_space) # max_step is max step for an episode - Create an enviroment instance
 env = Monitor(env)
 
-episodes= 50
+episodes= raw["supervisor"]["episodes"]
 total_timesteps = max_steps * episodes
 print(total_timesteps)
 
-model = PPO("MultiInputPolicy", env, verbose=2, learning_rate=0.0002,ent_coef=0.025)
+model = PPO("MultiInputPolicy", env, verbose=2, learning_rate=0.0002,ent_coef=0.05)
 # Create an instance of an agent 
-#model.set_parameters("7_29 - F50, ent(.025).zip") # Load the parameters of a previously trained agent
-model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
-model.save("7_29 - F50, ent(.025)")               # Save the model after training
+if(raw["supervisor"]["base_model"] != "na"):
+    model.set_parameters(raw["supervisor"]["base_model"]) # Load the parameters of a previously trained agent
+if(raw["supervisor"]["is_training"]):
+    model.learn(total_timesteps=total_timesteps)          # train the agent over a set number of steps
+    model.save(model.save(raw["supervisor"]["model_name"]))               # Save the model after training
 
-mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=False, deterministic=True)
-print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
+if(not raw["supervisor"]["is_training"]):
+    mean_rwd, std_reward = evaluate_policy(model, env, n_eval_episodes=10,render=False, deterministic=False)
+    print(f"After evaluation mean reward was : {mean_rwd} with std: {std_reward}")
 
 env.env.logScores()
 
@@ -85,6 +92,3 @@ end = time.time()
 print(f" training time was {(end - start) / 60} minutes for {total_timesteps} timesteps")
 
 
-
-
-from typing import Dict, Any

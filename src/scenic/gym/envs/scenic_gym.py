@@ -9,6 +9,7 @@ import random
 import numpy as np
 
 import pandas as pd
+import yaml
 
 setDebuggingOptions(verbosity=2)
 
@@ -64,20 +65,33 @@ class ScenicGymEnv(gym.Env):
         self.record_scenic_sim_results = record_scenic_sim_results
         self.feedback_fn = feedback_fn
         
+        with open("../../../../../config.yaml") as f:
+            raw = yaml.safe_load(f)
+        
         #CHANGEABLE STUFF, CHECK BEFORE EACH RUN ALSO CHECK THAT THE BUFFER IS EMPTY
-        self.training_method = "Random"
-        self.use_plr = False
-        self.use_verifai = False
-        self.buffer_p = 0.5 # probability of resampling
+        self.training_method = raw["training"]["training_method"]
+        self.use_plr = raw["training"]["use_plr"]
+        self.use_verifai = raw["training"]["use_verifai"]
+        self.buffer_p = raw["training"]["buffer_p"] # probability of resampling
         #Random: default
         #LP: Prioritized level replay based off learning potential
         #EL: episode length, probability distribution based off inverse of episode length, need termination
         
         #changeable stuff for saving data to csv
-        self.save_to_csv = True # whether to save data to csv
-        self.record_points = True
-        self.run_name = "7_29 - F50, ent(.025)" # name of the run, used for saving data to csv
-        self.total_steps = 10000*50 # total number of timesteps to run, used for saving data to csv
+        self.save_to_csv = raw["training"]["output_to_csv"] # whether to save data to csv
+        self.record_points = raw["training"]["output_to_csv"]
+        self.run_name = raw["supervisor"]["model_name"] # name of the run, used for saving data to csv
+        self.total_steps = raw["supervisor"]["max_steps"] * raw["supervisor"]["episodes"] # total number of timesteps to run, used for saving data to csv
+        
+        self.is_testing = not raw["supervisor"]["is_training"]
+        
+        if self.is_testing:
+            self.training_method = "Random"
+            self.use_plr = False
+            self.use_verifai = False
+            self.save_to_csv = False 
+            self.record_points = False
+            
     
         
         #load arrays
@@ -106,6 +120,7 @@ class ScenicGymEnv(gym.Env):
     def _make_run_loop(self):
         while True:
             try:
+                print(f"Training using {self.training_method}")
                 scene = None
                 self.is_resampling = random.uniform(0, 1) < self.buffer_p
                 #sample or resample scenes
