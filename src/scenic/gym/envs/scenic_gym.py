@@ -16,7 +16,7 @@ setDebuggingOptions(verbosity=2)
 #TODO make ResetException
 
 file_path = "../../../../../output.csv"
-point_file_path = "../../../../../points.csv"
+point_file_path = "../../../../../point_outputs/"
 
 def write_csv(name, coverage, collisions, discrete_collisions, rewards):
     rows = [[f"coverage_{name}"] + list(coverage),
@@ -28,9 +28,9 @@ def write_csv(name, coverage, collisions, discrete_collisions, rewards):
     df.to_csv(file_path, index=False, mode='a', header=False)
     
 def write_point_records(name, timewise_points):
-    rows = [[f"{name}"] + list(timewise_points)]
+    rows = list(timewise_points)
     df = pd.DataFrame(rows)
-    df.to_csv(point_file_path, index=False, mode='a',header=False)
+    df.to_csv(f"{point_file_path}{name}_points.csv", index=False, mode='a',header=False)
 class ResetException(Exception):
     def __init__(self):
         super().__init__("Resetting")
@@ -179,7 +179,7 @@ class ScenicGymEnv(gym.Env):
                                 simulation.terminateSimulation(TerminationType.terminatedByUser, "early truncation")
                             print("Simulation done")
                             if self.record_points:
-                                write_point_records(f"{self.run_name}_{len(self.episode_coverages)}", self.timewise_points)
+                                write_point_records(self.run_name, self.timewise_points)
                             self.logScores()
                             if not self.use_verifai:
                                 self.feedback_result = self.feedback_fn(simulation.result)
