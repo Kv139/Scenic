@@ -25,7 +25,6 @@ Robot {
       children IS bodySlot
     }
 
-    Shape { 
 
     Shape { 
       appearance DEF CREATE_APPEARANCE PBRAppearance {

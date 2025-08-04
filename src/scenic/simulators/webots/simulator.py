@@ -554,7 +554,7 @@ class WebotsSimulation(Simulation):
             "exploration_score": exploration,
             "final_score": score
         }
-
+    
     def create_heatmap(self, coordinates):
         if not coordinates:
             print("No data to plot.")
