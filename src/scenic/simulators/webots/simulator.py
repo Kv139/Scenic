@@ -19,6 +19,7 @@ import ctypes
 from scipy.stats import gaussian_kde
 import matplotlib.pyplot as plt
 import math
+import os
 from os import path
 import tempfile
 import matplotlib.patches as patches
@@ -673,10 +674,17 @@ class WebotsSimulation(Simulation):
         ax.set_ylim(y_min, y_max)
         ax.set_aspect('equal')
         ax.grid(True)
+        
 
         if episodes % 2 == 0:
-            filename = fr"C:\Users\PC-5\Downloads\SIP_Work_Graphs\heatmap_episode{episodes}.png"
-            plt.savefig(filename, dpi=300)
+            save_dir = os.path.join(os.getcwd(), "heatmaps") 
+            os.makedirs(save_dir, exist_ok=True)
+
+            filename = f"heatmap_episode{episodes}.png"
+            filepath = os.path.join(save_dir, filename)
+
+            plt.savefig(filepath, dpi=300)
+            
         # if episodes == 5:
         #     plt.savefig("heatmap_episode5.png", dpi=300)
         # if episodes == 10:
