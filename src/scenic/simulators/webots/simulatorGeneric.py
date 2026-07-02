@@ -29,7 +29,6 @@ from scenic.core.simulators import Simulation, Simulator
 from scenic.core.type_support import toOrientation
 from scenic.core.vectors import Vector
 from scenic.simulators.webots.utils import ENU, WebotsCoordinateSystem
-from controller import DistanceSensor
 
 
 class WebotsSimulatorGeneric(Simulator):
