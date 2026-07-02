@@ -77,7 +77,7 @@ class CompileOptions:
             if isinstance(value, (int, float, str)):
                 stream.write(str(value).encode())
             else:
-                stream.write([0])
+                stream.write(str([0]).encode())
         if self.scenario:
             stream.write(self.scenario.encode())
         # We can't use `hash` because it is not deterministic
