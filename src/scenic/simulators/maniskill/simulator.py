@@ -51,6 +51,7 @@ class ScenicEnv(BaseEnv):
         self.objects_to_create = objects_to_create
         self.scene_camera_configs = camera_configs
         self.shader_pack = shader_pack
+        self.obj_name_ids = {}
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -90,6 +91,26 @@ class ScenicEnv(BaseEnv):
         if self.agent is None:
             return {}
         return super()._get_obs_agent()
+    
+    def get_name_id(self,obj):
+        if obj not in self.obj_name_ids:
+            id = len(self.obj_name_ids) + 1
+
+        self.obj_name_ids[obj] = id
+        return id
+
+    def set_scenic_scene(self, objects_to_create, camera_configs):
+        """Swap in the contents of a new Scenic scene.
+
+        The actors themselves are (re)built the next time the environment is
+        reconfigured, i.e. on the next ``reset(options={"reconfigure": True})``.
+        This lets a single environment (and hence a single GPU/renderer context)
+        be reused across many simulations.
+        """
+        self.objects_to_create = objects_to_create
+        self.scene_camera_configs = camera_configs
+        self.scenic_objects = {}
+        self.obj_name_ids = {}
 
     def get_state_dict(self):
         """Return environment state.
@@ -117,6 +138,8 @@ class ScenicEnv(BaseEnv):
             )
 
         # Use a temporary directory for mesh files
+        if not hasattr(obj, "name"):
+            obj.name = f"scenic_maniskill_default_name{self.get_name_id(obj)}_mesh.obj"
         tmp_dir = tempfile.gettempdir()
         obj_filename = os.path.join(tmp_dir, f"scenic_maniskill_{obj.name}_mesh.obj")
         mesh.export(obj_filename)
@@ -165,9 +188,17 @@ class ScenicEnv(BaseEnv):
         else:
             actor = builder.build(name=obj.name)
 
+        if obj.name == "cubeA":
+            self.cubeA = actor
+        if obj.name == "cubeB":
+            self.cubeB = actor
+
         return actor
 
     def _load_scene(self, options: dict):
+        # Actors from any previous scene were destroyed by the reconfiguration,
+        # so start from a clean mapping.
+        self.scenic_objects = {}
         for obj in self.objects_to_create:
             mesh = obj.shape.mesh
             self.scenic_objects[obj.name] = self.build_actor_from_trimesh(
@@ -218,12 +249,6 @@ class ScenicEnv(BaseEnv):
             self.agent.robot.set_pose(sapien.Pose(DEFAULT_ROBOT_POSITION))
         # If no joint angles specified, the agent will use its default configuration
 
-    def compute_dense_reward(self, obs, action, info: dict):
-        return 1.0
-
-    def compute_normalized_dense_reward(self, obs, action, info: dict):
-        return 1.0
-
 
 # Register the ManiSkill environment in normal runs, but skip this during doc builds.
 if not buildingScenicDocumentation():
@@ -231,24 +256,49 @@ if not buildingScenicDocumentation():
 
 
 class ManiSkillSimulator(Simulator):
-    """Simulator interface for ManiSkill."""
+    """Simulator interface for ManiSkill.
 
-    def __init__(self, render=False, stride=1, shader_pack="default"):
+    The underlying ManiSkill environment is created once and reused by every
+    `ManiSkillSimulation` this simulator creates: each new simulation swaps in
+    its own objects/cameras and reconfigures the existing environment rather
+    than building a fresh one. This avoids leaking a GPU/renderer context per
+    episode, which is what makes repeated resets during RL training fall over.
+    """
+
+    def __init__(self, render=False, stride=1, shader_pack="default", obs_mode="rgb"):
         super().__init__()
         self.last_simulation = None
         self.render = render
         self.stride = stride
         self.shader_pack = shader_pack
+        self.obs_mode = obs_mode
+        self.env: Optional[gym.Env] = None
+        # Environment settings that are fixed at construction time; if a scene
+        # needs different ones we have no choice but to rebuild the environment.
+        self._env_key = None
+
+
+    def closeEnvironment(self):
+        """Close the shared environment, if one has been created."""
+        if self.env is not None:
+            self.env.close()
+            self.env = None
+            self._env_key = None
 
     def createSimulation(self, scene, **kwargs):
         self.last_simulation = ManiSkillSimulation(
             scene,
+            simulator=self,
             render=self.render,
             stride=self.stride,
             shader_pack=self.shader_pack,
             **kwargs,
         )
         return self.last_simulation
+
+    def destroy(self):
+        self.closeEnvironment()
+        super().destroy()
 
 
 class ManiSkillSimulation(Simulation):
@@ -258,12 +308,15 @@ class ManiSkillSimulation(Simulation):
         self,
         scene,
         *,
+        simulator=None,
         timestep=None,
         render=False,
         stride=1,
         shader_pack="default",
         **kwargs,
     ):
+        # The simulator owns the ManiSkill environment; we only borrow it.
+        self.maniskill_simulator = simulator
         self.env: Optional[gym.Env] = None
         self._done = False
         self._obs = None
@@ -302,25 +355,24 @@ class ManiSkillSimulation(Simulation):
 
         self.extract_camera_configs()
 
-        render_mode = "human" if self.render else None
-
         robot_uid = self.extract_robot_uid()
-        control_mode = "pd_ee_delta_pose" if robot_uid != "none" else None
 
-        self.env = gym.make(
-            "ScenicEnv",
-            num_envs=1,
-            obs_mode="rgb",
-            control_mode=control_mode,
-            robot_uids=robot_uid,
-            render_mode=render_mode,
-            objects_to_create=self.objects_to_create,
-            camera_configs=self.camera_configs,
-            shader_pack=self.shader_pack,
+        if self.maniskill_simulator is None:
+            raise RuntimeError(
+                "ManiSkillSimulation must be created by a ManiSkillSimulator, "
+                "which owns the underlying ManiSkill environment."
+            )
+
+        # Reuse the simulator's environment; it is only built on the first call.
+        self.env, reconfigure = self.maniskill_simulator.getEnvironment(
+            robot_uid, self.objects_to_create, self.camera_configs
         )
 
         self.step_count = 0
-        self._obs, self._info = self.env.reset(seed=0)
+        # Reconfiguring rebuilds the scene's actors from this simulation's
+        # objects without tearing down the environment itself.
+        options = {"reconfigure": True} if reconfigure else None
+        self._obs, self._info = self.env.reset(seed=0, options=options)
 
     def extract_camera_configs(self):
         """Extract camera configurations from Scenic objects.
@@ -373,13 +425,12 @@ class ManiSkillSimulation(Simulation):
         if self.env is None:
             raise RuntimeError("Environment not set up. Call setup() first.")
 
-        if self.action is None:
+        if self.actions is None:
             if self.env.action_space is None:
-                self.action = None
+                self.actions = None
             else:
-                self.action = self.env.action_space.sample() * 0.0
-
-        obs, reward, term, trunc, info = self.env.step(self.action)
+                self.actions = self.env.action_space.sample() * 0.0
+        obs, reward, term, trunc, info = self.env.step(self.actions)
         self._obs = obs
         self.step_count += 1
 
@@ -404,25 +455,27 @@ class ManiSkillSimulation(Simulation):
         if self.should_terminate():
             self._done = True
 
+    def should_terminate(self):
+        """Override this method to implement custom termination logic."""
+        return False
+
     def get_action_from_observation(self, obs):
         """Override this method to implement custom action selection."""
         if self.env.action_space is None:
             return None
         return self.env.action_space.sample() * 0.0
 
-    def should_terminate(self):
-        """Override this method to implement custom termination logic."""
-        return False
-
     def success(self):
-        """Override this method to implement custom success logic."""
-        return False
+        return self.success
 
     def get_step_count(self):
         return self.step_count
 
-    def getObservation(self):
-        return self._obs
+    def get_obs(self):
+        return self._obs["agent"]
+
+    def get_info(self):
+        return self._info
 
     def tensor_to_vector(self, tensor):
         if tensor.dim() != 1 or tensor.size(0) != 3:
@@ -477,14 +530,18 @@ class ManiSkillSimulation(Simulation):
 
         return values
 
-    def isDone(self):
+    def is_done(self):
         return self._done
 
-    def getReward(self):
+    def get_reward(self):
         return self._reward
 
     def destroy(self):
-        self.objects_to_create.clear()
-        if self.env is not None:
-            self.env.close()
-            self.env = None
+        # The environment belongs to the simulator and outlives this simulation,
+        # so just drop our references to it and to this scene's contents. The
+        # actors stay alive until the next simulation reconfigures the scene.
+        # Note we rebind rather than clear these lists, since the environment
+        # still holds the ones we handed it.
+        self.objects_to_create = []
+        self.camera_configs = []
+        self.env = None
