@@ -90,6 +90,7 @@ class ScenicEnv(BaseEnv):
         """
         if self.agent is None:
             return {}
+        # obs = super()._get_obs_agent()
         return super()._get_obs_agent()
     
     def get_name_id(self,obj):
@@ -150,10 +151,17 @@ class ScenicEnv(BaseEnv):
         length = getattr(obj, "length", 1.0)
         height = getattr(obj, "height", 1.0)
 
-        builder.add_multiple_convex_collisions_from_file(
+        if obj.name == "table": # Special hanndling for teh tables collision box
+            builder.add_box_collision(
+                pose=sapien.Pose(p=[0, 0, height / 2]),
+                half_size=(width / 2, length / 2, height / 2),
+            )
+
+        else:
+            builder.add_multiple_convex_collisions_from_file(
             filename=obj_filename,
             pose=sapien.Pose(),
-            scale=(width, length, height),
+            scale=(width,length, height),
             decomposition="coacd",
         )
 
@@ -319,7 +327,7 @@ class ManiSkillSimulation(Simulation):
         self.maniskill_simulator = simulator
         self.env: Optional[gym.Env] = None
         self._done = False
-        self._obs = None
+        self._obs = torch.zeros(1, 8)
         self._info = None
         self._reward = None
         self.action = None
@@ -430,6 +438,7 @@ class ManiSkillSimulation(Simulation):
                 self.actions = None
             else:
                 self.actions = self.env.action_space.sample() * 0.0
+
         obs, reward, term, trunc, info = self.env.step(self.actions)
         self._obs = obs
         self.step_count += 1
@@ -472,10 +481,13 @@ class ManiSkillSimulation(Simulation):
         return self.step_count
 
     def get_obs(self):
-        return self._obs["agent"]
+        return self._obs
 
     def get_info(self):
         return self._info
+
+    def sampler_feedback(self):
+        return None
 
     def tensor_to_vector(self, tensor):
         if tensor.dim() != 1 or tensor.size(0) != 3:
