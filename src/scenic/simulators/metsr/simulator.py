@@ -75,7 +75,9 @@ class METSRSimulation(Simulation):
     def updateObjects(self):
         obj_veh_ids = [self.getPrivateVehId(obj) for obj in self.objects]
         raw_veh_data = self.client.query_vehicle(obj_veh_ids, True, True)
-        self.obj_data_cache = {obj: raw_veh_data['DATA'][i] for i, obj in enumerate(self.objects)}
+        self.obj_data_cache = {
+            obj: raw_veh_data["data"][i] for i, obj in enumerate(self.objects)
+        }
         super().updateObjects()
         self.obj_data_cache = None
 
@@ -85,7 +87,7 @@ class METSRSimulation(Simulation):
 
         raw_data = self.obj_data_cache[obj]
 
-        if "road" not in raw_data and raw_data["state"] <= 0:
+        if not raw_data.get("onRoad", False) and raw_data["state"] <= 0:
             self.frozen_vehicles.add(obj)
 
         position = Vector(raw_data["x"], raw_data["y"], 0)

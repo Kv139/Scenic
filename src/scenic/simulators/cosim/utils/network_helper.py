@@ -42,9 +42,9 @@ class network_cache():
         """
         all_scenic_roads_connected_too = {}
         for road_lane,road_lane_map in self.scenic_to_metsr_map_lanes.items():
-            scenic_road = road_lane.split("_")[0]
+            scenic_road = road_lane.rsplit("_", 1)[0]
             for metsr_map in road_lane_map:
-                metsr_road  = metsr_map.split("_")[0]
+                metsr_road = metsr_map.rsplit("_", 1)[0]
                 if scenic_road not in self.scenic_to_metsr_map_roads:
                     self.scenic_to_metsr_map_roads[scenic_road] = set()
                     self.scenic_to_metsr_map_roads[scenic_road].add(metsr_road)
@@ -216,7 +216,9 @@ class network_cache():
         
         if query_key in self.scenic_to_metsr_map_lanes: 
             metsr_keys = self.scenic_to_metsr_map_lanes[query_key]
-            metsr_keys = set([metsr_key.split("_")[0] for metsr_key in metsr_keys])
+            metsr_keys = set(
+                metsr_key.rsplit("_", 1)[0] for metsr_key in metsr_keys
+            )
 
         return metsr_keys
     

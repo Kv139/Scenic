@@ -1,5 +1,9 @@
 import pathlib
-from scenic.simulators.carla.model import Vehicle, is2DMode
+from scenic.core.regions import PolygonalRegion
+from scenic.simulators.carla.model import Vehicle, is2DMode, network
+from scenic.simulators.cosim.utils.utils import (
+    generate_map, generate_metsr_lane_index_map
+)
 
 import scenic.simulators.carla.blueprints as blueprints
 from scenic.simulators.carla.behaviors import *
@@ -13,6 +17,28 @@ from scenic.simulators.metsr.traffic_flows import *
 from scenic.simulators.cosim.simulator import CosimSimulator
 map_town = pathlib.Path(globalParameters.map).stem
 param xml_path = pathlib.Path(globalParameters.xml_map)
+
+_scenicToMetsrLaneMap = generate_map(globalParameters.xml_path)
+_metsrDrivingLaneIDs = frozenset(
+    generate_metsr_lane_index_map(globalParameters.xml_path)
+)
+metsrMappedLaneKeys = frozenset(
+    scenic_lane
+    for scenic_lane, sumo_lanes in _scenicToMetsrLaneMap.items()
+    if any(sumo_lane in _metsrDrivingLaneIDs for sumo_lane in sumo_lanes)
+)
+_metsrMappedLanes = tuple(
+    lane
+    for lane in network.lanes
+    if f"{lane.road.id}_{lane.id}" in metsrMappedLaneKeys
+)
+if not _metsrMappedLanes:
+    raise RuntimeError(
+        f"SUMO map {globalParameters.xml_path} contains no physical driving "
+        "lanes mapped from the Scenic/OpenDRIVE network"
+    )
+metsrMappedRoad = PolygonalRegion.unionAll(_metsrMappedLanes)
+
 param carla_map = map_town
 param metsr_host = "localhost"
 param metsr_port = 4000
@@ -110,6 +136,8 @@ class NPCCar(Car, BackgroundDriver):
     :type behavior: Scenic Behavior
     """
     carla_actor_flag = False
+    regionContainedIn: metsrMappedRoad
+    position: new Point on metsrMappedRoad
     behavior: FollowRandomRoute()
 
 
@@ -168,7 +196,7 @@ behavior CustomBubbleBehavior():
 behavior FollowSingleTrajectoryBehavior(target_speed = 10, trajectory = None, turn_speed=None):
     """
     Follows the given trajectory. The behavior terminates once the end of the trajectory is reached.
-    If no trajectory is supplied, object will follow METSR proposed trajectory by default
+    If no trajectory is supplied, CARLA plans its own path to the METS-R target road
 
     :param target_speed: Its unit is in m/s. By default, it is set to 10 m/s
     :param trajectory: It is a list of sequential lanes to track, from the lane that the vehicle is initially on to the lane it should end up on.

@@ -1,12 +1,17 @@
+import gzip
+import hashlib
 import json
 import logging
+import math
 import os
+import posixpath
 import socket
 import struct
+import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
-
 import networkx as nx
 from websockets.sync.client import connect
 
@@ -28,7 +33,6 @@ from .util import (
     _request_id_from_record,
     _request_zone_from_record,
     _resolve_trajectory_root,
-    _set_road_reference,
     _trajectory_format_name,
     _trajectory_format_score,
     _trajectory_manifest_summary,
@@ -44,7 +48,6 @@ from .util import (
 
 str_list_to_int_list = str_list_mapper_gen(int)
 str_list_to_float_list = str_list_mapper_gen(float)
-
 
 def _normalize_config_json_path(config_json):
     if config_json is None:
@@ -88,6 +91,42 @@ def _sim_folder_from_config(config, sim_dirs=None, sim_index=0, default=None):
     return default
 
 
+def _batch_field_values(value, count, name, batch_name="vehID"):
+    """Broadcast a scalar batch field or validate an explicit sequence."""
+    if _is_sequence(value):
+        values = list(value)
+        if len(values) != count:
+            raise ValueError(f"{name} must have the same length as {batch_name}")
+        return values
+    return [value] * count
+
+
+def _optional_vehicle_lengths(value, count, batch_name):
+    """Broadcast and validate optional vehicle lengths in meters."""
+    values = _batch_field_values(value, count, "length", batch_name=batch_name)
+    normalized = []
+    for index, item in enumerate(values):
+        if item is None:
+            normalized.append(None)
+            continue
+        if isinstance(item, bool):
+            raise ValueError(
+                f"length[{index}] must be a finite positive value in meters"
+            )
+        try:
+            item = float(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"length[{index}] must be a finite positive value in meters"
+            ) from exc
+        if not math.isfinite(item) or item <= 0.0:
+            raise ValueError(
+                f"length[{index}] must be a finite positive value in meters"
+            )
+        normalized.append(item)
+    return normalized
+
+
 _VIZ_STREAM_MAGIC = b"MRTB"
 _VIZ_STREAM_VERSION = 8
 _VIZ_STREAM_DEFAULT_COORD_SCALE = 100000
@@ -97,6 +136,7 @@ _VIZ_STREAM_FRAME_GROUPS = [
     "ev_occupied",
     "ev_relocation",
     "ev_charging",
+    "ev_attack",
     "bus",
     "link",
     "zone",
@@ -108,6 +148,7 @@ _VIZ_STREAM_VEHICLE_FRAME_GROUPS = [
     "ev_occupied",
     "ev_relocation",
     "ev_charging",
+    "ev_attack",
     "bus",
 ]
 _VIZ_STREAM_VEHICLE_TYPES = {
@@ -117,6 +158,7 @@ _VIZ_STREAM_VEHICLE_TYPES = {
     "ev_relocation": 3,
     "ev_charging": 4,
     "bus": 5,
+    "ev_attack": 6,
 }
 _INT32_MIN = -(2 ** 31)
 _INT32_MAX = 2 ** 31 - 1
@@ -174,8 +216,8 @@ def _viz_first(record, *names, default=None):
 
 def _viz_has_xy(record):
     return (
-        _viz_first(record, "x", "lon", "longitude") is not None
-        and _viz_first(record, "y", "lat", "latitude") is not None
+        _viz_first(record, "x") is not None
+        and _viz_first(record, "y") is not None
     )
 
 
@@ -205,7 +247,7 @@ def _viz_sum(records, *field_names):
 
 def _viz_mean_speed(records):
     speeds = [
-        _viz_float(_viz_first(record, "speed", "speed_mps", default=0.0))
+        _viz_float(_viz_first(record, "speed", default=0.0))
         for record in records
     ]
     if not speeds:
@@ -218,8 +260,12 @@ def _viz_record_energy_by_class(records):
     etaxi = 0.0
     ebus = 0.0
     for record in records:
-        energy = _viz_float(_viz_first(record, "energy", "totalEnergy", "totalEnergyConsumed", "totalConsume", default=0.0))
-        vehicle_class = _viz_int(_viz_first(record, "vehicleClass", "v_type", "vehicle_class", default=-1), default=-1)
+        vehicle_class = _viz_int(_viz_first(record, "vehicleClass", default=-1), default=-1)
+        energy = _viz_float(_viz_first(
+            record,
+            "totalEnergyConsumed" if vehicle_class in (1, 2, 3) else "energyConsumed",
+            default=0.0,
+        ))
         if vehicle_class == 3:
             private_ev += energy
         elif vehicle_class == 1:
@@ -244,15 +290,15 @@ def _viz_origin_from_sim_folder(sim_folder):
     )
 
 
-def _viz_resolve_origin(sim_folder, initial_x=None, initial_y=None):
-    folder_origin = _viz_origin_from_sim_folder(sim_folder)
-    if folder_origin is not None:
-        if initial_x is None:
-            initial_x = folder_origin[0]
-        if initial_y is None:
-            initial_y = folder_origin[1]
+def _viz_resolve_origin(sim_folder, initial_x=0.0, initial_y=0.0):
+    initial_x = _viz_float(initial_x, default=0.0)
+    initial_y = _viz_float(initial_y, default=0.0)
+    if sim_folder and initial_x == 0.0 and initial_y == 0.0:
+        folder_origin = _viz_origin_from_sim_folder(sim_folder)
+        if folder_origin is not None:
+            return folder_origin
 
-    return _viz_float(initial_x, default=0.0), _viz_float(initial_y, default=0.0)
+    return initial_x, initial_y
 
 
 def _viz_manifest(road_id_dictionary, coord_scale, initial_x, initial_y, tick_interval,
@@ -282,21 +328,20 @@ def _viz_manifest(road_id_dictionary, coord_scale, initial_x, initial_y, tick_in
     }
 
 def _viz_vehicle_id(record):
-    return _viz_first(record, "ID", "id", "vehID", "vehicle_id", "vid", default=-1)
+    return _viz_first(
+        record, "vehicleId", default=-1,
+    )
 
 
 def _viz_vehicle_class(record):
     return _viz_int(_viz_first(
         record,
-        "vehicleClass",
-        "v_type",
-        "vehicle_class",
-        default=-1,
+        "vehicleClass", default=-1,
     ), default=-1)
 
 
 def _viz_vehicle_state(record):
-    return _viz_int(_viz_first(record, "state", "vehicleState", "tripState", default=-1), default=-1)
+    return _viz_int(_viz_first(record, "state", default=-1), default=-1)
 
 
 def _viz_same_identifier(left, right):
@@ -306,40 +351,13 @@ def _viz_same_identifier(left, right):
 
 
 def _viz_vehicle_origin_id(record):
-    value = _viz_first(
-        record,
-        "originZoneID",
-        "originZoneId",
-        "origin_zone_id",
-        "originId",
-        "origin_id",
-        "origin",
-        default=None,
-    )
-    if value is not None:
-        return value
-
-    value = _viz_first(record, "originID", default=None)
-    road_id = _viz_first(record, "roadID", "roadId", "road", default=None)
-    if value is not None and not _viz_same_identifier(value, road_id):
-        return value
-    return -1
+    return _viz_first(record, "originZoneId", default=-1)
 
 
 def _viz_vehicle_dest_id(record):
     return _viz_first(
         record,
-        "destZoneID",
-        "destZoneId",
-        "dest_zone_id",
-        "destId",
-        "dest_id",
-        "dest",
-        "destinationID",
-        "destinationId",
-        "destination",
-        "destID",
-        default=-1,
+        "destinationZoneId", default=-1,
     )
 
 
@@ -347,12 +365,18 @@ def _viz_vehicle_group_key(record):
     vehicle_class = _viz_vehicle_class(record)
     state = _viz_vehicle_state(record)
     private_flag = _viz_first(record, "_viz_private_veh", default=None)
+    attack_flag = _viz_first(
+        record,
+        "_viz_attack_vehicle", "attackEnabled", default=False,
+    )
 
     if vehicle_class == 0:
         return "vehicle"
     if vehicle_class == 2 or state == 3:
         return "bus"
     if vehicle_class == 1:
+        if bool(attack_flag):
+            return "ev_attack"
         if state == 4:
             return "ev_charging"
         if state == 1:
@@ -379,9 +403,9 @@ def _viz_group_vehicle_records(records):
 
 
 def _viz_vehicle_record_bytes(record, coord_scale, initial_x, initial_y):
-    x = _viz_first(record, "x", "lon", "longitude", default=0.0)
-    y = _viz_first(record, "y", "lat", "latitude", default=0.0)
-    vehicle_class = _viz_first(record, "vehicleClass", "v_type", "vehicle_class", default=-1)
+    x = _viz_first(record, "x", default=0.0)
+    y = _viz_first(record, "y", default=0.0)
+    vehicle_class = _viz_first(record, "vehicleClass", default=-1)
 
     data = bytearray()
     data.extend(_viz_pack_int(_viz_vehicle_id(record), default=-1))
@@ -389,8 +413,8 @@ def _viz_vehicle_record_bytes(record, coord_scale, initial_x, initial_y):
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "prevY", y, initial_y, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(y, initial_y, coord_scale)))
-    data.extend(_viz_pack_float(_viz_first(record, "bearing", "heading", "heading_deg", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "speed", "speed_mps", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "bearing", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "speed", default=0.0)))
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "originX", x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "originY", y, initial_y, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "destX", x, initial_x, coord_scale)))
@@ -400,8 +424,8 @@ def _viz_vehicle_record_bytes(record, coord_scale, initial_x, initial_y):
 
 
 def _viz_ev_base_record_bytes(record, coord_scale, initial_x, initial_y):
-    x = _viz_first(record, "x", "lon", "longitude", default=0.0)
-    y = _viz_first(record, "y", "lat", "latitude", default=0.0)
+    x = _viz_first(record, "x", default=0.0)
+    y = _viz_first(record, "y", default=0.0)
 
     data = bytearray()
     data.extend(_viz_pack_int(_viz_vehicle_id(record), default=-1))
@@ -409,34 +433,36 @@ def _viz_ev_base_record_bytes(record, coord_scale, initial_x, initial_y):
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "prevY", y, initial_y, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(y, initial_y, coord_scale)))
-    data.extend(_viz_pack_float(_viz_first(record, "bearing", "heading", "heading_deg", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "speed", "speed_mps", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "bearing", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "speed", default=0.0)))
     data.extend(_viz_pack_int(_viz_vehicle_origin_id(record), default=-1))
     data.extend(_viz_pack_int(_viz_vehicle_dest_id(record), default=-1))
-    data.extend(_viz_pack_float(_viz_first(record, "battery", "battery_state", "batteryLevel", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "energy", "totalEnergy", "totalEnergyConsumed", "totalConsume", "totalEnergyConsumption", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "battery", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(
+        record, "totalEnergyConsumed", default=0.0,
+    )))
     return data
 
 
 def _viz_private_ev_record_bytes(record, coord_scale, initial_x, initial_y):
     data = _viz_ev_base_record_bytes(record, coord_scale, initial_x, initial_y)
-    data.extend(_viz_pack_int(_viz_first(record, "tripNumber", "trip_number", "numTrip", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "tripNumber", default=0)))
     return data
 
 
 def _viz_etaxi_record_bytes(record, coord_scale, initial_x, initial_y):
     data = _viz_ev_base_record_bytes(record, coord_scale, initial_x, initial_y)
-    data.extend(_viz_pack_int(_viz_first(record, "matchedRequests", "taxiMatchedRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "matchedPassengers", "matchedTaxiPassengers", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "pickupRequests", "pickupTaxiRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "pickupPassengers", "pickupTaxiPassengers", "pass_num", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "dropoffRequests", "dropoffTaxiRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "dropoffPassengers", "dropoffTaxiPassengers", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "matchedRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "matchedPassengers", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "pickupRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "pickupPassengers", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "dropoffRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "dropoffPassengers", default=0)))
     return data
 
 
 def _viz_stop_zones(record):
-    zones = _viz_first(record, "stopZones", "stop_zones", default=[])
+    zones = _viz_first(record, "stopZoneIds", default=[])
     if zones is None:
         return []
     if isinstance(zones, (str, bytes)):
@@ -447,27 +473,27 @@ def _viz_stop_zones(record):
 
 
 def _viz_bus_record_bytes(record, coord_scale, initial_x, initial_y):
-    x = _viz_first(record, "x", "lon", "longitude", default=0.0)
-    y = _viz_first(record, "y", "lat", "latitude", default=0.0)
+    x = _viz_first(record, "x", default=0.0)
+    y = _viz_first(record, "y", default=0.0)
     stop_zones = _viz_stop_zones(record)
 
     data = bytearray()
     data.extend(_viz_pack_int(_viz_vehicle_id(record), default=-1))
-    data.extend(_viz_pack_int(_viz_first(record, "routeID", "routeId", "route_id", "route", default=-1), default=-1))
+    data.extend(_viz_pack_int(_viz_first(record, "routeId", default=-1), default=-1))
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "prevX", x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord_field(record, "prevY", y, initial_y, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(y, initial_y, coord_scale)))
-    data.extend(_viz_pack_float(_viz_first(record, "bearing", "heading", "heading_deg", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "speed", "speed_mps", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "battery", "battery_state", "batteryLevel", default=0.0)))
-    data.extend(_viz_pack_float(_viz_first(record, "energy", "totalEnergy", "totalEnergyConsumed", "totalConsume", "totalEnergyConsumption", default=0.0)))
-    data.extend(_viz_pack_int(_viz_first(record, "matchedRequests", "busMatchedRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "matchedPassengers", "matchedBusPassengers", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "pickupRequests", "pickupBusRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "pickupPassengers", "pickupBusPassengers", "pass_num", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "dropoffRequests", "dropoffBusRequests", default=0)))
-    data.extend(_viz_pack_int(_viz_first(record, "dropoffPassengers", "dropoffBusPassengers", default=0)))
+    data.extend(_viz_pack_float(_viz_first(record, "bearing", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "speed", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "battery", default=0.0)))
+    data.extend(_viz_pack_float(_viz_first(record, "energyConsumed", default=0.0)))
+    data.extend(_viz_pack_int(_viz_first(record, "matchedRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "matchedPassengers", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "pickupRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "pickupPassengers", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "dropoffRequests", default=0)))
+    data.extend(_viz_pack_int(_viz_first(record, "dropoffPassengers", default=0)))
     data.extend(_viz_pack_int(len(stop_zones)))
     for stop_zone in stop_zones:
         data.extend(_viz_pack_int(stop_zone, default=-1))
@@ -479,7 +505,7 @@ def _viz_vehicle_group_record_bytes(group_key, record, coord_scale, initial_x, i
         return _viz_vehicle_record_bytes(record, coord_scale, initial_x, initial_y)
     if group_key == "ev_private":
         return _viz_private_ev_record_bytes(record, coord_scale, initial_x, initial_y)
-    if group_key in ("ev_occupied", "ev_relocation", "ev_charging"):
+    if group_key in ("ev_occupied", "ev_relocation", "ev_charging", "ev_attack"):
         return _viz_etaxi_record_bytes(record, coord_scale, initial_x, initial_y)
     if group_key == "bus":
         return _viz_bus_record_bytes(record, coord_scale, initial_x, initial_y)
@@ -494,49 +520,61 @@ def _viz_record_float(record, *names, default=0.0):
 
 
 def _viz_link_record_bytes(record, road_id_index):
-    road_id = _viz_first(record, "ID", "roadID", "roadId", "originID", "origID", "orig_id", default=None)
+    road_id = _viz_first(record, "segmentId", default=None)
     index = None if road_id is None else road_id_index.get(str(road_id))
     if index is None:
-        index = _viz_first(record, "roadIndex", "road_index", default=None)
+        index = _viz_first(record, "visualizationIndex", default=None)
     if index is None:
         return None
 
     data = bytearray()
     data.extend(_viz_pack_int(index))
-    data.extend(_viz_pack_int(_viz_record_int(record, "num_veh", "nVehicles", "count")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "speed", "avgSpeed", "meanSpeed")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "flow", "totalFlow")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "energy", "energy_consumed", "totalEnergy")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "parkingCapacity", "parking_capacity")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "parkedNum", "parked_num")))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "vehicleCount",
+    )))
+    data.extend(_viz_pack_float(_viz_record_float(record, "speed")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "flow")))
+    data.extend(_viz_pack_float(_viz_record_float(
+        record, "energyConsumed",
+    )))
+    data.extend(_viz_pack_int(_viz_record_int(record, "parkingCapacity")))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "parkedVehicleCount",
+    )))
     return data
 
 
 def _viz_zone_record_bytes(record, coord_scale, initial_x, initial_y):
-    x = _viz_first(record, "x", "lon", "longitude", default=None)
-    y = _viz_first(record, "y", "lat", "latitude", default=None)
+    x = _viz_first(record, "x", default=None)
+    y = _viz_first(record, "y", default=None)
     if x is None or y is None:
         return None
 
     data = bytearray()
-    data.extend(_viz_pack_int(_viz_record_int(record, "ID", "id", "zoneID", "zoneId", default=-1), default=-1))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "zoneId", default=-1,
+    ), default=-1))
     data.extend(_viz_pack_int(_viz_scaled_coord(x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(y, initial_y, coord_scale)))
-    data.extend(_viz_pack_int(_viz_record_int(record, "zoneType", "z_type")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "zoneType")))
     data.extend(_viz_pack_int(_viz_record_int(record, "capacity")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "vehicleStock", "veh_stock")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "taxiRequest", "taxi_demand")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "busRequest", "bus_demand")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "vehicleStock")))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "taxiDemand",
+    )))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "busDemand",
+    )))
     data.extend(_viz_pack_int(_viz_record_int(record, "generatedTaxi")))
     data.extend(_viz_pack_int(_viz_record_int(record, "generatedBus")))
     data.extend(_viz_pack_int(_viz_record_int(record, "generatedPrivateEV")))
     data.extend(_viz_pack_int(_viz_record_int(record, "generatedPrivateGV")))
     data.extend(_viz_pack_int(_viz_record_int(record, "arrivedPrivateEV")))
     data.extend(_viz_pack_int(_viz_record_int(record, "arrivedPrivateGV")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "taxiPickup", "pickupTaxiRequests")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "busPickup", "pickupBusRequests")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "taxiServed", "dropoffTaxiRequests", "taxiDropoffRequests")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "busServed", "dropoffBusRequests", "busDropoffRequests")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "pickupTaxiRequests")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "pickupBusRequests")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "dropoffTaxiRequests")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "dropoffBusRequests")))
     data.extend(_viz_pack_int(_viz_record_int(record, "leftTaxiRequests")))
     data.extend(_viz_pack_int(_viz_record_int(record, "leftBusRequests")))
     data.extend(_viz_pack_int(_viz_record_int(record, "leftTaxiPassengers")))
@@ -546,8 +584,8 @@ def _viz_zone_record_bytes(record, coord_scale, initial_x, initial_y):
     data.extend(_viz_pack_float(_viz_record_float(record, "futureDemand")))
     data.extend(_viz_pack_float(_viz_record_float(record, "vehicleSurplus")))
     data.extend(_viz_pack_float(_viz_record_float(record, "vehicleDeficiency")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "taxiServedWait", "taxiDropoffWait")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "busServedWait", "busDropoffWait")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "taxiDropoffWait")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "busDropoffWait")))
     data.extend(_viz_pack_int(_viz_record_int(record, "taxiLeftWait")))
     data.extend(_viz_pack_int(_viz_record_int(record, "busLeftWait")))
     data.extend(_viz_pack_int(_viz_record_int(record, "taxiParkingTime")))
@@ -556,33 +594,35 @@ def _viz_zone_record_bytes(record, coord_scale, initial_x, initial_y):
 
 
 def _viz_charging_station_record_bytes(record, coord_scale, initial_x, initial_y):
-    x = _viz_first(record, "x", "lon", "longitude", default=None)
-    y = _viz_first(record, "y", "lat", "latitude", default=None)
+    x = _viz_first(record, "x", default=None)
+    y = _viz_first(record, "y", default=None)
     if x is None or y is None:
         return None
 
     data = bytearray()
-    data.extend(_viz_pack_int(_viz_record_int(record, "ID", "id", "stationID", "stationId", default=-1), default=-1))
+    data.extend(_viz_pack_int(_viz_record_int(
+        record, "chargingStationId", default=-1,
+    ), default=-1))
     data.extend(_viz_pack_int(_viz_scaled_coord(x, initial_x, coord_scale)))
     data.extend(_viz_pack_int(_viz_scaled_coord(y, initial_y, coord_scale)))
-    data.extend(_viz_pack_int(_viz_record_int(record, "queueL2", "queue_l2")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "queueL3", "queue_dcfc")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "queueBus", "queue_bus")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "chargingL2", "charging_l2")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "chargingL3", "charging_dcfc")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "chargingBus", "charging_bus")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "freeL2", "num_available_l2")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "freeL3", "num_available_dcfc")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "freeBus", "num_available_bus")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "numL2", "l2_charger")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "numL3", "dcfc_charger")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "numBus", "bus_charger")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "chargedCar")))
-    data.extend(_viz_pack_int(_viz_record_int(record, "chargedBus")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "priceL2", "l2_price")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "priceL3", "dcfc_price")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "waitingTimeL2")))
-    data.extend(_viz_pack_float(_viz_record_float(record, "waitingTimeL3")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "level2QueueCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "level3QueueCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "busQueueCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "chargingLevel2Count")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "chargingLevel3Count")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "chargingBusCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "availableLevel2ChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "availableLevel3ChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "availableBusChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "level2ChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "level3ChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "busChargerCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "chargedVehicleCount")))
+    data.extend(_viz_pack_int(_viz_record_int(record, "chargedBusCount")))
+    data.extend(_viz_pack_float(_viz_record_float(record, "level2Price")))
+    data.extend(_viz_pack_float(_viz_record_float(record, "level3Price")))
+    data.extend(_viz_pack_float(_viz_record_float(record, "level2WaitingTime")))
+    data.extend(_viz_pack_float(_viz_record_float(record, "level3WaitingTime")))
     data.extend(_viz_pack_int(_viz_record_int(record, "active", default=1), default=1))
     return data
 
@@ -664,14 +704,14 @@ def _viz_chunk(records, tick, coord_scale, initial_x, initial_y, tick_interval,
     data.extend(_viz_pack_int(link_snapshot_interval))
 
     data.extend(_viz_pack_int(tick))
-    data.extend(_viz_pack_int(_viz_sum(records, "matchedRequests", "taxiMatchedRequests", "busMatchedRequests")))
-    data.extend(_viz_pack_int(_viz_sum(records, "matchedPassengers", "matchedTaxiPassengers", "matchedBusPassengers")))
-    data.extend(_viz_pack_int(_viz_sum(records, "pickupRequests", "pickupTaxiRequests", "pickupBusRequests")))
-    data.extend(_viz_pack_int(_viz_sum(records, "pickupPassengers", "pickupTaxiPassengers", "pickupBusPassengers")))
-    data.extend(_viz_pack_int(_viz_sum(records, "dropoffRequests", "dropoffTaxiRequests", "dropoffBusRequests")))
-    data.extend(_viz_pack_int(_viz_sum(records, "dropoffPassengers", "dropoffTaxiPassengers", "dropoffBusPassengers")))
-    data.extend(_viz_pack_int(_viz_sum(records, "leftRequests", "leftTaxiRequests", "leftBusRequests")))
-    data.extend(_viz_pack_int(_viz_sum(records, "leftPassengers", "leftTaxiPassengers", "leftBusPassengers")))
+    data.extend(_viz_pack_int(_viz_sum(records, "matchedRequests")))
+    data.extend(_viz_pack_int(_viz_sum(records, "matchedPassengers")))
+    data.extend(_viz_pack_int(_viz_sum(records, "pickupRequests")))
+    data.extend(_viz_pack_int(_viz_sum(records, "pickupPassengers")))
+    data.extend(_viz_pack_int(_viz_sum(records, "dropoffRequests")))
+    data.extend(_viz_pack_int(_viz_sum(records, "dropoffPassengers")))
+    data.extend(_viz_pack_int(_viz_sum(records, "leftRequests")))
+    data.extend(_viz_pack_int(_viz_sum(records, "leftPassengers")))
     data.extend(_viz_pack_float(private_ev_energy + etaxi_energy + ebus_energy))
     data.extend(_viz_pack_int(len(records)))
     data.extend(_viz_pack_float(_viz_mean_speed(records)))
@@ -716,10 +756,20 @@ Acknowledgement: Eric Vin for helping with the revision of the code
 # 2. listerize the query and control function by adding a for loop (is list, go for list, otherwise make it a list with one element)
 
 class METSRClient:
+    """WebSocket client for the native METS-R SIM API schema.
+    METS-R SIM no longer accepts the retired TYPE/DATA/CODE V1 envelope or a
+    schemaVersion selector. Requests use messageType/data directly; responses
+    add status and canonical camelCase fields.
+    """
+
     SENSOR_DSRC = VEHICLE_SENSOR_DSRC
     SENSOR_CV2X = VEHICLE_SENSOR_CV2X
     SENSOR_MOBILE_DEVICE = VEHICLE_SENSOR_MOBILE_DEVICE
     VEHICLE_SENSOR_TYPES = VEHICLE_SENSOR_TYPES
+    _ROUTING_TOPOLOGY_SCHEMA_VERSION = 2
+    _ROUTING_TOPOLOGY_CACHE_LOCK = threading.Lock()
+    _ROUTING_TOPOLOGY_MEMORY_CACHE = {}
+    _NETWORK_SHA256_CACHE = {}
 
     def __init__(
             self,
@@ -748,6 +798,18 @@ class METSRClient:
         self.config_signature = _config_signature_from_path(self.config_json)
         self.config = config
         self.sim_index = int(sim_index)
+        if config is not None:
+            try:
+                self._client_config_values = dict(vars(config))
+            except TypeError:
+                self._client_config_values = {}
+        elif self.config_signature:
+            try:
+                self._client_config_values = json.loads(self.config_signature)
+            except (TypeError, ValueError):
+                self._client_config_values = {}
+        else:
+            self._client_config_values = {}
         self._connection_settings = {
             "max_connection_attempts": max_connection_attempts,
             "connection_retry_interval": connection_retry_interval,
@@ -755,11 +817,40 @@ class METSRClient:
             "max_connection_wait": max_connection_wait,
         }
 
-        self.sim_folder = sim_folder # this is required for open the visualization server
+        self.sim_folder = sim_folder # optional for live viz; used for origin fallback and offline trajectory lookup
         self.state = "connecting"
         self.timeout = timeout  # time out for resending the same message if no response
         self.verbose = verbose
         self._messagesLog = []
+        self._last_fatal_log_check = float("-inf")
+        self._cached_fatal_log_error = None
+        self._last_response_bytes = 0
+        self._capabilities_cache = None
+        self._optimized_api_available = None
+        self._feature_support = {}
+        self._legacy_command_results = {}
+        self._profile_lock = threading.Lock()
+        self.rpc_profile = {
+            "rpc_count": 0,
+            "request_bytes": 0,
+            "response_bytes": 0,
+            "json_encode_time": 0.0,
+            "json_decode_time": 0.0,
+            "socket_wait_time": 0.0,
+            "server_tick_time": 0.0,
+            "server_ticks": 0,
+        }
+        # Readable alias for dashboards and lightweight experiment loggers.
+        self.profiling = self.rpc_profile
+        self.startup_timings = {
+            "connection_seconds": None,
+            "network_load_seconds": None,
+            "fleet_spawn_seconds": None,
+        }
+        self.websocket_max_size = max(
+            1024,
+            int(self._client_config_value("websocket_max_size", 10 * 1024 * 1024)),
+        )
 
         # a pointer to the manager, for HPC usage that one manager controls multiple clients
         self.manager = manager
@@ -784,13 +875,15 @@ class METSRClient:
         self.viz_stream_chunk_counter = 0
         self.viz_stream_last_tick = None
         self.viz_stream_last_active_road_ids = set()
+        self._attack_vehicle_keys = set()
         self.offline_viz_start_kwargs = None
- 
+
         # Track the tick of the corresponding simulator
         self.current_tick = None
 
         # Establish connection
         connection_start = time.time()
+        connection_profile_start = time.perf_counter()
         max_connection_wait = (
             max_connection_wait
             if max_connection_wait is not None
@@ -801,7 +894,7 @@ class METSRClient:
             try:
                 self.ws = connect(
                     self.uri,
-                    max_size = 10 * 1024 * 1024,
+                    max_size = self.websocket_max_size,
                     ping_interval = None,
                     ping_timeout = None,
                     open_timeout = connection_open_timeout,
@@ -827,16 +920,167 @@ class METSRClient:
                         f"Retrying in {sleep_seconds:.1f} seconds..."
                     )
                 time.sleep(sleep_seconds)
-                
+
 
         print("Connection established!")
 
-        # Ensure server is initialized by waiting to receive an initial packet
-        # (could be ANS_ready or a heartbeat)
-        self.receive_msg(ignore_heartbeats=False, return_ready=True)
+        # Do not expose a connected client until METS-R has completed startup.
+        self._await_simulator_ready()
+        self.startup_timings["connection_seconds"] = (
+            time.perf_counter() - connection_profile_start
+        )
+        self.startup_timings.update(self._simulator_startup_log_timings())
+        self._record_launcher_startup_timings()
 
         self.lock = threading.Lock()
         register_metsr_client(self)
+
+    def _client_config_value(self, name, default=None):
+        if self.config is not None:
+            value = getattr(self.config, name, None)
+            if value is not None:
+                return value
+        value = self._client_config_values.get(name)
+        return default if value is None else value
+
+    def _await_simulator_ready(self):
+        """Wait for the simulator's explicit readiness acknowledgement."""
+        ready_timeout = max(
+            0.1,
+            float(self._client_config_value("startup_ready_timeout", self.timeout)),
+        )
+        try:
+            response = self.receive_msg(
+                ignore_heartbeats=False,
+                waiting_forever=False,
+                return_ready=True,
+                print_timeout=False,
+                timeout=ready_timeout,
+            )
+            if response is None:
+                raise TimeoutError(
+                    f"METS-R SIM accepted the WebSocket connection at {self.uri} "
+                    f"but did not report ready within {ready_timeout:.1f} seconds"
+                )
+            if response.get("messageType") != "ready":
+                raise RuntimeError(
+                    "Expected METS-R SIM ready response, received "
+                    + str(response.get("messageType"))
+                )
+            return response
+        except Exception:
+            self.state = "failed"
+            websocket = getattr(self, "ws", None)
+            if websocket is not None:
+                try:
+                    websocket.close()
+                except Exception:
+                    pass
+                self.ws = None
+            raise
+
+    def _configured_sim_step_size(self):
+        configured = self._client_config_value("sim_step_size", None)
+        if configured is not None:
+            value = float(configured)
+        else:
+            value = None
+            candidates = []
+            if self.sim_folder:
+                candidates.extend((
+                    os.path.join(self.sim_folder, "data", "Data.properties"),
+                    os.path.join(self.sim_folder, "Data.properties"),
+                ))
+            for properties_path in candidates:
+                try:
+                    with open(properties_path, "r", encoding="utf-8") as properties:
+                        for line in properties:
+                            key, separator, raw_value = line.partition("=")
+                            if separator and key.strip() == "SIMULATION_STEP_SIZE":
+                                value = float(raw_value.strip())
+                                break
+                except (OSError, TypeError, ValueError):
+                    continue
+                if value is not None:
+                    break
+        if value is None:
+            raise RuntimeError(
+                "Simulation step size is unavailable; pass config/config_json "
+                "with sim_step_size or provide sim_folder/data/Data.properties"
+            )
+        if value <= 0.0:
+            raise ValueError("sim_step_size must be positive")
+        return value
+
+    def _simulator_startup_log_timings(self):
+        timings = {
+            "network_load_seconds": None,
+            "fleet_spawn_seconds": None,
+        }
+        if not self.sim_folder:
+            return timings
+        log_path = os.path.join(self.sim_folder, "logs", "mets_r.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
+                lines = log_file.readlines()
+        except OSError:
+            return timings
+
+        build_ms = None
+        vehicle_ms = None
+        fleet_end_ms = None
+        for line in lines:
+            first_token = line.lstrip().split(None, 1)
+            if not first_token:
+                continue
+            token = first_token[0].strip("[]")
+            if not token.isdigit():
+                continue
+            relative_ms = int(token)
+            if "Building subcontexts" in line:
+                build_ms = relative_ms
+                vehicle_ms = None
+                fleet_end_ms = None
+            elif build_ms is not None and "VehicleContext creation" in line:
+                vehicle_ms = relative_ms
+            elif vehicle_ms is not None and "Total EV taxis generated" in line:
+                fleet_end_ms = relative_ms
+            elif vehicle_ms is not None and "Total EV buses generated" in line:
+                fleet_end_ms = relative_ms
+
+        if build_ms is not None and vehicle_ms is not None and vehicle_ms >= build_ms:
+            timings["network_load_seconds"] = (vehicle_ms - build_ms) / 1000.0
+        if vehicle_ms is not None and fleet_end_ms is not None and fleet_end_ms >= vehicle_ms:
+            timings["fleet_spawn_seconds"] = (fleet_end_ms - vehicle_ms) / 1000.0
+        return timings
+
+    def _record_launcher_startup_timings(self):
+        handles = getattr(self.config, "launch_handles", None) if self.config else None
+        if not handles:
+            return
+        try:
+            handle = handles[self.sim_index]
+        except (IndexError, KeyError, TypeError):
+            return
+        recorder = getattr(handle, "record_timing", None)
+        if not callable(recorder):
+            return
+        existing_timings = getattr(handle, "_timings", None)
+        if not isinstance(existing_timings, dict):
+            try:
+                candidate = getattr(handle, "timings", None)
+            except Exception:
+                candidate = None
+            existing_timings = candidate if isinstance(candidate, dict) else {}
+        for phase, key in (
+                ("connection", "connection_seconds"),
+                ("network_load", "network_load_seconds"),
+                ("fleet_spawn", "fleet_spawn_seconds")):
+            value = self.startup_timings.get(key)
+            if (
+                    value is not None
+                    and existing_timings.get(phase) is None):
+                recorder(phase, value)
 
     def _connect(
             self,
@@ -844,6 +1088,12 @@ class METSRClient:
             connection_retry_interval = 0.5,
             connection_open_timeout = 1,
             max_connection_wait = None):
+        self._cached_fatal_log_error = None
+        self._last_fatal_log_check = float("-inf")
+        self._capabilities_cache = None
+        self._optimized_api_available = None
+        self._feature_support.clear()
+        connection_profile_start = time.perf_counter()
         connection_start = time.time()
         max_connection_wait = (
             max_connection_wait
@@ -855,7 +1105,7 @@ class METSRClient:
             try:
                 self.ws = connect(
                     self.uri,
-                    max_size = 10 * 1024 * 1024,
+                    max_size = self.websocket_max_size,
                     ping_interval = None,
                     ping_timeout = None,
                     open_timeout = connection_open_timeout,
@@ -883,9 +1133,68 @@ class METSRClient:
                 time.sleep(sleep_seconds)
 
         print("Connection established!")
-        self.receive_msg(ignore_heartbeats=False, return_ready=True)
+        self._await_simulator_ready()
+        self.startup_timings["connection_seconds"] = (
+            time.perf_counter() - connection_profile_start
+        )
+        self.startup_timings.update(self._simulator_startup_log_timings())
+        self._record_launcher_startup_timings()
 
-    def _fatal_log_error(self):
+    def _profile_add(self, **values):
+        lock = getattr(self, "_profile_lock", None)
+        profile = getattr(self, "rpc_profile", None)
+        if lock is None or profile is None:
+            return
+        with lock:
+            for key, value in values.items():
+                profile[key] = profile.get(key, 0) + value
+
+    def get_rpc_profile(self, reset=False):
+        """Return a stable snapshot of cumulative client-side RPC timings."""
+        with self._profile_lock:
+            profile = dict(self.rpc_profile)
+            if reset:
+                for key in self.rpc_profile:
+                    self.rpc_profile[key] = (
+                        0.0 if key.endswith("_time") else 0
+                    )
+        profile["total_bytes"] = profile["request_bytes"] + profile["response_bytes"]
+        tick_count = profile["server_ticks"]
+        profile["average_server_tick_time"] = (
+            profile["server_tick_time"] / tick_count if tick_count else 0.0
+        )
+        return profile
+
+    def get_profile(self, reset=False):
+        """Return RPC profiling together with startup phase timings."""
+        profile = self.get_rpc_profile(reset=reset)
+        profile["startup_timings"] = dict(self.startup_timings)
+        profile.update(self.startup_timings)
+        return profile
+
+    def reset_rpc_profile(self):
+        """Reset RPC byte, count, JSON, socket, and stepping counters."""
+        with self._profile_lock:
+            for key in self.rpc_profile:
+                self.rpc_profile[key] = 0.0 if key.endswith("_time") else 0
+
+    def _record_server_tick_time(self, started_at, starting_tick):
+        if self.current_tick is None:
+            return
+        advanced = max(0, int(self.current_tick) - int(starting_tick))
+        if advanced:
+            self._profile_add(
+                server_tick_time=max(0.0, time.perf_counter() - started_at),
+                server_ticks=advanced,
+            )
+
+    def _fatal_log_error(self, force=False):
+        now = time.monotonic()
+        if self._cached_fatal_log_error is not None:
+            return self._cached_fatal_log_error
+        if not force and now - self._last_fatal_log_check < 1.0:
+            return None
+        self._last_fatal_log_check = now
         if not self.sim_folder:
             return None
 
@@ -916,22 +1225,56 @@ class METSRClient:
                 "Control API change. Add an Integer maxWaitingTime field to "
                 "MessageClass.ZoneIDOrigDestRouteNameNum and rebuild METS-R_SIM."
             )
-        return f"METS-R simulator reported a fatal JVM error in {log_path}:\n{excerpt}{guidance}"
+        self._cached_fatal_log_error = (
+            f"METS-R simulator reported a fatal JVM error in {log_path}:\n{excerpt}{guidance}"
+        )
+        return self._cached_fatal_log_error
+
+    @staticmethod
+    def _validate_wire_message(msg):
+        if not isinstance(msg, dict):
+            raise TypeError("METS-R SIM requests must be mappings")
+        retired = sorted({"TYPE", "DATA", "CODE"}.intersection(msg))
+        if retired:
+            raise ValueError(
+                "METS-R SIM V1 fields are no longer supported: "
+                + ", ".join(retired)
+            )
+        if "schemaVersion" in msg or "schema_version" in msg:
+            raise ValueError(
+                "METS-R SIM no longer accepts a schemaVersion selector"
+            )
+        operation = msg.get("messageType")
+        if not isinstance(operation, str) or not operation:
+            raise ValueError("METS-R SIM requests require a messageType")
+        return msg
 
     def send_msg(self, msg):
+        wire_msg = self._validate_wire_message(msg)
         if self.verbose:
-            self._logMessage("SENT", msg)
-        self.ws.send(json.dumps(msg))
+            self._logMessage("SENT", wire_msg)
+        encode_start = time.perf_counter()
+        payload = json.dumps(wire_msg)
+        encode_time = time.perf_counter() - encode_start
+        request_bytes = len(payload.encode("utf-8"))
+        self._profile_add(
+            rpc_count=1,
+            request_bytes=request_bytes,
+            json_encode_time=encode_time,
+        )
+        self.ws.send(payload)
 
     def _update_current_tick_from_message(self, msg):
-        msg_type = msg.get("TYPE")
-        if msg_type not in {"STEP", "ANS_tick", "CTRL_load", "CTRL_reset"}:
+        msg_type = msg.get("messageType")
+        if msg_type not in {
+                "step", "tick", "load", "reset",
+                "advanceAndSnapshot"}:
             return False
-        tick_value = msg.get("TICK", msg.get("tick"))
+        tick_value = msg.get("tick", msg.get("finalTick"))
         if tick_value is None:
             return False
         server_tick = int(tick_value)
-        if msg_type in {"CTRL_load", "CTRL_reset"}:
+        if msg_type in {"load", "reset"}:
             self.current_tick = server_tick
             return True
         if self.current_tick is None or server_tick > int(self.current_tick):
@@ -945,7 +1288,8 @@ class METSRClient:
             waiting_forever = True,
             return_ready = False,
             print_timeout = True,
-            timeout = None):
+            timeout = None,
+            return_errors = False):
         timeout = self.timeout if timeout is None else timeout
         start_time = time.time()
         while True:
@@ -953,54 +1297,131 @@ class METSRClient:
             if fatal_error:
                 raise RuntimeError(fatal_error)
             try:
-                raw_msg = self.ws.recv(timeout = min(5, max(0.1, timeout)))
+                socket_wait_start = time.perf_counter()
+                try:
+                    raw_msg = self.ws.recv(timeout = min(5, max(0.1, timeout)))
+                finally:
+                    self._profile_add(
+                        socket_wait_time=time.perf_counter() - socket_wait_start
+                    )
 
-                # Decode the json string
-                msg = json.loads(str(raw_msg))
+                if isinstance(raw_msg, bytes):
+                    response_bytes = len(raw_msg)
+                    raw_text = raw_msg.decode("utf-8")
+                else:
+                    raw_text = str(raw_msg)
+                    response_bytes = len(raw_text.encode("utf-8"))
+                self._last_response_bytes = response_bytes
+                decode_start = time.perf_counter()
+                try:
+                    msg = json.loads(raw_text)
+                finally:
+                    self._profile_add(
+                        response_bytes=response_bytes,
+                        json_decode_time=time.perf_counter() - decode_start,
+                    )
 
                 if self.verbose:
                     self._logMessage("RECEIVED", msg)
-
-                # EVERY decoded msg must have a TYPE field
-                if "TYPE" not in msg.keys():
-                    raise RuntimeError("No type field in received message")
-                if msg["TYPE"].split("_")[0] not in {"STEP", "ANS", "CTRL", "ATK"}:
-                    raise RuntimeError("Uknown message type: " + str(msg["TYPE"]))
+                if not isinstance(msg, dict):
+                    raise RuntimeError("METS-R SIM response must be a JSON object")
+                retired = sorted({"TYPE", "DATA", "CODE"}.intersection(msg))
+                if retired:
+                    raise RuntimeError(
+                        "METS-R SIM returned retired V1 fields: "
+                        + ", ".join(retired)
+                    )
+                if "schemaVersion" in msg or "schema_version" in msg:
+                    raise RuntimeError(
+                        "METS-R SIM returned a retired schemaVersion envelope"
+                    )
+                msg_type = msg.get("messageType")
+                if not isinstance(msg_type, str) or not msg_type:
+                    raise RuntimeError(
+                        "METS-R SIM response is missing messageType"
+                    )
+                status = msg.get("status")
+                if status not in {"ok", "partial", "error"}:
+                    raise RuntimeError(
+                        "METS-R SIM response has an invalid or missing status"
+                    )
 
                 self._update_current_tick_from_message(msg)
 
-                # Allow tick()
-                if msg["TYPE"] in {"ANS_ready"}:
-                    self.current_tick = 0
+                if msg_type == "ready":
+                    if self.current_tick is None:
+                        self.current_tick = 0
                     if return_ready:
                         return msg
                     continue
 
-                # Allow error message
-                if msg["TYPE"] in {"ANS_error"}:
-                    print(f"Error: {msg['MSG']}")
+                if msg_type == "error" and not return_errors:
+                    print(f"Error: {msg.get('message', 'Unknown METS-R SIM error')}")
                     return None
 
-                # Return decoded message, if it's not an ignored heartbeat
-                if not ignore_heartbeats or msg["TYPE"] != "STEP":
+                if not ignore_heartbeats or msg_type != "step":
                     return msg
             except KeyboardInterrupt:
                 raise
             except TimeoutError:
-                pass
+                fatal_error = self._fatal_log_error(force=True)
+                if fatal_error:
+                    raise RuntimeError(fatal_error)
             except Exception as exc:
-                fatal_error = self._fatal_log_error()
+                fatal_error = self._fatal_log_error(force=True)
                 if fatal_error:
                     raise RuntimeError(fatal_error) from exc
                 self.state = "failed"
-                raise RuntimeError(f"Error while receiving message from METS-R SIM at {self.uri}: {exc}") from exc
-            
+                raise RuntimeError(
+                    f"Error while receiving message from METS-R SIM at "
+                    f"{self.uri}: {exc}"
+                ) from exc
+
             if time.time() - start_time > timeout and not waiting_forever:
                 if print_timeout:
                     print("Timeout while waiting for message.")
                 return None
-            
-    def send_receive_msg(self, msg, ignore_heartbeats, max_attempts=5): 
+
+    @staticmethod
+    def _retryable_control_message(msg, max_attempts, command_id=None):
+        # advanceAndSnapshot is the only operation with server-side command-ID
+        # deduplication. Other control retries retain their historical behavior.
+        if msg.get("messageType") != "advanceAndSnapshot" or max_attempts == 1:
+            return msg
+
+        wire_msg = dict(msg)
+        data = dict(wire_msg.get("data") or {})
+        if command_id is None:
+            command_id = data.get("commandId")
+        if command_id is None:
+            command_id = uuid.uuid4().hex
+        data.setdefault("commandId", str(command_id))
+        wire_msg["data"] = data
+        return wire_msg
+
+    @staticmethod
+    def _response_matches_request(request, response, response_matcher=None):
+        if (
+                isinstance(response, dict)
+                and response.get("messageType") == "advanceAndSnapshot"
+                and request.get("messageType") != "advanceAndSnapshot"):
+            return False
+        return response_matcher is None or bool(response_matcher(response))
+
+    def send_receive_msg(
+            self,
+            msg,
+            ignore_heartbeats,
+            max_attempts=5,
+            timeout=None,
+            return_errors=False,
+            command_id=None,
+            response_matcher=None):
+        msg = self._retryable_control_message(msg, max_attempts, command_id=command_id)
+        response_timeout = max(
+            0.1,
+            float(self.timeout if timeout is None else timeout),
+        )
         with self.lock:
             res = None
             num_attempts = 0
@@ -1008,38 +1429,67 @@ class METSRClient:
                 while res is None:
                     num_attempts += 1
                     self.send_msg(msg)
-                    if(max_attempts > 0):
-                        res = self.receive_msg(
-                            ignore_heartbeats=ignore_heartbeats,
-                            waiting_forever=False,
-                            print_timeout=False,
-                        )
-                        if num_attempts >= max_attempts:
+                    if max_attempts > 0:
+                        response_deadline = time.monotonic() + response_timeout
+                        while True:
+                            remaining = response_deadline - time.monotonic()
+                            if remaining <= 0.0:
+                                res = None
+                                break
+                            candidate = self.receive_msg(
+                                ignore_heartbeats=ignore_heartbeats,
+                                waiting_forever=False,
+                                print_timeout=False,
+                                timeout=remaining,
+                                return_errors=return_errors,
+                            )
+                            if candidate is None:
+                                res = None
+                                break
+                            if self._response_matches_request(
+                                    msg,
+                                    candidate,
+                                    response_matcher=response_matcher):
+                                res = candidate
+                                break
+                        if res is None and num_attempts >= max_attempts:
                             raise TimeoutError(
-                                f"No response received for '{msg.get('TYPE', 'unknown')}' "
+                                f"No response received for '{msg.get('messageType', 'unknown')}' "
                                 f"after {max_attempts} attempts; last STEP tick seen was {self.current_tick}"
                             )
                     else:
-                        res = self.receive_msg(ignore_heartbeats=ignore_heartbeats, waiting_forever=True)
+                        while True:
+                            candidate = self.receive_msg(
+                                ignore_heartbeats=ignore_heartbeats,
+                                waiting_forever=True,
+                                timeout=timeout,
+                                return_errors=return_errors,
+                            )
+                            if self._response_matches_request(
+                                    msg,
+                                    candidate,
+                                    response_matcher=response_matcher):
+                                res = candidate
+                                break
             except KeyboardInterrupt:
                 print("\nKeyboardInterrupt detected. Stopping the current operation but keeping the server active.")
                 return None  # Return None to indicate the operation was interrupted
             return res
 
     def _apply_tick_response(self, res):
-        if res.get("TYPE") != "ANS_tick":
-            raise RuntimeError(f"Expected ANS_tick, received {res.get('TYPE')}")
-        if res.get("CODE", "OK") != "OK":
-            raise RuntimeError(f"METS-R SIM rejected QUERY_tick: {res}")
-        if "TICK" not in res:
-            raise RuntimeError(f"METS-R SIM QUERY_tick response is missing TICK: {res}")
+        if res.get("messageType") != "tick":
+            raise RuntimeError(f"Expected tick, received {res.get('messageType')}")
+        if res.get("status", "ok") != "ok":
+            raise RuntimeError(f"METS-R SIM rejected tick query: {res}")
+        if "tick" not in res:
+            raise RuntimeError(f"METS-R SIM query tick response is missing tick: {res}")
         self._update_current_tick_from_message(res)
-        return int(res["TICK"])
+        return int(res["tick"])
 
     def _query_tick_locked(self, timeout = None):
         """Query server tick while self.lock is already held."""
         before_tick = self.current_tick
-        self.send_msg({"TYPE": "QUERY_tick"})
+        self.send_msg({"messageType": "tick"})
         res = self.receive_msg(
             ignore_heartbeats=True,
             waiting_forever=False,
@@ -1054,8 +1504,61 @@ class METSRClient:
 
     def query_tick(self):
         """Return the current simulation tick reported by METS-R SIM."""
-        res = self.send_receive_msg({"TYPE": "QUERY_tick"}, ignore_heartbeats=True)
+        res = self.send_receive_msg({"messageType": "tick"}, ignore_heartbeats=True)
         return self._apply_tick_response(res)
+
+    @staticmethod
+    def _is_unsupported_response(response):
+        if response is None or not isinstance(response, dict):
+            return True
+        if response.get("messageType") == "error":
+            return True
+        if str(response.get("status", "ok")).lower() != "error":
+            return False
+        detail = " ".join(
+            str(response.get(key, ""))
+            for key in ("message", "errorCode")
+        ).lower()
+        return any(
+            marker in detail
+            for marker in ("unknown", "unsupported", "unrecognized", "not found")
+        )
+
+    def query_capabilities(self, refresh=False):
+        """Return capabilities reported by the current METS-R SIM API."""
+        if self._capabilities_cache is not None and not refresh:
+            return dict(self._capabilities_cache)
+        response = self.send_receive_msg(
+            {"messageType": "capabilities"},
+            ignore_heartbeats=True,
+            max_attempts=1,
+            timeout=min(2.0, max(0.1, float(self.timeout))),
+            return_errors=True,
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("METS-R SIM returned no capabilities response")
+        if response.get("messageType") != "capabilities":
+            raise RuntimeError(
+                "Expected capabilities, received "
+                + str(response.get("messageType"))
+            )
+        if response.get("status") != "ok":
+            raise RuntimeError(f"METS-R SIM rejected capabilities query: {response}")
+        self._capabilities_cache = dict(response)
+        self._optimized_api_available = True
+        self._feature_support.update({
+            name: (
+                self._routing_truthy(response[name])
+                if name in response else True
+            )
+            for name in ("advanceAndSnapshot", "routingTopology", "fieldMasks")
+        })
+        return dict(response)
+
+    def _supports_feature(self, name):
+        if name not in self._feature_support:
+            self.query_capabilities()
+        return bool(self._feature_support.get(name, False))
 
     def query_tick_status(self):
         """Return server-side stepping status.
@@ -1064,7 +1567,7 @@ class METSRClient:
         ``activeRoadStepping`` and ``activeRoadCount`` when that scheduler mode
         is enabled.
         """
-        res = self.send_receive_msg({"TYPE": "QUERY_stepStatus"}, ignore_heartbeats=True)
+        res = self.send_receive_msg({"messageType": "stepStatus"}, ignore_heartbeats=True)
         return res
 
     def tick(
@@ -1080,6 +1583,8 @@ class METSRClient:
         ``wait_forever`` keeps tolerating slow steps, but it should not hide a
         dead server or a permanently stalled tick. Progress is therefore based
         on the server tick actually increasing, not just on receiving a reply.
+        Once the tick advances beyond the tick attached to a STEP request, that
+        request is active and must not be resent.
         """
         assert self.current_tick is not None, "self.current_tick is None. Maybe there is another METS-R SIM instance unclosed."
 
@@ -1095,6 +1600,7 @@ class METSRClient:
             overall_start = time.time()
             last_progress_time = overall_start
             last_send_time = overall_start
+            step_request_tick = None
 
             if retry_interval is None:
                 retry_interval = min(float(self.timeout), 30.0)
@@ -1106,14 +1612,22 @@ class METSRClient:
                 max_stalled_seconds = max(60.0, min(float(self.timeout), 300.0))
 
             def send_step_request():
-                nonlocal last_send_time
+                nonlocal last_send_time, step_request_tick
                 remaining_steps = target_tick - int(self.current_tick)
                 if remaining_steps <= 0:
                     return
-                msg = {"TYPE": "STEP", "TICK": int(self.current_tick), "NUM": remaining_steps}
+                msg = {"messageType": "step", "tick": int(self.current_tick), "tickCount": remaining_steps}
                 self.send_msg(msg)
+                step_request_tick = int(self.current_tick)
                 last_send_time = time.time()
 
+            def step_request_is_active():
+                return (
+                    step_request_tick is not None
+                    and int(self.current_tick) > step_request_tick
+                )
+
+            server_tick_started = time.perf_counter()
             send_step_request()
 
             while True:
@@ -1162,17 +1676,19 @@ class METSRClient:
                     if int(self.current_tick) >= target_tick:
                         break
 
+                    # A tick query can overtake a delayed STEP heartbeat. Once
+                    # progress passes the request tick, the server has accepted
+                    # that request and a retry would be a stale duplicate.
+                    if step_request_is_active():
+                        continue
+
                     if not wait_forever:
                         raise TimeoutError(
                             f"Timed out waiting for METS-R SIM to reach tick {target_tick}; "
                             f"last received tick was {self.current_tick}"
                         )
 
-                    should_retry_step = (
-                        retry_interval is None
-                        or int(self.current_tick) > tick_before_query
-                        or now - max(last_send_time, last_progress_time) >= retry_interval
-                    )
+                    should_retry_step = now - last_send_time >= retry_interval
                     if should_retry_step:
                         if self.verbose:
                             print(
@@ -1182,13 +1698,13 @@ class METSRClient:
                         send_step_request()
                     continue
 
-                if res["TYPE"] == "ANS_tick":
+                if res["messageType"] == "tick":
                     continue
 
-                if res["TYPE"] != "STEP":
-                    raise RuntimeError(f"Expected STEP while ticking, received {res['TYPE']}")
+                if res["messageType"] != "step":
+                    raise RuntimeError(f"Expected STEP while ticking, received {res['messageType']}")
 
-                if res.get("CODE") == "KO":
+                if res.get("status") == "error":
                     tick_before_query = int(self.current_tick)
                     synced_tick = self._query_tick_locked()
                     now = time.time()
@@ -1196,6 +1712,12 @@ class METSRClient:
                         last_progress_time = now
                     if int(self.current_tick) >= target_tick:
                         break
+                    if (
+                            res.get("errorCode") == "TICK_MISMATCH"
+                            and step_request_is_active()):
+                        # A stale duplicate may already be queued from an older
+                        # retry. The accepted request is still advancing.
+                        continue
                     if not wait_forever:
                         raise RuntimeError(
                             f"METS-R SIM rejected STEP request for tick {target_tick}; "
@@ -1204,7 +1726,7 @@ class METSRClient:
                     send_step_request()
                     continue
 
-                step_tick = int(res["TICK"])
+                step_tick = int(res["tick"])
                 if step_tick < int(self.current_tick):
                     continue
 
@@ -1214,7 +1736,36 @@ class METSRClient:
 
                 if step_tick >= target_tick:
                     break
-   
+
+        self._record_server_tick_time(server_tick_started, start_tick)
+
+    def advance_seconds(self, seconds, step_size=None, **tick_kwargs):
+        """Advance by at least ``seconds`` using the configured simulation step."""
+        seconds = float(seconds)
+        if seconds < 0.0:
+            raise ValueError("seconds must be non-negative")
+        if seconds == 0.0:
+            return self.current_tick
+        if step_size is None:
+            step_size = self._configured_sim_step_size()
+        step_size = float(step_size)
+        if step_size <= 0.0:
+            raise ValueError("step_size must be positive")
+        step_num = max(1, int(math.ceil(seconds / step_size)))
+        self.tick(step_num=step_num, **tick_kwargs)
+        return self.current_tick
+
+    def advance_minutes(self, minutes, step_size=None, **tick_kwargs):
+        """Advance by at least ``minutes`` using the configured simulation step."""
+        minutes = float(minutes)
+        if minutes < 0.0:
+            raise ValueError("minutes must be non-negative")
+        return self.advance_seconds(
+            minutes * 60.0,
+            step_size=step_size,
+            **tick_kwargs,
+        )
+
     # QUERY: inspect the state of the simulator
     # By default query public vehicles
     def query_vehicle(self, id = None, private_veh = False, transform_coords = False):
@@ -1223,16 +1774,17 @@ class METSRClient:
         Without ``id`` the server returns two lists::
 
             {
-              'public_vids':  [...],   # IDs of public vehicles (taxis + buses)
-              'private_vids': [...],   # IDs of private vehicles (EV / GV)
-              'TYPE': 'ANS_vehicle'
+              'publicVehicleIds':  [...],   # IDs of public vehicles (taxis + buses)
+              'privateVehicleIds': [...],   # IDs of private vehicles (EV / GV)
+              'messageType': 'vehicle'
             }
 
         With ``id`` each matched vehicle produces::
 
             {
-              'ID':      <int>   internal vehicle ID,
-              'v_type':  <int>   vehicle class:
+              'vehicleId': <int> bridge-visible private ID for EV/GV;
+                                  internal vehicle ID for taxi/bus,
+              'vehicleClass': <int> vehicle class:
                                    0 = GV  (private gasoline vehicle)
                                    1 = ETAXI
                                    2 = EBUS
@@ -1254,21 +1806,31 @@ class METSRClient:
                                   SUMO y if transform_coords=True,
               'z':       <float> elevation,
               'bearing': <float> heading in degrees (0 = north, clockwise),
-              'acc':     <float> current longitudinal acceleration (m/sÂ²),
+              'acceleration':     <float> current longitudinal acceleration (m/sÂ²),
               'speed':   <float> current speed (m/s),
-              'originZoneID': <int> current trip origin zone ID,
-              'destZoneID':   <int> current trip destination zone ID,
-              'originRoadID': <str> original road ID for the trip origin road,
-              'destRoadID':   <str> original road ID for the trip destination road,
+              'originZoneId': <int> current trip origin zone ID,
+              'destinationZoneId': <int> current trip destination zone ID,
+              'originRoadId': <str> original road ID for the trip origin road,
+              'destinationRoadId': <str> original road ID for the trip destination road,
               'battery': <float> EV battery energy (kWh, EV classes only),
               'totalEnergyConsumed': <float> EV cumulative energy use (kWh),
-              'roadID':  <str>   SUMO road ID of the road the vehicle is on
-                                 (only present when vehicle is on a road),
-              'lane':    <int>   lane index on that road (present when on a lane),
-              'dist':    <float> distance to the next downstream junction (m)
-                                 (present when on a lane),
-              'currentParkingRoad': <int> internal road ID where the vehicle is
-                                     parked or has reserved parking, when set
+              'onRoad':      <bool> whether the vehicle occupies a road-like facility,
+              'onConnector': <bool> whether that facility is an intersection connector,
+              'segmentId': <str> physical road or connector ID,
+                                 an intersection connector,
+               'laneIndex': <int | None> compact 0-based physical-road lane
+                                  index; None on a connector,
+              'distanceToSegmentEnd': <float> distance to the next junction on a physical
+                                 lane, or remaining connector distance (m),
+              'sourceRoadId': <str> connector source road when on a connector,
+              'targetRoadId': <str> connector target road when on a connector,
+              'intersectionId': <int> connector intersection ID,
+               'connectorPathId': <int> connector-local movement path,
+               'connectorPathInternalEdgeIds': <list[str]> exact physical path,
+               'connectorTravelTimeP90': <float> connector P90 travel time (s),
+              'intersectionCollision': <bool> current conflict state,
+              'currentParkingRoadId': <str | None> original road ID where the
+                                      vehicle is parked or has reserved parking
             }
 
         Parameters
@@ -1283,9 +1845,9 @@ class METSRClient:
             georeferenced networks). ``True`` returns projected/local SUMO
             coordinates, which can be passed to the CARLA coordinate helpers.
         """
-        msg = {"TYPE": "QUERY_vehicle"}
+        msg = {"messageType": "vehicle"}
         if id is not None:
-            msg["DATA"] = []
+            msg["data"] = []
             if not isinstance(id, list):
                 id = [id]
             if not isinstance(private_veh, list):
@@ -1293,39 +1855,84 @@ class METSRClient:
             if not isinstance(transform_coords, list):
                 transform_coords = [transform_coords] * len(id)
             for veh_id, prv, tran in zip(id, private_veh, transform_coords):
-                msg["DATA"].append({"vehID": veh_id, "vehType": prv, "transformCoord": tran})
+                msg["data"].append({"vehicleId": veh_id, "isPrivate": prv, "transformCoordinates": tran})
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_vehicle", res["TYPE"]
+        assert res["messageType"] == "vehicle", res["messageType"]
         return res
- 
-    def query_on_road_vehicles(self, roadID=None):
-        """Query IDs for vehicles currently on active roads, optionally by road."""
-        msg = {"TYPE": "QUERY_onRoadVehicles"}
-        if roadID is not None:
-            msg["DATA"] = roadID
+
+    def query_vehicle_route(self, id=None, private_veh=False):
+        """Query the currently assigned remaining route of one or more vehicles.
+
+        Unlike query_route_between_roads, this endpoint does not compute or
+        modify a route. It returns the vehicle's live assigned path with
+        separate physical-road and connector IDs, the interleaved segment path,
+        connector-aware distance, and mean/P90 travel-time metrics.
+
+        Parameters
+        ----------
+        id : int | list[int] | None
+            Bridge-visible vehicle ID(s). If omitted, METS-R returns the public
+            and private vehicle ID indexes.
+        private_veh : bool | list[bool]
+            Whether each requested ID belongs to the private fleet.
+        """
+        msg = {"messageType": "vehicleRoute"}
+        if id is not None:
+            vehicle_ids = _as_list(id)
+            private_flags = _batch_field_values(
+                private_veh,
+                len(vehicle_ids),
+                "private_veh",
+                batch_name="id",
+            )
+            msg["data"] = [
+                {
+                    "vehicleId": vehicle_id,
+                    "isPrivate": bool(private_flag),
+                }
+                for vehicle_id, private_flag in zip(vehicle_ids, private_flags)
+            ]
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] in ("ANS_onRoadVehicles", "ANS_onRoadVehicle"), res["TYPE"]
+        assert res["messageType"] == "vehicleRoute", res["messageType"]
+        return res
+
+    def query_on_road_vehicles(self, roadID=None):
+        """Query IDs for vehicles on active physical or connector roads.
+
+        Connector IDs are opaque values assigned by METS-R. Per-road records
+        identify connectors with ``isConnector=True`` and ``laneIndex=None``.
+        """
+        msg = {"messageType": "onRoadVehicles"}
+        if roadID is not None:
+            msg["data"] = roadID
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "onRoadVehicles", res["messageType"]
         return res
 
     def query_active_roads(self):
-        """Query compact records for roads currently in the active-road index."""
-        msg = {"TYPE": "QUERY_activeRoads"}
+        """Query active physical roads and occupied intersection connectors.
+
+        Records use ``segmentId`` and ``segmentType``; connectors report
+        ``laneIndex=None``.
+        """
+        msg = {"messageType": "activeRoads"}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] in ("ANS_activeRoads", "ANS_activeRoad"), res["TYPE"]
+        assert res["messageType"] == "activeRoads", res["messageType"]
         return res
-    
+
     def query_taxi(self, id = None):
         """Query the state of one or more e-taxis.
 
         Without ``id`` returns a fleet-level summary::
 
-            {'id_list': [...], 'TYPE': 'ANS_taxi'}
+            {'taxiIds': [...], 'messageType': 'taxi'}
 
         With ``id`` each matched taxi produces::
 
             {
-              'ID':       <int>   internal vehicle ID,
+              'taxiId':   <int>   internal vehicle ID,
               'state':    <int>   operational state:
                                    0 = PARKING        â€“ parked at a zone, waiting for a request
                                    1 = OCCUPIED_TRIP  â€“ carrying passenger(s) to drop-off
@@ -1338,14 +1945,20 @@ class METSRClient:
               'x':        <float> SIM/internal x coordinate,
               'y':        <float> SIM/internal y coordinate,
               'z':        <float> elevation,
-              'origin':   <int>   current origin zone ID,
-              'dest':     <int>   current destination zone ID
+              'originZoneId': <int> current origin zone ID,
+              'destinationZoneId': <int> current destination zone ID
                                   (negative â†’ heading to a charging station),
-              'pass_num': <int>   number of passengers currently on board,
-              'remainingDistance': <float> remaining active-trip distance in meters,
+              'passengerCount': <int> number of passengers currently on board,
+              'remainingDistance': <float> connector-inclusive remaining
+                                           active-trip distance in meters,
               'remainingDistanceMiles': <float> remaining active-trip distance in miles,
-              'currentParkingRoad': <int> internal road ID where the taxi is
-                                     parked or has reserved parking, when set
+              'remainingConnectorDistance': <float> connector-only remainder (m),
+              'remainingConnectorTravelTime': <float> connector-only remainder (s),
+              'currentParkingRoadId': <str | None> original road ID where the
+                                      taxi is parked or has reserved parking,
+              'segmentId': <str>   physical or connector road ID,
+              'onConnector': <bool>,
+              'laneIndex':    <int | None> compact lane index, or None on a connector
             }
 
         Parameters
@@ -1353,16 +1966,16 @@ class METSRClient:
         id : int | list[int] | None
             Taxi ID(s) to query. Pass ``None`` to get the full fleet ID list.
         """
-        my_msg = {"TYPE": "QUERY_taxi"}
+        my_msg = {"messageType": "taxi"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)
+                my_msg['data'].append(i)
 
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_taxi", res["TYPE"]
+        assert res["messageType"] == "taxi", res["messageType"]
         return res
 
     def query_available_taxis(self, zoneID = None):
@@ -1371,14 +1984,14 @@ class METSRClient:
         Without ``zoneID`` returns available taxis across all zones. With a
         zone ID, returns only the available-taxi pool for that zone.
 
-        Each entry in ``DATA`` includes the taxi ID, the pool zone ID, state,
+        Each entry in ``data`` includes ``taxiId``, ``zoneId``, state,
         position, battery level, battery feasibility, and passenger count.
         """
-        msg = {"TYPE": "QUERY_availableTaxis"}
+        msg = {"messageType": "availableTaxis"}
         if zoneID is not None:
-            msg["DATA"] = zoneID
+            msg["data"] = zoneID
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_availableTaxis", res["TYPE"]
+        assert res["messageType"] == "availableTaxis", res["messageType"]
         return res
 
     def query_almost_finished_taxis(
@@ -1392,38 +2005,38 @@ class METSRClient:
         queued pickup requests, and remaining trip distance below the supplied
         threshold. A ``zoneID`` filter selects the request destination zone.
         """
-        msg = {"TYPE": "QUERY_almostFinishedTaxis"}
+        msg = {"messageType": "almostFinishedTaxis"}
         params = {}
         if distance_threshold_meters is not None:
             params["distanceThresholdMeters"] = distance_threshold_meters
         elif distance_threshold_miles is not None:
             params["distanceThresholdMiles"] = distance_threshold_miles
         if zoneID is not None:
-            params["zoneID"] = zoneID
+            params["zoneId"] = zoneID
         if params:
-            msg["DATA"] = params
+            msg["data"] = params
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_almostFinishedTaxis", res["TYPE"]
+        assert res["messageType"] == "almostFinishedTaxis", res["messageType"]
         return res
-         
+
     def query_bus(self, id = None):
         """Query the state of one or more electric buses.
 
         Without ``id`` returns::
 
-            {'id_list': [...], 'TYPE': 'ANS_bus'}
+            {'busIds': [...], 'messageType': 'bus'}
 
         With ``id`` each matched bus produces::
 
             {
-              'ID':            <int>   internal vehicle ID,
-              'route':         <str>   name of the current bus route
+              'busId':         <int>   internal vehicle ID,
+              'routeName':     <str>   name of the current bus route
                                        (empty string if the bus is idle),
-              'stopZones':     <list>  zone IDs in the assigned stop sequence,
-              'current_stop':  <int>   index of the last completed stop
+              'stopZoneIds':   <list>  zone IDs in the assigned stop sequence,
+              'currentStopIndex': <int> index of the last completed stop
                                        in the route's stop list (0-based),
-              'pass_num':      <int>   number of passengers currently on board,
-              'battery_state': <float> remaining battery energy (kWh)
+              'passengerCount': <int>  number of passengers currently on board,
+              'battery':       <float> remaining battery energy (kWh)
             }
 
         Notes
@@ -1438,57 +2051,114 @@ class METSRClient:
         id : int | list[int] | None
             Bus ID(s) to query. Pass ``None`` to get the full fleet ID list.
         """
-        my_msg = {"TYPE": "QUERY_bus"}
+        my_msg = {"messageType": "bus"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)      
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_bus", res["TYPE"]
+        assert res["messageType"] == "bus", res["messageType"]
         return res
 
-        
+
     def query_road(self, id = None):
         """Query static and real-time attributes of one or more roads.
 
         Without ``id`` returns the full road index::
 
-            {'id_list': [...], 'orig_id': [...], 'TYPE': 'ANS_road'}
+            {'roadIds': [...], 'connectorIds': [...], 'messageType': 'road'}
 
-        With ``id`` (SUMO road IDs, i.e. ``orig_id`` strings) each matched
-        road produces::
+        With ``id`` (SUMO road IDs or connector IDs) each matched facility
+        produces a record. Physical roads include::
 
             {
-              'ID':               <str>   SUMO original road ID,
-              'r_type':           <int>   road type code,
-              'num_veh':          <int>   current number of vehicles on the road,
-              'speed_limit':      <float> posted speed limit (m/s),
-              'avg_travel_time':  <float> recent mean travel time (s),
+              'segmentId':        <str>   SUMO original road ID,
+              'roadType':         <int>   road type code,
+              'vehicleCount':     <int>   current number of vehicles on the road,
+              'speedLimit':       <float> posted speed limit (m/s),
+              'travelTime':       <float> recent mean travel time (s),
+              'travelTimeP90':    <float> estimated P90 travel time (s),
+              'travelTimeConfidence': <float> estimator confidence,
+              'travelTimeEstimateSource': <str> source of the estimate,
+              'routingWeight':    <float> current routing-graph cost; this can
+                                           differ from travelTime after
+                                           :meth:`update_road_weights`,
               'length':           <float> road length (m),
-              'energy_consumed':  <float> cumulative energy consumed on this road (kWh),
-              'down_stream_road': <list>  list of downstream road orig-IDs,
-              'parking_capacity': <int>   parking capacity on this road,
-              'parked_num':       <int>   current parked or reserved vehicles,
-              'enteringVehicleQueue': <list[int]> vehicle IDs waiting to enter
-                                         this road, useful for co-sim roads
+              'energyConsumed':   <float> cumulative energy consumed on this road (kWh),
+              'downstreamIds':    <list>  downstream road IDs,
+              'parkingCapacity':  <int>   parking capacity on this road,
+              'parkedVehicleCount': <int> current parked or reserved vehicles
             }
+
+        Connector records use ``segmentType='connector'``, ``laneIndex=None``,
+        source/target road IDs, movement-level ``paths``, conflict metadata,
+        and geometry/travel-time metrics.
 
         Parameters
         ----------
         id : str | list[str] | None
-            SUMO road ID(s) to query. Pass ``None`` to get the full road index.
+            Physical road or connector ID(s). Pass ``None`` for the full index.
         """
-        my_msg = {"TYPE": "QUERY_road"}
+        my_msg = {"messageType": "road"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_road", res["TYPE"]
+        assert res["messageType"] == "road", res["messageType"]
+        return res
+
+    def query_connector_path(self, connector_id, connector_path_id=None):
+        """Query lane-to-lane paths for one or more opaque connector IDs.
+
+        Omitting connector_path_id returns every movement path belonging to
+        each connector. Supplying a zero-based connector-local path ID returns
+        that path's source/target lanes, via-lane IDs, exact internal-edge IDs,
+        signal metadata, and geometry parameters.
+        """
+        connector_ids = _as_list(connector_id)
+        if not connector_ids:
+            raise ValueError("connector_id cannot be empty")
+        path_ids = _batch_field_values(
+            connector_path_id,
+            len(connector_ids),
+            "connector_path_id",
+            batch_name="connector_id",
+        )
+
+        data = []
+        for index, (connector, path_id) in enumerate(zip(connector_ids, path_ids)):
+            if connector is None or not str(connector).strip():
+                raise ValueError(f"connector_id[{index}] cannot be empty")
+            record = {"connectorId": str(connector)}
+            if path_id is not None:
+                if isinstance(path_id, bool):
+                    raise ValueError(
+                        "connector_path_id must be a non-negative integer"
+                    )
+                try:
+                    numeric_path_id = float(path_id)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "connector_path_id must be a non-negative integer"
+                    ) from exc
+                if (
+                        not math.isfinite(numeric_path_id)
+                        or numeric_path_id < 0
+                        or not numeric_path_id.is_integer()):
+                    raise ValueError(
+                        "connector_path_id must be a non-negative integer"
+                    )
+                record["connectorPathId"] = int(numeric_path_id)
+            data.append(record)
+
+        msg = {"messageType": "connectorPath", "data": data}
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "connectorPath", res["messageType"]
         return res
 
     def query_entering_vehicle_queue(self, roadID = None):
@@ -1498,36 +2168,43 @@ class METSRClient:
         :meth:`enter_road_from_queue`. Without ``roadID`` the server returns
         the road index. With road IDs, each record includes ``enteringVehicleIDs``
         and detailed queue entries with visible/private IDs, internal IDs,
-        vehicle type, departure tick, and readiness.
+        vehicle type, departure tick, and readiness. The index and lookup also
+        support connector IDs; connector records set ``isConnector=True`` and
+        ``laneIndex=None``.
         """
-        msg = {"TYPE": "QUERY_enteringVehicleQueue"}
+        msg = {"messageType": "enteringVehicleQueue"}
         if roadID is not None:
-            msg["DATA"] = _as_list(roadID)
+            msg["data"] = _as_list(roadID)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_enteringVehicleQueue", res["TYPE"]
+        assert res["messageType"] == "enteringVehicleQueue", res["messageType"]
         return res
 
     def query_cosim_entering_vehicle_queue(self):
         """Query entering queues for every road currently marked as co-sim."""
-        msg = {"TYPE": "QUERY_coSimEnteringVehicleQueue"}
+        msg = {"messageType": "coSimEnteringVehicleQueue"}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_coSimEnteringVehicleQueue", res["TYPE"]
+        assert res["messageType"] == "coSimEnteringVehicleQueue", res["messageType"]
         return res
-    
+
     def query_centerline(self, id, lane_index = -1, transform_coords = False):
         """Query the geometric center-line of a road or a specific lane.
 
-        Each matched road returns::
+        Each matched physical road returns::
 
             {
-              'ID':         <str>         SUMO road ID,
+              'segmentId':  <str>         SUMO road ID,
               'centerline': [[x, y, z], ...]  ordered coordinate list
             }
+
+        Connector IDs return their representative centerline plus
+        ``centerlines`` for all lane-to-lane movements, with
+        ``isConnector=True`` and ``laneIndex=None``. The requested ``lane_index``
+        is ignored for connectors.
 
         Parameters
         ----------
         id : str | list[str]
-            SUMO road ID(s) to query. Required; cannot be ``None``.
+            Physical road or connector ID(s). Required; cannot be ``None``.
         lane_index : int | list[int]
             Index of the lane whose centerline to return.
             Use ``-1`` (default) to get the road's overall start/end points
@@ -1537,9 +2214,9 @@ class METSRClient:
             georeferenced networks). ``True`` returns projected/local SUMO
             coordinates.
         """
-        my_msg = {"TYPE": "QUERY_centerLine"}
+        my_msg = {"messageType": "centerLine"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             if not isinstance(lane_index, list):
@@ -1547,11 +2224,15 @@ class METSRClient:
             if not isinstance(transform_coords, list):
                 transform_coords = [transform_coords] * len(id)
             for i, lane_idx, tran in zip(id, lane_index, transform_coords):
-                my_msg['DATA'].append({"roadID": i, "laneIndex": lane_idx, "transformCoord": tran})
+                my_msg['data'].append({
+                    "segmentId": i,
+                    "laneIndex": lane_idx,
+                    "transformCoordinates": tran,
+                })
         else:
             raise ValueError("id cannot be None for query_centerLine")
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_centerLine", res["TYPE"]
+        assert res["messageType"] == "centerLine", res["messageType"]
         return res
 
     def query_zone(self, id = None):
@@ -1559,18 +2240,18 @@ class METSRClient:
 
         Without ``id`` returns the full zone index::
 
-            {'id_list': [...], 'TYPE': 'ANS_zone'}
+            {'zoneIds': [...], 'messageType': 'zone'}
 
         With ``id`` each matched zone produces::
 
             {
-              'ID':          <int>   zone ID,
-              'z_type':      <int>   zone type code,
-              'taxi_demand': <int>   number of pending taxi requests currently
+              'zoneId':      <int>   zone ID,
+              'zoneType':    <int>   zone type code,
+              'taxiDemand':  <int>   number of pending taxi requests currently
                                      waiting in this zone,
-              'bus_demand':  <int>   number of pending bus requests currently
+              'busDemand':   <int>   number of pending bus requests currently
                                      waiting in this zone,
-              'veh_stock':   <int>   number of available taxis parked / cruising
+              'vehicleStock': <int>  number of available taxis parked / cruising
                                      in this zone at this tick,
               'x':           <float> centroid x coordinate (network CRS),
               'y':           <float> centroid y coordinate (network CRS),
@@ -1590,15 +2271,15 @@ class METSRClient:
         id : int | list[int] | None
             Zone ID(s) to query. Pass ``None`` to get the full zone ID list.
         """
-        my_msg = {"TYPE": "QUERY_zone"}
+        my_msg = {"messageType": "zone"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)     
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_zone", res["TYPE"] 
+        assert res["messageType"] == "zone", res["messageType"]
         return res
 
     def query_pending_requests(self, zoneID = None):
@@ -1606,30 +2287,30 @@ class METSRClient:
 
         Without ``zoneID`` returns pending requests across all zones. With a
         zone ID, returns pending requests in that zone. Request records include
-        ``ID`` (the request ID used by ``dispatch_taxi``), origin/destination
+        ``requestId`` (used by ``dispatch_taxi``), origin/destination
         zones and roads, party size, waiting-time fields, and a queue status.
         """
-        msg = {"TYPE": "QUERY_pendingRequests"}
+        msg = {"messageType": "pendingRequests"}
         if zoneID is not None:
-            msg["DATA"] = zoneID
+            msg["data"] = zoneID
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_pendingRequests", res["TYPE"]
+        assert res["messageType"] == "pendingRequests", res["messageType"]
         return res
 
     def query_request(self, reqID):
         """Query one or more ride-hailing or bus request records by ID."""
-        msg = {"TYPE": "QUERY_request", "DATA": []}
+        msg = {"messageType": "request", "data": []}
         if not isinstance(reqID, list):
             reqID = [reqID]
         for rid in reqID:
-            msg["DATA"].append(rid)
+            msg["data"].append(rid)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_request", res["TYPE"]
+        assert res["messageType"] == "request", res["messageType"]
         return res
 
     def _infer_request_zone_id(self, reqID):
         response = self.query_request(reqID)
-        for record in response.get("DATA", []):
+        for record in response.get("data", []):
             zone_id = _request_zone_from_record(record)
             if zone_id is not None:
                 return zone_id
@@ -1641,11 +2322,11 @@ class METSRClient:
         METS-R SIM added this endpoint with the cancellation API. Passing
         ``reqID`` filters the result to one or more request IDs.
         """
-        msg = {"TYPE": "QUERY_pickupTaxiInfo"}
+        msg = {"messageType": "pickupTaxiInfo"}
         if reqID is not None:
-            msg["DATA"] = _as_list(reqID)
+            msg["data"] = _as_list(reqID)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_pickupTaxiInfo", res["TYPE"]
+        assert res["messageType"] == "pickupTaxiInfo", res["messageType"]
         return res
 
     def query_occupied_taxi_info(self, reqID=None):
@@ -1655,11 +2336,11 @@ class METSRClient:
         Cancellation eligibility is reported by the simulator in the response
         to :meth:`cancel_requests`.
         """
-        msg = {"TYPE": "QUERY_occupiedTaxiInfo"}
+        msg = {"messageType": "occupiedTaxiInfo"}
         if reqID is not None:
-            msg["DATA"] = _as_list(reqID)
+            msg["data"] = _as_list(reqID)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_occupiedTaxiInfo", res["TYPE"]
+        assert res["messageType"] == "occupiedTaxiInfo", res["messageType"]
         return res
 
     def query_signal(self, id = None):
@@ -1667,20 +2348,20 @@ class METSRClient:
 
         Without ``id`` returns the full signal index::
 
-            {'id_list': [...], 'TYPE': 'ANS_signal'}
+            {'signalIds': [...], 'messageType': 'signal'}
 
         With ``id`` each matched signal produces::
 
             {
-              'ID':               <int>  internal signal ID,
-              'groupID':          <str>  SUMO junction ID this signal belongs to,
+              'signalId':         <int>  internal signal ID,
+              'signalGroupId':          <str>  SUMO junction ID this signal belongs to,
               'state':            <int>  current phase:
                                            0 = Green
                                            1 = Yellow
                                            2 = Red,
-              'nex_state':        <int>  next phase (same encoding),
-              'next_update_time': <int>  simulation tick at which the phase will change,
-              'phase_ticks':      <list> [green_ticks, yellow_ticks, red_ticks]
+              'nextState':        <int>  next phase (same encoding),
+              'nextUpdateTime':   <int>  simulation tick at which the phase will change,
+              'phaseTicks':       <list> [green_ticks, yellow_ticks, red_ticks]
                                          duration of each phase in simulation ticks
             }
 
@@ -1698,29 +2379,29 @@ class METSRClient:
         id : int | list[int] | None
             Signal ID(s) to query. Pass ``None`` to get the full signal ID list.
         """
-        my_msg = {"TYPE": "QUERY_signal"}
+        my_msg = {"messageType": "signal"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_signal", res["TYPE"]
+        assert res["messageType"] == "signal", res["messageType"]
         return res
-    
+
     def query_signal_group(self, id = None):
         """Query the set of signal IDs that belong to each signal group (junction).
 
         Without ``id`` returns all group IDs::
 
-            {'id_list': [...], 'TYPE': 'ANS_signalGroup'}
+            {'signalGroupIds': [...], 'messageType': 'signalGroup'}
 
         With ``id`` (SUMO junction / group IDs) each group produces::
 
             {
-              'groupID':   <str>   SUMO junction ID,
-              'signalIDs': <list>  list of individual signal IDs in this group
+              'signalGroupId':   <str>   SUMO junction ID,
+              'signalIds': <list>  list of individual signal IDs in this group
             }
 
         Parameters
@@ -1728,32 +2409,32 @@ class METSRClient:
         id : str | list[str] | None
             Group / junction ID(s) to query. Pass ``None`` to list all groups.
         """
-        my_msg = {"TYPE": "QUERY_signalGroup"}
+        my_msg = {"messageType": "signalGroup"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_signalGroup", res["TYPE"]
+        assert res["messageType"] == "signalGroup", res["messageType"]
         return res
-    
+
     def query_signal_between_roads(self, upstream_road, downstream_road):
         """Query the signal controlling the connection between two consecutive roads.
 
         Each connection produces::
 
             {
-              'upStreamRoad':    <str>  SUMO ID of the upstream road,
-              'downStreamRoad':  <str>  SUMO ID of the downstream road,
-              'signalID':        <int>  signal ID (use with :meth:`query_signal`),
+              'upstreamRoadId':  <str>  SUMO ID of the upstream road,
+              'downstreamRoadId':<str>  SUMO ID of the downstream road,
+              'signalId':        <int>  signal ID (use with :meth:`query_signal`),
               'state':           <int>  current phase (0=Green, 1=Yellow, 2=Red),
-              'next_state':      <int>  next phase (same encoding),
-              'next_update_tick':<int>  simulation tick at which the phase changes,
-              'phase_ticks':     <list> [green_ticks, yellow_ticks, red_ticks],
-              'junction_id':     <int>  internal junction ID,
-              'STATUS':          <str>  'OK' or 'KO' (road / junction not found)
+              'nextState':       <int>  next phase (same encoding),
+              'nextUpdateTick':  <int>  simulation tick at which the phase changes,
+              'phaseTicks':      <list> [green_ticks, yellow_ticks, red_ticks],
+              'junctionId':      <int>  internal junction ID,
+              'status':          <str>  'ok' or 'error' (road / junction not found)
             }
 
         Parameters
@@ -1763,38 +2444,38 @@ class METSRClient:
         downstream_road : str | list[str]
             SUMO road ID(s) of the downstream road (matched pairwise).
         """
-        msg = {"TYPE": "QUERY_signalForConnection", "DATA": []}
+        msg = {"messageType": "signalForConnection", "data": []}
         if not isinstance(upstream_road, list):
             upstream_road = [upstream_road]
         if not isinstance(downstream_road, list):
             downstream_road = [downstream_road] * len(upstream_road)
         assert len(upstream_road) == len(downstream_road), "Length of upstream_road and downstream_road must be the same"
-        
+
         for up_road, down_road in zip(upstream_road, downstream_road):
-            msg["DATA"].append({"upStreamRoad": up_road, "downStreamRoad": down_road})
-        
+            msg["data"].append({"upstreamRoadId": up_road, "downstreamRoadId": down_road})
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_signalForConnection", res["TYPE"]
+        assert res["messageType"] == "signalForConnection", res["messageType"]
         return res
-    
+
     def query_chargingStation(self, id = None):
         """Query the status and capacity of one or more charging stations.
 
         Without ``id`` returns the full station index::
 
-            {'id_list': [...], 'TYPE': 'ANS_chargingStation'}
+            {'chargingStationIds': [...], 'messageType': 'chargingStation'}
 
         With ``id`` each matched station produces::
 
             {
-              'ID':                <int>   internal station ID,
-              'l2_charger':        <int>   total number of L2 (AC) charger ports,
-              'dcfc_charger':      <int>   total number of DCFC (L3 / fast) charger ports,
-              'l2_price':          <float> current price per kWh at L2 chargers,
-              'dcfc_price':        <float> current price per kWh at DCFC chargers,
-              'bus_charger':       <int>   total number of bus-dedicated charger ports,
-              'num_available_l2':  <int>   number of L2 ports not currently occupied,
-              'num_available_dcfc':<int>   number of DCFC ports not currently occupied,
+              'chargingStationId': <int>   internal station ID,
+              'level2ChargerCount': <int>  total number of L2 charger ports,
+              'level3ChargerCount': <int>  total number of fast charger ports,
+              'level2Price':       <float> current L2 price per kWh,
+              'level3Price':       <float> current L3 price per kWh,
+              'busChargerCount':   <int>   bus-dedicated charger ports,
+              'availableLevel2ChargerCount': <int> available L2 ports,
+              'availableLevel3ChargerCount': <int> available L3 ports,
               'x':                 <float> station x coordinate (network CRS),
               'y':                 <float> station y coordinate (network CRS),
               'z':                 <float> elevation
@@ -1812,56 +2493,110 @@ class METSRClient:
         id : int | list[int] | None
             Charging station ID(s) to query. Pass ``None`` to get the full list.
         """
-        my_msg = {"TYPE": "QUERY_chargingStation"}
+        my_msg = {"messageType": "chargingStation"}
         if id is not None:
-            my_msg['DATA'] = []
+            my_msg['data'] = []
             if not isinstance(id, list):
                 id = [id]
             for i in id:
-                my_msg['DATA'].append(i)      
+                my_msg['data'].append(i)
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_chargingStation", res["TYPE"]
+        assert res["messageType"] == "chargingStation", res["messageType"]
         return res
-    
-    def query_coSimVehicle(self):
-        """Query vehicles currently on co-simulation (CARLA-managed) roads.
 
-        Returns all vehicles that are located on roads previously registered
-        with :meth:`set_cosim_road`.  Each entry in ``DATA`` represents one
-        vehicle::
+    def query_cosim_vehicle(self):
+        """Query vehicles currently owned by the external co-simulator.
+
+        Returns vehicles currently owned by the external co-simulator on roads
+        and connectors registered through :meth:`set_cosim_road`. Each entry in
+        ``data`` represents one vehicle::
 
             {
-              'ID':        <int>   vehicle ID
+              'vehicleId': <int>   vehicle ID
                                     â€“ for private vehicles (EV/GV) this is the
                                       *external* private-vehicle ID
                                     â€“ for public vehicles (taxi/bus) this is the
                                       internal simulation ID,
-              'v_type':    <bool>  True  â†’ private vehicle (EV / GV)
+              'isPrivate': <bool>  True  â†’ private vehicle (EV / GV)
                                    False â†’ public vehicle (taxi / bus),
-              'coord_map': <list>  recent coordinate history (up to 6 entries),
-                                   each entry is [x, y, z, bearing, speed],
-              'route':     <list>  list of upcoming road orig-IDs in the vehicle's
-                                   current planned route
+              'coordinateTrail': <list> up to 6 upcoming [x, y] route points
+                                   in projected/local SUMO coordinates;
+                                   query_vehicle provides the current pose,
+              'routeRoadIds': <list> upcoming road IDs, excluding the current
+                                   road; this is not a constraint on CARLA routing,
+              'segmentId': <str>   physical or connector segment ID,
+              'connectorId': <str> present while on a connector,
+              'onConnector': <bool>,
+              'laneIndex':    <int> compact lane index, or -1 on a connector
             }
 
         Returns
         -------
         dict
-            ``{'DATA': [...], 'TYPE': 'ANS_coSimVehicle'}``
+            ``{'data': [...], 'messageType': 'coSimVehicle'}``
         """
-        my_msg = {"TYPE": "QUERY_coSimVehicle"}
+        my_msg = {"messageType": "coSimVehicle"}
         res = self.send_receive_msg(my_msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_coSimVehicle", res["TYPE"]
+        assert res["messageType"] == "coSimVehicle", res["messageType"]
         return res
-    
+
+    # Historical camel-case spelling retained for source compatibility.
+    query_coSimVehicle = query_cosim_vehicle
+
+    def query_boundary_vehicle(self):
+        """Query native vehicles blocking exits from controlled connectors.
+
+        Sends ``boundaryVehicle`` (the server's ``queryBoundaryVeh`` handler).
+        No input data is required. METS-R selects vehicles on native downstream
+        roads whose distance from their current lane's entry is strictly less
+        than 1.2 times their length. The query does not change vehicle control
+        or reserve a connector.
+
+        Records use the :meth:`query_cosim_vehicle` schema, with the actual
+        native road/lane and ``controlMode='native'``. Use ``vehicleId`` together
+        with ``isPrivate`` as the identity, and :meth:`query_vehicle` with
+        ``transform_coords=True`` for current positions and headings.
+        """
+        res = self.send_receive_msg(
+            {"messageType": "boundaryVehicle"}, ignore_heartbeats=True
+        )
+        assert res["messageType"] == "boundaryVehicle", res["messageType"]
+        return res
+
+    queryBoundaryVeh = query_boundary_vehicle
+
+    def query_cosim_roads(self):
+        """Query every physical road and connector controlled by co-simulation.
+
+        The response contains ``roadIds``, ``connectorIds``, and full ``data``
+        records using ``segmentId``, ``segmentType``, ``controlMode``, and
+        canonical connector source/target and geometry fields.
+        """
+        msg = {"messageType": "coSimRoad"}
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "coSimRoad", res["messageType"]
+        return res
+
     def query_route(self, orig_x, orig_y, dest_x, dest_y, transform_coords = False):
         """Query the shortest path between two coordinate pairs.
 
-        Each query pair returns::
+        Each query pair returns a connector-aware route record::
 
-            {'road_list': [<road_orig_id>, ...]}
-
-        or ``'KO'`` if no path was found.
+            {
+              'roadIds': [<physical_road_id>, ...],
+              'connectorIds': [<opaque_connector_id>, ...],
+              'segmentIds': [<road>, <connector>, ...],
+              'roadDistance': <meters>,
+              'connectorDistance': <meters>,
+              'distance': <meters>,
+              'roadTravelTime': <seconds>,
+              'connectorTravelTime': <seconds>,
+              'travelTime': <seconds>,
+              'travelTimeP90': <seconds>,
+              'travelTimeConfidence': <0..1>,
+              'minimumSegmentTravelTimeConfidence': <0..1>
+            }
+        The server returns ``'error'`` if no path was found.
 
         Parameters
         ----------
@@ -1875,7 +2610,7 @@ class METSRClient:
             coordinates and should be transformed into the SIM/internal frame
             before routing.
         """
-        msg = {"TYPE": "QUERY_routesBwCoords", "DATA": []}
+        msg = {"messageType": "routesBwCoords", "data": []}
         if not isinstance(orig_x, list):
             orig_x = [orig_x]
             orig_y = [orig_y]
@@ -1884,25 +2619,44 @@ class METSRClient:
 
         if not isinstance(transform_coords, list):
             transform_coords = [transform_coords] * len(orig_x)
-        
+
         assert len(orig_x) == len(orig_y) == len(dest_x) == len(dest_y), "Length of orig_x, orig_y, dest_x, and dest_y must be the same"
 
         for orig_x, orig_y, dest_x, dest_y, transform_coord in zip(orig_x, orig_y, dest_x, dest_y, transform_coords):
-            msg["DATA"].append({"origX": orig_x, "origY": orig_y, "destX": dest_x, "destY": dest_y, "transformCoord": transform_coord})
+            msg["data"].append({
+                "originX": orig_x,
+                "originY": orig_y,
+                "destinationX": dest_x,
+                "destinationY": dest_y,
+                "transformCoordinates": transform_coord,
+            })
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
 
-        assert res["TYPE"] == "ANS_routesBwCoords", res["TYPE"]
+        assert res["messageType"] == "routesBwCoords", res["messageType"]
         return res
 
     def query_k_routes(self, orig_x, orig_y, dest_x, dest_y, k, transform_coords = False):
         """Query the *k* shortest paths between two coordinate pairs.
 
-        Each query pair returns::
+        Each query pair returns physical-only ``roadIdLists`` plus parallel
+        connector-aware arrays::
 
-            {'road_lists': [[<road_orig_id>, ...], ...]}  # k routes
+            {
+              'roadIdLists': [[<physical_road_id>, ...], ...],
+              'connectorIdLists': [[<connector_id>, ...], ...],
+              'segmentIdLists': [[<road_or_connector>, ...], ...],
+              'roadDistances': [<meters>, ...],
+              'connectorDistances': [<meters>, ...],
+              'distances': [<meters>, ...],
+              'roadTravelTimes': [<seconds>, ...],
+              'connectorTravelTimes': [<seconds>, ...],
+              'travelTimes': [<seconds>, ...],
+              'travelTimeP90s': [<seconds>, ...],
+              'travelTimeConfidences': [<0..1>, ...]
+            }
 
-        or ``'KO'`` if no path was found.
+        or ``'error'`` if no path was found.
 
         Parameters
         ----------
@@ -1916,7 +2670,7 @@ class METSRClient:
             ``True`` to interpret coordinates as projected/local SUMO
             coordinates and transform them into the SIM/internal frame.
         """
-        msg = {"TYPE": "QUERY_multiRoutesBwCoords", "DATA": []}
+        msg = {"messageType": "multiRoutesBwCoords", "data": []}
         if not isinstance(orig_x, list):
             orig_x = [orig_x]
             orig_y = [orig_y]
@@ -1927,24 +2681,40 @@ class METSRClient:
             transform_coords = [transform_coords] * len(orig_x)
         if not isinstance(k, list):
             k = [k] * len(orig_x)
-        
+
         assert len(orig_x) == len(orig_y) == len(dest_x) == len(dest_y), "Length of orig_x, orig_y, dest_x, and dest_y must be the same"
 
         for orig_x, orig_y, dest_x, dest_y, transform_coord, k in zip(orig_x, orig_y, dest_x, dest_y, transform_coords, k):
-            msg["DATA"].append({"origX": orig_x, "origY": orig_y, "destX": dest_x, "destY": dest_y, "transformCoord": transform_coord, "K": k})
-        
+            msg["data"].append({
+                "originX": orig_x,
+                "originY": orig_y,
+                "destinationX": dest_x,
+                "destinationY": dest_y,
+                "transformCoordinates": transform_coord,
+                "routeCount": k,
+            })
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_kRoutes", res["TYPE"]
+        assert res["messageType"] == "multiRoutesBwCoords", res["messageType"]
         return res
-    
+
     def query_route_between_roads(self, orig_road, dest_road):
         """Query the shortest path between two roads identified by their SUMO IDs.
 
-        Each query pair returns::
+        Each query pair returns a connector-aware route record::
 
-            {'road_list': [<road_orig_id>, ...]}
+            {
+              'roadIds': [<physical_road_id>, ...],
+              'connectorIds': [<opaque_connector_id>, ...],
+              'segmentIds': [<road_or_connector>, ...],
+              'distance': <meters>,
+              'travelTime': <seconds>,
+              'travelTimeP90': <seconds>,
+              'travelTimeConfidence': <0..1>
+            }
 
-        or ``'KO'`` if no path was found.
+        Separate physical-road and connector distance/travel-time fields are
+        also returned. The server returns ``'error'`` if no path was found.
 
         Parameters
         ----------
@@ -1953,30 +2723,40 @@ class METSRClient:
         dest_road : str | list[str]
             SUMO road ID(s) of the destination road (matched pairwise).
         """
-        msg = {"TYPE": "QUERY_routesBwRoads", "DATA": []}
+        msg = {"messageType": "routesBwRoads", "data": []}
         if not isinstance(orig_road, list):
             orig_road = [orig_road]
-        
+
         if not isinstance(dest_road, list):
             dest_road = [dest_road] * len(orig_road)
         assert len(orig_road) == len(dest_road), "Length of orig_road and dest_road must be the same"
 
         for orig_road, dest_road in zip(orig_road, dest_road):
-            msg["DATA"].append({"orig": orig_road, "dest": dest_road})
-        
+            msg["data"].append({
+                "originRoadId": orig_road,
+                "destinationRoadId": dest_road,
+            })
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
 
-        assert res["TYPE"] == "ANS_routesBwRoads", res["TYPE"]
+        assert res["messageType"] == "routesBwRoads", res["messageType"]
         return res
 
     def query_k_routes_between_roads(self, orig_road, dest_road, k):
         """Query the *k* shortest paths between two roads.
 
-        Each query pair returns::
+        Each query pair returns physical-only ``roadIdLists`` plus connector
+        IDs, interleaved paths, and per-route distance/travel-time arrays::
 
-            {'road_lists': [[<road_orig_id>, ...], ...]}  # k routes
+            {'roadIdLists': [[<physical_road_id>, ...], ...],
+             'connectorIdLists': [[<connector_id>, ...], ...],
+             'segmentIdLists': [[<road_or_connector>, ...], ...],
+             'distances': [<meters>, ...],
+             'travelTimes': [<seconds>, ...],
+             'travelTimeP90s': [<seconds>, ...],
+             'travelTimeConfidences': [<0..1>, ...]}
 
-        or ``'KO'`` if no path was found.
+        or ``'error'`` if no path was found.
 
         Parameters
         ----------
@@ -1987,7 +2767,7 @@ class METSRClient:
         k : int | list[int]
             Number of alternative routes to return per query.
         """
-        msg = {"TYPE": "QUERY_multiRoutesBwRoads", "DATA": []}
+        msg = {"messageType": "multiRoutesBwRoads", "data": []}
         if not isinstance(orig_road, list):
             orig_road = [orig_road]
             dest_road = [dest_road]
@@ -1996,64 +2776,72 @@ class METSRClient:
             k = [k] * len(orig_road)
 
         assert len(orig_road) == len(dest_road), "Length of orig_road and dest_road must be the same"
-        
+
         for orig_road, dest_road, k in zip(orig_road, dest_road, k):
-            msg["DATA"].append({"orig": orig_road, "dest": dest_road, "K": k})
-        
+            msg["data"].append({
+                "originRoadId": orig_road,
+                "destinationRoadId": dest_road,
+                "routeCount": k,
+            })
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_multiRoutesBwRoads", res["TYPE"]
+        assert res["messageType"] == "multiRoutesBwRoads", res["messageType"]
         return res
 
     def query_road_weights(self, roadID = None):
-        """Query the routing-graph edge weight in seconds for one or more roads.
+        """Query costs for physical roads or intersection connectors.
 
         Without ``roadID`` returns all road/edge IDs::
 
-            {'id_list': [...], 'orig_id': [...], 'TYPE': 'ANS_edgeWeight'}
+            {'roadIds': [...], 'connectorIds': [...], 'messageType': 'edgeWeight'}
 
-        With ``roadID`` each matched road produces::
+        Physical-road records contain routing-edge costs. Connector records
+        instead use their estimated travel time as ``routingWeight`` and include
+        connector travel-time, P90, and geometry fields with ``laneIndex=None``.
+
+        With ``roadID`` each matched physical road produces::
 
             {
-              'ID':              <str>   SUMO road ID,
-              'r_type':          <int>   road type code,
-              'avg_travel_time': <float> recent mean travel time (s),
+              'segmentId':       <str>   SUMO road ID,
               'length':          <float> road length (m),
-              'weight':          <float> current edge weight in seconds used
+              'routingWeight':   <float> current edge weight in seconds used
                                          by the router (typically travel time,
                                          may be overridden via
-                                         :meth:`update_edge_weight`)
+                                         :meth:`update_road_weights`),
+              'segmentType':     'road'
             }
 
         Parameters
         ----------
         roadID : str | list[str] | None
-            SUMO road ID(s). Pass ``None`` to get all edges.
+            Physical road or connector ID(s). Pass ``None`` to get the full
+            queryable facility index.
         """
-        msg = {"TYPE": "QUERY_edgeWeight"}
+        msg = {"messageType": "edgeWeight"}
         if roadID is not None:
-            msg["DATA"] = []
+            msg["data"] = []
             if not isinstance(roadID, list):
                 roadID = [roadID]
             for i in roadID:
-                msg["DATA"].append(i)
+                msg["data"].append(i)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_edgeWeight", res["TYPE"]
+        assert res["messageType"] == "edgeWeight", res["messageType"]
         return res
-    
+
     def query_bus_route(self, routeID = None):
         """Query the stop sequence and road IDs of one or more bus routes.
 
         Without ``routeID`` returns all route identifiers::
 
-            {'id_list': [...], 'orig_id': [...], 'TYPE': 'ANS_busRoute'}
+            {'routeIds': [...], 'routeNames': [...], 'messageType': 'busRoute'}
 
         With ``routeID`` (route *name* strings) each matched route produces::
 
             {
               'routeName': <str>   human-readable route name,
-              'routeID':   <int>   internal integer route ID,
-              'stopZones': <list>  ordered list of zone IDs the bus visits,
-              'stopRoads': <list>  corresponding SUMO road IDs at each stop
+              'routeId':   <int>   internal integer route ID,
+              'stopZoneIds': <list> ordered list of zone IDs the bus visits,
+              'stopRoadIds': <list> corresponding road IDs at each stop
             }
 
         Parameters
@@ -2061,30 +2849,30 @@ class METSRClient:
         routeID : str | list[str] | None
             Route name(s) to query. Pass ``None`` to list all routes.
         """
-        msg = {"TYPE": "QUERY_busRoute"}
+        msg = {"messageType": "busRoute"}
         if routeID is not None:
-            msg["DATA"] = []
+            msg["data"] = []
             if not isinstance(routeID, list):
                 routeID = [routeID]
             for i in routeID:
-                msg["DATA"].append(i)
+                msg["data"].append(i)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_busRoute", res["TYPE"]
+        assert res["messageType"] == "busRoute", res["messageType"]
         return res
-    
+
     def query_route_bus(self, routeID = None):
         """Query the IDs of all buses currently operating on a given route.
 
         Without ``routeID`` returns all route identifiers::
 
-            {'id_list': [...], 'orig_id': [...], 'TYPE': 'ANS_busWithRoute'}
+            {'routeIds': [...], 'routeNames': [...], 'messageType': 'busWithRoute'}
 
         With ``routeID`` (route *name* strings) each matched route produces::
 
             {
               'routeName': <str>   human-readable route name,
-              'routeID':   <int>   internal integer route ID,
-              'busIDs':    <list>  IDs of buses currently assigned to this route
+              'routeId':   <int>   internal integer route ID,
+              'busIds':    <list>  IDs of buses currently assigned to this route
             }
 
         Parameters
@@ -2092,15 +2880,15 @@ class METSRClient:
         routeID : str | list[str] | None
             Route name(s) to query. Pass ``None`` to list all routes.
         """
-        msg = {"TYPE": "QUERY_busWithRoute"}
+        msg = {"messageType": "busWithRoute"}
         if routeID is not None:
-            msg["DATA"] = []
+            msg["data"] = []
             if not isinstance(routeID, list):
                 routeID = [routeID]
             for i in routeID:
-                msg["DATA"].append(i)
+                msg["data"].append(i)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_busWithRoute", res["TYPE"]
+        assert res["messageType"] == "busWithRoute", res["messageType"]
         return res
 
     @staticmethod
@@ -2132,21 +2920,12 @@ class METSRClient:
 
     @classmethod
     def _routing_road_id_from(cls, record):
-        road_id = cls._routing_first(record, "ID", "roadID", "roadId", "id", "orig_id", "origID")
+        road_id = record.get("segmentId")
         return None if road_id is None else str(road_id)
 
     @classmethod
     def _routing_downstream_from(cls, record, default=None):
-        downstream = cls._routing_first(
-            record,
-            "down_stream_road",
-            "downstream_road",
-            "downStreamRoad",
-            "downStreamRoads",
-            "downstreamRoad",
-            "downstreamRoads",
-            default=default,
-        )
+        downstream = record.get("downstreamIds", default)
         if downstream is None:
             return None
         if isinstance(downstream, str):
@@ -2157,56 +2936,90 @@ class METSRClient:
     def _routing_node_attrs_from(cls, record, previous=None):
         previous = previous or {}
         distance = cls._routing_float(
-            record,
-            "distance",
-            "distance_m",
-            "length",
-            default=previous.get("distance", previous.get("length", 0.0)),
+            record, "length", default=previous.get("distance", 0.0)
         )
         speed_limit = cls._routing_float(
-            record,
-            "speed_limit",
-            "speedLimit",
-            default=previous.get("speed_limit", 0.0),
+            record, "speedLimit", default=previous.get("speed_limit", 0.0)
         )
         travel_time = cls._routing_float(
-            record,
-            "travel_time",
-            "travelTime",
-            "travel_time_s",
-            "avg_travel_time",
-            default=previous.get("travel_time", previous.get("weight", 0.0)),
+            record, "travelTime", default=previous.get("travel_time", 0.0)
         )
         if travel_time <= 0.0 and distance > 0.0 and speed_limit > 0.0:
             travel_time = distance / speed_limit
+        travel_time_p90 = cls._routing_float(
+            record,
+            "travelTimeP90",
+            default=previous.get("travel_time_p90", travel_time),
+        )
+        if travel_time_p90 < travel_time:
+            travel_time_p90 = travel_time
 
         energy_consumed = cls._routing_float(
-            record,
-            "energy_consumed",
-            "energyConsumed",
-            "totalEnergy",
-            "totalEnergyConsumed",
-            "energy",
-            default=previous.get("energy_consumed", previous.get("total_energy", 0.0)),
+            record, "energyConsumed", default=previous.get("energy_consumed", 0.0)
         )
         avg_energy = cls._routing_float(
-            record,
-            "avg_energy_consumption",
-            "avgEnergyConsumption",
-            "energy_consumption",
-            "energyConsumption",
-            default=previous.get("avg_energy_consumption", previous.get("energy_consumption", 0.0)),
+            record, "averageEnergyConsumption",
+            default=previous.get("avg_energy_consumption", 0.0),
         )
-        if cls._routing_first(record, "weight", default=None) is None:
+        weight = cls._routing_float(
+            record, "routingWeight", default=travel_time
+        )
+        if weight <= 0.0:
             weight = travel_time
-        else:
-            weight = cls._routing_float(record, "weight", default=travel_time)
-            if weight <= 0.0:
-                weight = travel_time
+
+        travel_time_confidence = cls._routing_float(
+            record,
+            "travelTimeConfidence",
+            default=previous.get("travel_time_confidence", 0.0),
+        )
+        effective_sample_count = cls._routing_float(
+            record,
+            "travelTimeEffectiveSampleCount",
+            default=previous.get("travel_time_effective_sample_count", 0.0),
+        )
+        sample_age_seconds = cls._routing_float(
+            record,
+            "travelTimeSampleAgeSeconds",
+            default=previous.get("travel_time_sample_age_seconds", -1.0),
+        )
+        live_vehicle_count = int(cls._routing_float(
+            record,
+            "travelTimeLiveVehicleCount",
+            default=previous.get("travel_time_live_vehicle_count", 0),
+        ))
+        stopped_fraction = cls._routing_float(
+            record,
+            "travelTimeStoppedFraction",
+            default=previous.get("travel_time_stopped_fraction", 0.0),
+        )
+        live_lower_bound = cls._routing_float(
+            record,
+            "travelTimeLiveLowerBound",
+            default=previous.get("travel_time_live_lower_bound", 0.0),
+        )
+        live_mean_speed = cls._routing_float(
+            record,
+            "travelTimeLiveMeanSpeed",
+            default=previous.get("travel_time_live_mean_speed", 0.0),
+        )
+        estimate_source = cls._routing_first(
+            record,
+            "travelTimeEstimateSource",
+            default=previous.get("travel_time_estimate_source"),
+        )
 
         attrs = {
             "distance": distance,
             "travel_time": travel_time,
+            "travel_time_p90": travel_time_p90,
+            "travel_time_confidence": travel_time_confidence,
+            "travel_time_effective_sample_count": effective_sample_count,
+            "travel_time_sample_age_seconds": sample_age_seconds,
+            "travel_time_live_vehicle_count": live_vehicle_count,
+            "travel_time_stopped_fraction": stopped_fraction,
+            "travel_time_live_lower_bound": live_lower_bound,
+            "travel_time_live_mean_speed": live_mean_speed,
+            "travel_time_estimate_source": estimate_source,
             "energy_consumption": avg_energy,
             "avg_energy_consumption": avg_energy,
             "energy_consumed": energy_consumed,
@@ -2215,26 +3028,14 @@ class METSRClient:
             "weight": weight,
             "speed_limit": speed_limit,
         }
-        passthrough = (
-            "roadID",
-            "roadIndex",
-            "r_type",
-            "num_veh",
-            "nVehicles",
-            "speed",
-            "flow",
-            "parking_capacity",
-            "parkingCapacity",
-            "parked_num",
-            "parkedNum",
-            "STATUS",
-        )
-        for name in passthrough:
-            value = cls._routing_first(record, name, default=None)
-            if value is not None:
-                attrs[name] = value
-        if "roadIndex" in attrs:
-            attrs["road_index"] = attrs["roadIndex"]
+        for name in (
+                "segmentId", "segmentType", "visualizationIndex",
+                "vehicleCount", "speed", "flow", "parkingCapacity",
+                "parkedVehicleCount", "status"):
+            if record.get(name) is not None:
+                attrs[name] = record[name]
+        if "visualizationIndex" in attrs:
+            attrs["road_index"] = attrs["visualizationIndex"]
         return attrs
 
     @staticmethod
@@ -2242,6 +3043,15 @@ class METSRClient:
         keys = (
             "distance",
             "travel_time",
+            "travel_time_p90",
+            "travel_time_confidence",
+            "travel_time_effective_sample_count",
+            "travel_time_sample_age_seconds",
+            "travel_time_live_vehicle_count",
+            "travel_time_stopped_fraction",
+            "travel_time_live_lower_bound",
+            "travel_time_live_mean_speed",
+            "travel_time_estimate_source",
             "energy_consumption",
             "avg_energy_consumption",
             "energy_consumed",
@@ -2259,8 +3069,9 @@ class METSRClient:
         graph.graph["snapshot_required"] = cls._routing_truthy(response.get("snapshotRequired", False))
         metadata_fields = (
             ("tick", "tick"),
-            ("TICK", "tick"),
             ("topologyVersion", "topology_version"),
+            ("metricVersion", "metric_version"),
+            ("metricVersion", "weight_version"),
             ("version", "metric_version"),
             ("version", "weight_version"),
             ("weightVersion", "weight_version"),
@@ -2272,48 +3083,764 @@ class METSRClient:
     def query_routing_graph_updates(self):
         """Query road routing-metric deltas since the last full road snapshot.
 
-        The updated SIM endpoint returns ``DATA`` records only for roads whose
+        The endpoint returns ``data`` records only for roads whose
         routing metrics changed. If topology changed, the response sets
         ``snapshotRequired`` and callers should rebuild with
         :meth:`query_routing_graph`.
         """
-        msg = {"TYPE": "QUERY_routingGraphUpdates"}
+        msg = {"messageType": "routingGraphUpdates"}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "ANS_routingGraphUpdates", res["TYPE"]
+        assert res["messageType"] == "routingGraphUpdates", res["messageType"]
         return res
 
-    def query_routing_graph(self, batch_size=500):
-        """Build and return the full road-level NetworkX routing graph.
+    def _routing_batch_settings(self, batch_size=None):
+        if batch_size is None:
+            batch_size = self._client_config_value("routing_graph_batch_size", 5000)
+        batch_size = max(1, int(batch_size))
+        minimum = max(
+            1,
+            int(self._client_config_value("routing_graph_min_batch_size", 500)),
+        )
+        minimum = min(minimum, batch_size)
+        target_bytes = int(self._client_config_value(
+            "routing_graph_response_bytes",
+            max(1024, int(self.websocket_max_size * 0.75)),
+        ))
+        target_bytes = max(1024, min(target_bytes, self.websocket_max_size - 1))
+        return batch_size, minimum, target_bytes
 
-        Nodes are SUMO road IDs. Directed edges represent downstream road
-        connectivity, with source-road metrics copied onto the edge. Useful
-        edge weights include ``weight`` / ``travel_time``, ``distance``, and
-        ``energy_consumption``.
+    def _recover_routing_connection(self):
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+        self._connect(**self._connection_settings)
+
+    @staticmethod
+    def _routing_response_size_error(error):
+        current = error
+        for _ in range(4):
+            if current is None:
+                break
+            detail = (
+                type(current).__name__ + " " + str(current)
+            ).lower().replace("-", " ")
+            if any(marker in detail for marker in (
+                    "payloadtoobig",
+                    "payload too big",
+                    "message too big",
+                    "frame exceeds limit",
+                    "max_size",
+                    "close code 1009",
+                    "received 1009")):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _query_road_records_adaptive(self, road_ids, batch_size=None):
+        requested_batch, minimum_batch, target_bytes = self._routing_batch_settings(
+            batch_size
+        )
+        records = []
+        metadata = {}
+        offset = 0
+        current_batch = requested_batch
+        while offset < len(road_ids):
+            count = min(current_batch, len(road_ids) - offset)
+            batch = road_ids[offset:offset + count]
+            try:
+                response = self.send_receive_msg(
+                    {"messageType": "road", "data": batch},
+                    ignore_heartbeats=True,
+                    max_attempts=1,
+                    return_errors=True,
+                )
+            except RuntimeError as exc:
+                if not self._routing_response_size_error(exc):
+                    raise
+                if count <= minimum_batch:
+                    raise
+                self._recover_routing_connection()
+                current_batch = max(minimum_batch, count // 2)
+                continue
+            except TimeoutError:
+                if count <= minimum_batch:
+                    raise
+                self._recover_routing_connection()
+                current_batch = max(minimum_batch, count // 2)
+                continue
+            if response.get("messageType") != "road":
+                raise RuntimeError(
+                    f"Expected road, received {response.get('messageType')}"
+                )
+            if str(response.get("status", "ok")).lower() == "error":
+                raise RuntimeError(f"METS-R SIM rejected road query batch: {response}")
+
+            records.extend(response.get("data", []))
+            metadata = response
+            offset += count
+            response_bytes = max(1, int(self._last_response_bytes))
+            if response_bytes > target_bytes and count > minimum_batch:
+                scaled = int(count * target_bytes * 0.85 / response_bytes)
+                current_batch = max(minimum_batch, min(count, scaled))
+        self._last_routing_batch_size = current_batch
+        return records, metadata
+
+    def query_routing_topology(
+            self,
+            offset=0,
+            limit=None,
+            include_center=False,
+            compact=True,
+            legacy_fallback=True):
+        """Query one page of static road topology.
+
+        The native endpoint returns the compact ``roadId``,
+        ``downstreamRoadId``, and ``length`` schema. If capabilities explicitly
+        disable it, the same shape is synthesized from the native ``road`` query.
         """
+        offset = max(0, int(offset))
+        if limit is not None:
+            limit = max(0, int(limit))
+        if self._supports_feature("routingTopology"):
+            msg = {
+                "messageType": "routingTopology",
+                "offset": offset,
+                "includeCenter": bool(include_center),
+                "compact": bool(compact),
+            }
+            if limit is not None:
+                msg["limit"] = limit
+            response = self.send_receive_msg(
+                msg,
+                ignore_heartbeats=True,
+                max_attempts=1,
+                return_errors=True,
+            )
+            if not self._is_unsupported_response(response):
+                if response.get("messageType") != "routingTopology":
+                    raise RuntimeError(
+                        "Expected routingTopology, received "
+                        f"{response.get('messageType')}"
+                    )
+                if str(response.get("status", "ok")).lower() != "ok":
+                    raise RuntimeError(
+                        f"METS-R SIM rejected routingTopology query: {response}"
+                    )
+                return response
+            self._feature_support["routingTopology"] = False
+
+        if include_center:
+            raise RuntimeError(
+                "include_center requires a METS-R SIM with routingTopology support"
+            )
+        if not legacy_fallback:
+            raise RuntimeError("Connected METS-R SIM does not support routingTopology")
+        index_response = self.query_road()
+        if str(index_response.get("status", "ok")).lower() == "error":
+            raise RuntimeError(f"METS-R SIM rejected road query: {index_response}")
+        road_ids = index_response.get("roadIds") or []
+        total = len(road_ids)
+        end = total if limit is None else min(total, offset + limit)
+        selected = road_ids[min(offset, total):end]
+        road_records, metadata = self._query_road_records_adaptive(
+            selected,
+            batch_size=limit,
+        ) if selected else ([], index_response)
+        static_records = self._static_topology_records(road_records)
+        if compact:
+            data = [
+                [
+                    record["segmentId"],
+                    record["downstreamIds"],
+                    record["length"],
+                ]
+                for record in static_records
+            ]
+        else:
+            data = static_records
+        return {
+            "messageType": "routingTopology",
+            "status": "ok",
+            "data": data,
+            "offset": min(offset, total),
+            "count": len(data),
+            "total": total,
+            "hasMore": end < total,
+            "topologyVersion": metadata.get(
+                "topologyVersion",
+                index_response.get("topologyVersion"),
+            ),
+            "tick": metadata.get("tick", self.current_tick),
+            "compact": bool(compact),
+            "schema": ["roadId", "downstreamRoadId", "length"] if compact else None,
+            "legacyFallback": True,
+        }
+
+    def _thin_run_network_file_candidate(self, configured):
+        if not self.sim_folder:
+            return None
+        manifest_path = os.path.join(
+            self.sim_folder,
+            "data",
+            ".metsr_hpc_inputs.json",
+        )
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            if (
+                    not isinstance(manifest, dict)
+                    or int(manifest.get("schema_version")) != 1):
+                return None
+            host_source = os.path.expanduser(os.fspath(
+                manifest.get("host_data_source")
+            ))
+            container_target = os.fspath(
+                manifest.get("container_data_target")
+            ).replace("\\", "/")
+            if (
+                    not os.path.isabs(host_source)
+                    or not posixpath.isabs(container_target)):
+                return None
+            host_source = os.path.normpath(os.path.abspath(host_source))
+            container_target = posixpath.normpath(container_target)
+            configured_posix = posixpath.normpath(
+                os.fspath(configured).replace("\\", "/")
+            )
+
+            relative_path = None
+            try:
+                if posixpath.commonpath(
+                        (configured_posix, container_target)
+                ) == container_target:
+                    relative_path = posixpath.relpath(
+                        configured_posix,
+                        container_target,
+                    )
+            except ValueError:
+                pass
+            if relative_path is None:
+                if configured_posix == "data":
+                    relative_path = "."
+                elif configured_posix.startswith("data/"):
+                    relative_path = configured_posix[len("data/"):]
+                else:
+                    return None
+
+            candidate = os.path.abspath(os.path.join(
+                host_source,
+                *relative_path.split("/"),
+            ))
+            if os.path.commonpath((candidate, host_source)) != host_source:
+                return None
+            return candidate if os.path.isfile(candidate) else None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _resolved_network_file(self):
+        configured = self._client_config_value("network_file", None)
+        if not configured and self.sim_folder:
+            properties = _read_property_values(
+                os.path.join(self.sim_folder, "data", "Data.properties")
+            )
+            configured = properties.get("NETWORK_FILE")
+        if not configured:
+            return None
+        configured = os.fspath(configured)
+        candidates = [
+            candidate for candidate in (
+                self._thin_run_network_file_candidate(configured),
+            ) if candidate is not None
+        ]
+        if os.path.isabs(configured):
+            candidates.append(configured)
+        else:
+            if self.sim_folder:
+                candidates.append(os.path.join(self.sim_folder, configured))
+            candidates.append(os.path.abspath(configured))
+            if self.config_json:
+                candidates.append(os.path.join(
+                    os.path.dirname(self.config_json),
+                    configured,
+                ))
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _network_file_sha256(self):
+        network_file = self._resolved_network_file()
+        if network_file is None:
+            return None
+        try:
+            stat = os.stat(network_file)
+        except OSError:
+            return None
+        stat_key = (
+            network_file,
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+        )
+        with self._ROUTING_TOPOLOGY_CACHE_LOCK:
+            cached = self._NETWORK_SHA256_CACHE.get(stat_key)
+            if cached is not None:
+                return cached
+            digest = hashlib.sha256()
+            try:
+                with open(network_file, "rb") as network_stream:
+                    for chunk in iter(lambda: network_stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                return None
+            value = digest.hexdigest()
+            self._NETWORK_SHA256_CACHE[stat_key] = value
+            return value
+
+    def _routing_topology_cache_schema(self, include_center=False):
+        return int(self._ROUTING_TOPOLOGY_SCHEMA_VERSION) * 2 + int(
+            bool(include_center)
+        )
+
+    def _routing_topology_cache_key(self, topology_version, include_center=False):
+        network_sha256 = self._network_file_sha256()
+        if network_sha256 is None or topology_version is None:
+            return None
+        return (
+            network_sha256,
+            self._routing_topology_cache_schema(include_center),
+            str(topology_version),
+        )
+
+    def _routing_topology_cache_dir(self):
+        configured = self._client_config_value("routing_topology_cache_dir", None)
+        if configured:
+            return os.path.abspath(os.path.expanduser(os.fspath(configured)))
+        base = (
+            os.environ.get("XDG_CACHE_HOME")
+            or os.environ.get("LOCALAPPDATA")
+            or os.path.join(os.path.expanduser("~"), ".cache")
+        )
+        return os.path.join(base, "metsr-hpc", "routing")
+
+    def _routing_topology_cache_path(self, cache_key):
+        network_sha256, schema_version, topology_version = cache_key
+        version_token = hashlib.sha256(
+            topology_version.encode("utf-8")
+        ).hexdigest()[:16]
+        filename = (
+            f"topology-v{schema_version}-{network_sha256}-{version_token}.json.gz"
+        )
+        return os.path.join(self._routing_topology_cache_dir(), filename)
+
+    def _load_routing_topology_cache(
+            self,
+            topology_version,
+            include_center=False,
+            expected_count=None):
+        if not self._routing_truthy(
+                self._client_config_value("routing_topology_cache", True)):
+            return None
+        cache_key = self._routing_topology_cache_key(topology_version, include_center)
+        if cache_key is None:
+            return None
+        with self._ROUTING_TOPOLOGY_CACHE_LOCK:
+            memory_payload = self._ROUTING_TOPOLOGY_MEMORY_CACHE.get(cache_key)
+        if memory_payload is not None:
+            memory_records = memory_payload.get("records")
+            if (
+                    isinstance(memory_records, list)
+                    and (
+                        expected_count is None
+                        or len(memory_records) == int(expected_count)
+                    )):
+                return memory_payload
+            with self._ROUTING_TOPOLOGY_CACHE_LOCK:
+                self._ROUTING_TOPOLOGY_MEMORY_CACHE.pop(cache_key, None)
+        cache_path = self._routing_topology_cache_path(cache_key)
+        try:
+            with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+            payload_key = (
+                payload.get("networkSHA256"),
+                int(payload.get("schemaVersion")),
+                str(payload.get("topologyVersion")),
+            )
+            records = payload.get("records")
+            if (
+                    payload_key != cache_key
+                    or not isinstance(records, list)
+                    or (
+                        expected_count is not None
+                        and len(records) != int(expected_count)
+                    )):
+                return None
+        except (AttributeError, EOFError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        with self._ROUTING_TOPOLOGY_CACHE_LOCK:
+            self._ROUTING_TOPOLOGY_MEMORY_CACHE[cache_key] = payload
+        return payload
+
+    def _save_routing_topology_cache(self, topology_version, records, include_center=False):
+        if not self._routing_truthy(
+                self._client_config_value("routing_topology_cache", True)):
+            return
+        cache_key = self._routing_topology_cache_key(topology_version, include_center)
+        if cache_key is None:
+            return
+        payload = {
+            "networkSHA256": cache_key[0],
+            "schemaVersion": cache_key[1],
+            "topologyVersion": cache_key[2],
+            # Records are deliberately static: no speed, travel time, energy,
+            # flow, occupancy, metric version, or tick is persisted.
+            "records": records,
+        }
+        with self._ROUTING_TOPOLOGY_CACHE_LOCK:
+            self._ROUTING_TOPOLOGY_MEMORY_CACHE[cache_key] = payload
+        cache_dir = self._routing_topology_cache_dir()
+        temp_path = None
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix=".topology-",
+                suffix=".tmp",
+                dir=cache_dir,
+            )
+            with os.fdopen(descriptor, "wb") as raw_file:
+                with gzip.GzipFile(fileobj=raw_file, mode="wb") as cache_file:
+                    cache_file.write(json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"))
+            os.replace(temp_path, self._routing_topology_cache_path(cache_key))
+            temp_path = None
+        except OSError:
+            pass
+        finally:
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    @classmethod
+    def _static_topology_records(cls, records, schema=None):
+        normalized = []
+        schema = list(schema or [])
+        positions = {name: index for index, name in enumerate(schema)}
+        for raw in records:
+            if isinstance(raw, dict):
+                road_id = raw.get("roadId")
+                if road_id is None:
+                    road_id = cls._routing_road_id_from(raw)
+                downstream = raw.get("downstreamRoadId")
+                if downstream is None:
+                    downstream = cls._routing_downstream_from(raw, default=None)
+                if downstream is None:
+                    downstream = raw.get("downstreamIds", [])
+                length = cls._routing_float(
+                    raw, "length", "distance", "distance_m", default=0.0
+                )
+                center_x = raw.get("centerX")
+                center_y = raw.get("centerY")
+            elif isinstance(raw, (list, tuple)) and len(raw) >= 3:
+                road_index = positions.get("roadId", 0)
+                downstream_index = positions.get("downstreamRoadId", 1)
+                length_index = positions.get("length", 2)
+                road_id = raw[road_index]
+                downstream = raw[downstream_index]
+                try:
+                    length = float(raw[length_index])
+                except (TypeError, ValueError):
+                    length = 0.0
+                center_x = (
+                    raw[positions["centerX"]]
+                    if "centerX" in positions and positions["centerX"] < len(raw)
+                    else None
+                )
+                center_y = (
+                    raw[positions["centerY"]]
+                    if "centerY" in positions and positions["centerY"] < len(raw)
+                    else None
+                )
+            else:
+                continue
+            if road_id is None:
+                continue
+            record = {
+                "segmentId": str(road_id),
+                "downstreamIds": [
+                    str(value) for value in (downstream or []) if value is not None
+                ],
+                "length": length,
+            }
+            if center_x is not None and center_y is not None:
+                record["centerX"] = center_x
+                record["centerY"] = center_y
+            normalized.append(record)
+        return normalized
+
+    def _build_static_topology_graph(
+            self,
+            records,
+            metadata,
+            cache_hit=False,
+            include_center=False):
+        graph = nx.DiGraph()
+        for record in records:
+            attrs = {
+                "distance": float(record.get("length", 0.0)),
+                "length": float(record.get("length", 0.0)),
+            }
+            if "centerX" in record and "centerY" in record:
+                attrs["center_x"] = record["centerX"]
+                attrs["center_y"] = record["centerY"]
+            graph.add_node(record["segmentId"], **attrs)
+        for record in records:
+            edge_attrs = {
+                "distance": float(record.get("length", 0.0)),
+                "length": float(record.get("length", 0.0)),
+            }
+            for downstream_id in record.get("downstreamIds", []):
+                graph.add_edge(record["segmentId"], downstream_id, **edge_attrs)
+        self._apply_routing_graph_metadata(graph, metadata)
+        graph.graph.update({
+            "topology_only": True,
+            "topology_cache_hit": bool(cache_hit),
+            "topology_schema_version": self._routing_topology_cache_schema(
+                include_center),
+            "topology_includes_center": bool(include_center),
+        })
+        if metadata.get("topologyVersion") is not None:
+            graph.graph["topology_version"] = metadata["topologyVersion"]
+        if metadata.get("tick") is not None:
+            graph.graph["tick"] = metadata["tick"]
+        network_sha256 = self._network_file_sha256()
+        if network_sha256 is not None:
+            graph.graph["network_sha256"] = network_sha256
+        return graph
+
+    def _query_optimized_topology_graph(
+            self,
+            batch_size,
+            use_cache=True,
+            include_center=False):
+        probe = self.query_routing_topology(
+            offset=0,
+            limit=0,
+            include_center=include_center,
+            compact=True,
+            legacy_fallback=True,
+        )
+        if probe.get("legacyFallback"):
+            return None
+        if include_center:
+            probe_schema = set(probe.get("schema") or [])
+            if not {"centerX", "centerY"}.issubset(probe_schema):
+                raise RuntimeError(
+                    "METS-R SIM routingTopology response omitted requested centers"
+                )
+        topology_version = probe.get("topologyVersion")
+        total = max(0, int(probe.get("total", 0)))
+        if use_cache:
+            cached = self._load_routing_topology_cache(
+                topology_version,
+                include_center=include_center,
+                expected_count=total,
+            )
+            if cached is not None:
+                return self._build_static_topology_graph(
+                    cached["records"],
+                    probe,
+                    cache_hit=True,
+                    include_center=include_center,
+                )
+
+        requested_batch, minimum_batch, target_bytes = self._routing_batch_settings(
+            batch_size
+        )
+        offset = 0
+        current_batch = requested_batch
+        records = []
+        metadata = probe
+        correlation_failures = 0
+        while offset < total:
+            count = min(current_batch, total - offset)
+            try:
+                response = self.query_routing_topology(
+                    offset=offset,
+                    limit=count,
+                    include_center=include_center,
+                    compact=True,
+                    legacy_fallback=False,
+                )
+            except RuntimeError as exc:
+                if not self._routing_response_size_error(exc):
+                    raise
+                if count <= minimum_batch:
+                    raise
+                self._recover_routing_connection()
+                current_batch = max(minimum_batch, count // 2)
+                continue
+            except TimeoutError:
+                if count <= minimum_batch:
+                    raise
+                self._recover_routing_connection()
+                current_batch = max(minimum_batch, count // 2)
+                continue
+            try:
+                response_offset = int(response.get("offset"))
+                response_total = int(response.get("total"))
+            except (TypeError, ValueError):
+                response_offset = -1
+                response_total = -1
+            if response_offset != offset or response_total != total:
+                correlation_failures += 1
+                if correlation_failures > 1:
+                    raise RuntimeError(
+                        "METS-R SIM routingTopology page correlation failed: "
+                        f"requested offset/total {offset}/{total}, received "
+                        f"{response_offset}/{response_total}"
+                    )
+                self._recover_routing_connection()
+                continue
+            correlation_failures = 0
+            if str(response.get("topologyVersion")) != str(topology_version):
+                raise RuntimeError(
+                    "METS-R SIM topology changed while its graph was being loaded"
+                )
+            page_records = self._static_topology_records(
+                response.get("data", []),
+                schema=response.get("schema"),
+            )
+            records.extend(page_records)
+            received_count = int(response.get(
+                "count", len(response.get("data", []))
+            ))
+            if received_count <= 0:
+                raise RuntimeError(
+                    f"METS-R SIM returned an empty topology page at offset {offset}"
+                )
+            if len(page_records) != received_count:
+                raise RuntimeError(
+                    "METS-R SIM routingTopology count does not match "
+                    f"its data length at offset {offset}"
+                )
+            offset += received_count
+            metadata = response
+            response_bytes = max(1, int(self._last_response_bytes))
+            if response_bytes > target_bytes and count > minimum_batch:
+                scaled = int(count * target_bytes * 0.85 / response_bytes)
+                current_batch = max(minimum_batch, min(count, scaled))
+        self._last_routing_batch_size = current_batch
+        if use_cache:
+            self._save_routing_topology_cache(
+                topology_version,
+                records,
+                include_center=include_center,
+            )
+        graph = self._build_static_topology_graph(
+            records,
+            metadata,
+            cache_hit=False,
+            include_center=include_center,
+        )
+        graph.graph["routing_batch_size"] = current_batch
+        return graph
+
+    def query_routing_graph(
+            self,
+            batch_size=None,
+            topology_only=False,
+            use_cache=True,
+            include_center=False):
+        """Build and return the road-level NetworkX routing graph.
+
+        The default batch comes from ``routing_graph_batch_size`` (5,000 when
+        unset) and shrinks automatically when responses approach the
+        WebSocket byte limit.
+
+        ``topology_only=True`` omits all live metrics and caches only road IDs,
+        downstream connections, lengths, and optional centers. Cache keys are
+        the network-file SHA-256, client schema version, and simulator
+        topology version.
+        """
+        batch_size, _, _ = self._routing_batch_settings(batch_size)
+        if topology_only and self._supports_feature("routingTopology"):
+            optimized = self._query_optimized_topology_graph(
+                batch_size=batch_size,
+                use_cache=use_cache,
+                include_center=include_center,
+            )
+            if optimized is not None:
+                return optimized
+        if topology_only and include_center:
+            raise RuntimeError(
+                "include_center requires a METS-R SIM with routingTopology support"
+            )
+
         all_roads_res = self.query_road()
-        if all_roads_res.get("CODE") == "KO":
-            raise RuntimeError(f"METS-R SIM rejected QUERY_road: {all_roads_res}")
-        road_ids = all_roads_res.get("id_list") or all_roads_res.get("orig_id") or []
+        if all_roads_res.get("status") == "error":
+            raise RuntimeError(f"METS-R SIM rejected road query: {all_roads_res}")
+        road_ids = all_roads_res.get("roadIds") or []
+        topology_version = all_roads_res.get("topologyVersion")
+
+        if topology_only and use_cache:
+            cached = self._load_routing_topology_cache(
+                topology_version,
+                include_center=False,
+                expected_count=len(road_ids),
+            )
+            if cached is not None:
+                return self._build_static_topology_graph(
+                    cached["records"],
+                    all_roads_res,
+                    cache_hit=True,
+                    include_center=False,
+                )
+
+        road_records, metadata_response = self._query_road_records_adaptive(
+            road_ids,
+            batch_size=batch_size,
+        )
+        if not metadata_response:
+            metadata_response = all_roads_res
+        if topology_only:
+            static_records = self._static_topology_records(road_records)
+            if use_cache:
+                self._save_routing_topology_cache(
+                    metadata_response.get("topologyVersion", topology_version),
+                    static_records,
+                    include_center=False,
+                )
+            graph = self._build_static_topology_graph(
+                static_records,
+                metadata_response,
+                cache_hit=False,
+                include_center=False,
+            )
+            graph.graph["legacy_topology_fallback"] = True
+            graph.graph["routing_batch_size"] = getattr(
+                self, "_last_routing_batch_size", batch_size
+            )
+            return graph
 
         graph = nx.DiGraph()
         downstream_by_road = {}
-        metadata_response = all_roads_res
-        batch_size = max(1, int(batch_size or 1))
-        for batch_start in range(0, len(road_ids), batch_size):
-            batch = road_ids[batch_start: batch_start + batch_size]
-            response = self.query_road(id=batch)
-            if response.get("CODE") == "KO":
-                raise RuntimeError(f"METS-R SIM rejected QUERY_road batch: {response}")
-            metadata_response = response
-            for road in response.get("DATA", []):
-                if not isinstance(road, dict):
-                    continue
-                road_id = self._routing_road_id_from(road)
-                if road_id is None:
-                    continue
-                graph.add_node(road_id, **self._routing_node_attrs_from(road))
-                downstream_by_road[road_id] = self._routing_downstream_from(road, default=[])
-
+        for road in road_records:
+            if not isinstance(road, dict):
+                continue
+            road_id = self._routing_road_id_from(road)
+            if road_id is None:
+                continue
+            graph.add_node(road_id, **self._routing_node_attrs_from(road))
+            downstream_by_road[road_id] = self._routing_downstream_from(
+                road, default=[]
+            )
         for road_id, downstream_ids in downstream_by_road.items():
             edge_attrs = self._routing_edge_attrs_from(graph.nodes[road_id])
             for downstream_id in downstream_ids or []:
@@ -2321,6 +3848,10 @@ class METSRClient:
 
         self._apply_routing_graph_metadata(graph, metadata_response)
         graph.graph["snapshot_required"] = False
+        graph.graph["topology_only"] = False
+        graph.graph["routing_batch_size"] = getattr(
+            self, "_last_routing_batch_size", batch_size
+        )
         return graph
 
     def update_routing_graph(
@@ -2329,8 +3860,8 @@ class METSRClient:
             update_response=None,
             include_topology=False,
             reload_on_snapshot_required=True,
-            batch_size=500):
-        """Apply ``QUERY_routingGraphUpdates`` results to an existing graph.
+            batch_size=None):
+        """Apply ``routingGraphUpdates`` results to an existing graph.
 
         Normal update responses are metric-only. When SIM reports
         ``snapshotRequired``, the topology has changed and this method reloads a
@@ -2340,14 +3871,21 @@ class METSRClient:
         """
         if update_response is None:
             update_response = self.query_routing_graph_updates()
-        if update_response.get("CODE") == "KO":
-            raise RuntimeError(f"METS-R SIM rejected QUERY_routingGraphUpdates: {update_response}")
+        if update_response.get("status") == "error":
+            raise RuntimeError(f"METS-R SIM rejected routingGraphUpdates: {update_response}")
 
         if self._routing_truthy(update_response.get("snapshotRequired", False)):
             if not reload_on_snapshot_required:
                 self._apply_routing_graph_metadata(graph, update_response)
                 raise RuntimeError("METS-R SIM requested a fresh routing graph snapshot")
-            return self.query_routing_graph(batch_size=batch_size)
+            return self.query_routing_graph(
+                batch_size=batch_size,
+                topology_only=bool(graph.graph.get("topology_only", False)),
+                include_center=bool(
+                    graph.graph.get("topology_includes_center", False)
+                ),
+                use_cache=True,
+            )
 
         removed_ids = update_response.get("removed", []) or update_response.get("REMOVED", []) or []
         for road_id in removed_ids:
@@ -2355,15 +3893,15 @@ class METSRClient:
             if road_id in graph:
                 graph.remove_node(road_id)
 
-        for road in update_response.get("DATA", []):
+        for road in update_response.get("data", []):
             if not isinstance(road, dict):
                 continue
             road_id = self._routing_road_id_from(road)
             if road_id is None:
                 continue
-            status = str(road.get("STATUS", road.get("status", "OK"))).upper()
-            if status in {"KO", "REMOVED", "DELETE", "DELETED"}:
-                if road_id in graph and status != "KO":
+            status = str(road.get("status", "ok")).lower()
+            if status in {"error", "REMOVED", "DELETE", "DELETED"}:
+                if road_id in graph and status != "error":
                     graph.remove_node(road_id)
                 continue
 
@@ -2384,74 +3922,119 @@ class METSRClient:
 
     # CONTROL: change the state of the simulator
     # generate a vehicle trip between origin and destination zones
-    def generate_trip(self, vehID, origin = -1, destination = -1):
-        msg = {"TYPE": "CTRL_generateTrip", "DATA": []}
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-        if not isinstance(origin, list):
-            origin = [origin] * len(vehID)
-        if not isinstance(destination, list):
-            destination = [destination] * len(vehID)
+    def generate_trip(self, vehID, origin = -1, destination = -1, length = None):
+        """Generate private-EV trips between zones.
 
-        assert len(vehID) == len(origin) == len(destination), "Length of vehID, origin, and destination must be the same"
-        for vehID, origin, destination in zip(vehID, origin, destination):
-            msg["DATA"].append({"vehID": vehID, "orig": origin, "dest": destination})
+        ``length`` is an optional vehicle length in meters. It may be a scalar
+        or one value per ``vehID`` and must be finite and positive when set.
+        METS-R SIM applies it only when that external vehicle ID is first
+        created; subsequent trips retain the vehicle's original length. Each
+        successful response record reports the effective ``length``.
+        """
+        msg = {"messageType": "generateTrip", "data": []}
+        vehicle_ids = _as_list(vehID)
+        origins = _batch_field_values(
+            origin, len(vehicle_ids), "origin", batch_name="vehicleId"
+        )
+        destinations = _batch_field_values(
+            destination, len(vehicle_ids), "destination", batch_name="vehicleId"
+        )
+        lengths = _optional_vehicle_lengths(length, len(vehicle_ids), "vehicleId")
+
+        for vehicle_id, origin_id, destination_id, vehicle_length in zip(
+                vehicle_ids, origins, destinations, lengths):
+            record = {
+                "vehicleId": vehicle_id,
+                "originZoneId": origin_id,
+                "destinationZoneId": destination_id,
+            }
+            if vehicle_length is not None:
+                record["vehicleLength"] = vehicle_length
+            msg["data"].append(record)
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
 
-        assert res["TYPE"] == "CTRL_generateTrip", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "generateTrip", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
-    # generate a vehicle trip between origin and destination roads
-    def generate_trip_between_roads(self, vehID, origin, destination):
-        msg = {"TYPE": "CTRL_genTripBwRoads", "DATA": []}
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-        if not isinstance(origin, list):
-            origin = [origin] * len(vehID)
-        if not isinstance(destination, list):
-            destination = [destination] * len(vehID)
 
-        assert len(vehID) == len(origin) == len(destination), "Length of vehID, origin, and destination must be the same"
-        for vehID, origin, destination in zip(vehID, origin, destination):
-            msg["DATA"].append({"vehID": vehID, "orig": origin, "dest": destination})
+    # generate a vehicle trip between origin and destination roads
+    def generate_trip_between_roads(
+            self, vehID, origin, destination, length = None):
+        """Generate private-EV trips between original road IDs.
+
+        ``length`` follows :meth:`generate_trip`: it is measured in meters,
+        supports scalar broadcasting, and only affects a newly created vehicle.
+        """
+        msg = {"messageType": "generateTripsByRoad", "data": []}
+        vehicle_ids = _as_list(vehID)
+        origins = _batch_field_values(
+            origin, len(vehicle_ids), "origin", batch_name="vehicleId"
+        )
+        destinations = _batch_field_values(
+            destination, len(vehicle_ids), "destination", batch_name="vehicleId"
+        )
+        lengths = _optional_vehicle_lengths(length, len(vehicle_ids), "vehicleId")
+
+        for vehicle_id, origin_id, destination_id, vehicle_length in zip(
+                vehicle_ids, origins, destinations, lengths):
+            record = {
+                "vehicleId": vehicle_id,
+                "originRoadId": origin_id,
+                "destinationRoadId": destination_id,
+            }
+            if vehicle_length is not None:
+                record["vehicleLength"] = vehicle_length
+            msg["data"].append(record)
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
 
-        assert res["TYPE"] == "CTRL_genTripBwRoads", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "generateTripsByRoad", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
 
     # set the road for co-simulation
     def set_cosim_road(self, roadID):
+        """Hand one or more roads from native simulation to co-simulation.
+
+        For every valid road, current METS-R SIM releases native ownership and
+        returns every controlled connector touching that road, both inbound and
+        outbound. Connector records contain the opaque server ``connectorId``,
+        both endpoint road IDs, and physical SUMO ``internalEdgeIds``.
+        """
         msg = {
-                "TYPE": "CTRL_setCoSimRoad",
-                "DATA": [] 
+                "messageType": "setCoSimRoad",
+                "data": []
               }
-        if not isinstance(roadID, list):
-            roadID = [roadID]
-        for i in roadID:
-            msg['DATA'].append(i)
+        for i in _as_list(roadID):
+            msg['data'].append(i)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_setCoSimRoad", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "setCoSimRoad", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     # release the road for co-simulation
     def release_cosim_road(self, roadID):
+        """Return one or more roads to native METS-R SIM control.
+
+        Valid roads are always released. Successful records partition the
+        road's previously controlled incident connectors into
+        ``releasedConnectorIds``/``releasedConnectors`` and the connectors
+        which remain controlled through the other endpoint in
+        ``connectorIds``/``connectors``.
+        """
         msg = {
-                "TYPE": "CTRL_releaseCosimRoad",
-                "DATA": [] 
+                "messageType": "releaseCoSimRoad",
+                "data": []
               }
         if not isinstance(roadID, list):
             roadID = [roadID]
         for i in roadID:
-            msg['DATA'].append(i)
+            msg['data'].append(i)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_releaseCosimRoad", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "releaseCoSimRoad", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def enter_road_from_queue(self, vehID = None, roadID = None, private_veh = None,
@@ -2483,10 +4066,15 @@ class METSRClient:
         requests : dict | list[dict] | None
             Fully formed simulator request record(s). When provided, other
             parameters are ignored.
+
+        Notes
+        -----
+        A temporarily reserved or occupied entry lane is reported per record
+        as ``status='error'`` with ``retryable=True`` and an ``errorCode``.
         """
-        msg = {"TYPE": "CTRL_enterRoadFromQueue", "DATA": []}
+        msg = {"messageType": "enterRoadFromQueue", "data": []}
         if requests is not None:
-            msg["DATA"] = _as_list(requests)
+            msg["data"] = _as_list(requests)
         else:
             if vehID is None and roadID is None and internal_vehicle_id is None:
                 raise ValueError("vehID, roadID, internal_vehicle_id, or requests is required")
@@ -2504,160 +4092,623 @@ class METSRClient:
             for vid, rid, prv, internal_id in zip(veh_ids, road_ids, private_flags, internal_ids):
                 record = {}
                 if vid is not None:
-                    record["vehID"] = vid
+                    record["vehicleId"] = vid
                 if internal_id is not None:
-                    record["internalVehicleID"] = internal_id
+                    record["internalVehicleId"] = internal_id
                 if prv is not None:
-                    record["vehType"] = prv
+                    record["isPrivate"] = prv
                 if rid is not None:
-                    record["roadID"] = rid
-                msg["DATA"].append(record)
+                    record["roadId"] = rid
+                msg["data"].append(record)
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_enterRoadFromQueue", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "enterRoadFromQueue", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-        
-    # teleport vehicle to a target location specified by road and coordiantes, only work when the road is a cosim road
-    def teleport_cosim_vehicle(self, vehID, x, y, bearing, speed = 0, z = 0.0, private_veh = False, transform_coords = False):
-        msg = {
-                "TYPE": "CTRL_teleportCoSimVeh",
-                "DATA": []
-                }
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-            x = [x]
-            y = [y]
-            z = [z]
-            speed = [speed]
-            bearing = [bearing]
-        if not isinstance(z, list):
-            z = [z] * len(vehID)
-        if not isinstance(bearing, list):
-            bearing = [bearing] * len(vehID)
-        if not isinstance(speed, list):
-            speed = [speed] * len(vehID)
-        if not isinstance(private_veh, list):
-            private_veh = [private_veh] * len(vehID)
-        if not isinstance(transform_coords, list):
-            transform_coords = [transform_coords] * len(vehID)
-        for vehID, x, y, z, bearing, speed, private_veh, transform_coords in zip(vehID, x, y, z, bearing, speed, private_veh, transform_coords):
-            msg["DATA"].append({"vehID": vehID, "x": x, "y": y, "z": z, "bearing": bearing, "speed": speed, "vehType": private_veh, "transformCoord": transform_coords})
-        res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_teleportCoSimVeh", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
-        return res
-    
-    # teleport vehicle to a target location specified by road/lane plus distance or projected coordinates
-    def teleport_trace_replay_vehicle(
+
+    def initialize_cosim_vehicle(
             self,
             vehID,
-            roadID,
-            laneID,
-            dist = None,
+            x,
+            y,
+            bearing,
+            destination_road_id = None,
+            speed = 0,
+            z = 0.0,
+            private_veh = True,
+            transform_coords = False,
+            length = None,
+            segment_id = None,
+            connector_path_id = None,
+            road_id = None,
+            destinationRoadID = None,
+            destRoadID = None,
+            segmentID = None,
+            roadID = None,
+            connectorPathID = None):
+        """Create private EVs directly at authoritative co-simulation poses.
+
+        The latest METS-R SIM map-matches each front-bumper pose against the
+        controlled physical roads and intersection connectors. ``segment_id``
+        is an optional physical-road or connector hint; ``connector_path_id``
+        selects a zero-based path when that hint is a connector. ``road_id`` is
+        the protocol's equivalent legacy spelling. ``destination_road_id``
+        must be a physical METS-R road with a destination zone. The server
+        rejects overlaps instead of shifting the requested pose.
+
+        All arguments accept scalars or batches matching ``vehID``. The camel-
+        case keyword aliases mirror the wire protocol. Public fleet vehicles
+        are not supported by this command and produce a per-record
+        ``UNSUPPORTED_VEHICLE_TYPE`` response.
+        """
+        if destinationRoadID is not None:
+            if destination_road_id is not None:
+                raise ValueError(
+                    "Use either destination_road_id or destinationRoadID, not both"
+                )
+            destination_road_id = destinationRoadID
+        if destRoadID is not None:
+            if destination_road_id is not None:
+                raise ValueError(
+                    "Use only one of destination_road_id, destinationRoadID, or destRoadID"
+                )
+            destination_road_id = destRoadID
+        if segmentID is not None:
+            if segment_id is not None:
+                raise ValueError("Use either segment_id or segmentID, not both")
+            segment_id = segmentID
+        if roadID is not None:
+            if road_id is not None:
+                raise ValueError("Use either road_id or roadID, not both")
+            road_id = roadID
+        if connectorPathID is not None:
+            if connector_path_id is not None:
+                raise ValueError(
+                    "Use either connector_path_id or connectorPathID, not both"
+                )
+            connector_path_id = connectorPathID
+        if destination_road_id is None:
+            raise ValueError("destination_road_id is required")
+
+        msg = {"messageType": "initializeCoSimVeh", "data": []}
+        veh_ids = _as_list(vehID)
+        count = len(veh_ids)
+        xs = _batch_field_values(x, count, "x")
+        ys = _batch_field_values(y, count, "y")
+        zs = _batch_field_values(z, count, "z")
+        bearings = _batch_field_values(bearing, count, "bearing")
+        speeds = _batch_field_values(speed, count, "speed")
+        private_flags = _batch_field_values(private_veh, count, "private_veh")
+        transform_flags = _batch_field_values(
+            transform_coords, count, "transform_coords"
+        )
+        vehicle_lengths = _optional_vehicle_lengths(
+            length, count, batch_name="vehicleId"
+        )
+        segment_ids = _batch_field_values(segment_id, count, "segment_id")
+        road_ids = _batch_field_values(road_id, count, "road_id")
+        connector_path_ids = _batch_field_values(
+            connector_path_id, count, "connector_path_id"
+        )
+        destination_ids = _batch_field_values(
+            destination_road_id, count, "destination_road_id"
+        )
+
+        for (veh_id, x_value, y_value, z_value, bearing_value, speed_value,
+             private_flag, transform_flag, vehicle_length, segment_hint,
+             road_hint, connector_path, destination_id) in zip(
+                veh_ids, xs, ys, zs, bearings, speeds, private_flags,
+                transform_flags, vehicle_lengths, segment_ids, road_ids,
+                connector_path_ids, destination_ids):
+            record = {
+                "vehicleId": veh_id,
+                "isPrivate": private_flag,
+                "x": x_value,
+                "y": y_value,
+                "z": z_value,
+                "bearing": bearing_value,
+                "speed": speed_value,
+                "transformCoordinates": transform_flag,
+                "destinationRoadId": destination_id,
+            }
+            if vehicle_length is not None:
+                record["vehicleLength"] = vehicle_length
+            selected_segment = segment_hint if segment_hint is not None else road_hint
+            if connector_path is not None and selected_segment is None:
+                raise ValueError("connector_path_id requires segment_id")
+            if segment_hint is not None:
+                record["segmentId"] = segment_hint
+            elif road_hint is not None:
+                record["segmentId"] = road_hint
+            if connector_path is not None:
+                record["connectorPathId"] = connector_path
+            msg["data"].append(record)
+
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "initializeCoSimVeh", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+        return res
+
+    initialize_coSim_vehicle = initialize_cosim_vehicle
+
+    # Teleport a vehicle to an authoritative pose on a controlled segment.
+    def teleport_cosim_vehicle(
+            self,
+            vehID,
+            x,
+            y,
+            bearing,
+            speed = 0,
+            z = 0.0,
+            private_veh = False,
+            transform_coords = False,
+            observed_road_id = None,
+            observedRoadID = None,
+            observed_lane_id = None,
+            observedLaneID = None,
+            segment_id = None,
+            segmentID = None,
+            road_id = None,
+            roadID = None,
+            lane_index = None,
+            laneIndex = None,
+            connector_path_id = None,
+            connectorPathID = None):
+        """Apply an authoritative external pose to a co-simulation vehicle.
+
+        Without ``segment_id``, METS-R map-matches only against co-simulation
+        roads and connectors. An explicit segment is authoritative.
+        ``lane_index`` selects a road lane and ``connector_path_id`` selects a
+        connector path; both require a segment and are mutually exclusive.
+
+        An explicit native segment releases a co-simulation-owned vehicle back
+        to METS-R. The response reports ``controlMode='native'`` and
+        ``releasedFromCoSim=True``; callers should then remove their external
+        actor.
+
+        ``road_id``/``observed_road_id`` and ``observed_lane_id`` are deprecated
+        Python aliases. The wire payload always uses ``segmentId``,
+        ``laneIndex``, and ``connectorPathId``. Record failures use
+        ``status='error'`` with ``errorCode``; the top-level status may be
+        ``partial``.
+        """
+        if observedRoadID is not None:
+            if observed_road_id is not None:
+                raise ValueError(
+                    "Use either observed_road_id or observedRoadID, not both"
+                )
+            observed_road_id = observedRoadID
+        if observedLaneID is not None:
+            if observed_lane_id is not None:
+                raise ValueError(
+                    "Use either observed_lane_id or observedLaneID, not both"
+                )
+            observed_lane_id = observedLaneID
+        if segmentID is not None:
+            if segment_id is not None:
+                raise ValueError("Use either segment_id or segmentID, not both")
+            segment_id = segmentID
+        if roadID is not None:
+            if road_id is not None:
+                raise ValueError("Use either road_id or roadID, not both")
+            road_id = roadID
+        if laneIndex is not None:
+            if lane_index is not None:
+                raise ValueError("Use either lane_index or laneIndex, not both")
+            lane_index = laneIndex
+        if observed_lane_id is not None:
+            if lane_index is not None:
+                raise ValueError(
+                    "observed_lane_id is a legacy alias for lane_index; use only one"
+                )
+            lane_index = observed_lane_id
+        if connectorPathID is not None:
+            if connector_path_id is not None:
+                raise ValueError(
+                    "Use either connector_path_id or connectorPathID, not both"
+                )
+            connector_path_id = connectorPathID
+        segment_source_count = sum(
+            value is not None
+            for value in (segment_id, road_id, observed_road_id)
+        )
+        if segment_source_count > 1:
+            raise ValueError(
+                "segment_id, road_id, and observed_road_id are aliases; use only one"
+            )
+
+        msg = {
+                "messageType": "teleportCoSimVeh",
+                "data": []
+                }
+        veh_ids = _as_list(vehID)
+        count = len(veh_ids)
+        xs = _batch_field_values(x, count, "x")
+        ys = _batch_field_values(y, count, "y")
+        zs = _batch_field_values(z, count, "z")
+        bearings = _batch_field_values(bearing, count, "bearing")
+        speeds = _batch_field_values(speed, count, "speed")
+        private_flags = _batch_field_values(private_veh, count, "private_veh")
+        transform_flags = _batch_field_values(
+            transform_coords, count, "transform_coords"
+        )
+        observed_road_ids = _batch_field_values(
+            observed_road_id, count, "observed_road_id"
+        )
+        segment_ids = _batch_field_values(segment_id, count, "segment_id")
+        road_ids = _batch_field_values(road_id, count, "road_id")
+        lane_indices = _batch_field_values(lane_index, count, "lane_index")
+        connector_path_ids = _batch_field_values(
+            connector_path_id, count, "connector_path_id"
+        )
+
+        for (veh_id, x_value, y_value, z_value, bearing_value, speed_value,
+             private_flag, transform_flag, observed_road, segment_hint,
+             road_hint, selected_lane, selected_connector_path) in zip(
+                veh_ids,
+                xs,
+                ys,
+                zs,
+                bearings,
+                speeds,
+                private_flags,
+                transform_flags,
+                observed_road_ids,
+                segment_ids,
+                road_ids,
+                lane_indices,
+                connector_path_ids):
+            record = {
+                "vehicleId": veh_id,
+                "x": x_value,
+                "y": y_value,
+                "z": z_value,
+                "bearing": bearing_value,
+                "speed": speed_value,
+                "isPrivate": private_flag,
+                "transformCoordinates": transform_flag,
+            }
+            selected_segment = next(
+                (candidate for candidate in
+                 (segment_hint, road_hint, observed_road)
+                 if candidate is not None),
+                None,
+            )
+            if selected_lane is not None and selected_connector_path is not None:
+                raise ValueError(
+                    "lane_index and connector_path_id are mutually exclusive"
+                )
+            if (selected_lane is not None or selected_connector_path is not None) \
+                    and selected_segment is None:
+                raise ValueError(
+                    "lane_index and connector_path_id require segment_id"
+                )
+            if selected_segment is not None:
+                record["segmentId"] = selected_segment
+            if selected_lane is not None:
+                record["laneIndex"] = selected_lane
+            if selected_connector_path is not None:
+                record["connectorPathId"] = selected_connector_path
+            msg["data"].append(record)
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "teleportCoSimVeh", res["messageType"]
+        return res
+
+    def _teleport_digital_twin_vehicle(
+            self,
+            message_type,
+            vehID,
+            segment_id = None,
+            lane_index = None,
+            distance_to_segment_end = None,
             private_veh = False,
             x = None,
             y = None,
-            transform_coords = False):
-        """Teleport trace-replay vehicles by lane distance or by coordinates.
+            transform_coords = False,
+            z = None,
+            connector_path_id = None,
+            position_type = None,
+            roadID = None,
+            laneID = None,
+            dist = None,
+            segmentID = None,
+            laneIndex = None,
+            connectorPathID = None):
+        """Implement digital-twin teleport for the current and legacy names.
 
-        ``dist`` is the distance to the downstream junction. Recent METS-R SIM
-        versions also accept ``x``/``y`` coordinates, which are projected onto
-        the target lane by the simulator. Set ``transform_coords=True`` when
-        those coordinates are projected/local SUMO, XODR, or CARLA-meter
-        coordinates; leave it ``False`` for SIM/internal coordinates.
+        Each record uses exactly one position mode. Coordinate mode takes
+        ``x``/``y`` and optional ``z`` and lets METS-R match a native road or
+        connector. Segment mode takes ``segment_id`` plus
+        ``distance_to_segment_end`` and optionally ``lane_index`` for a road or
+        ``connector_path_id`` for a connector. Set ``position_type`` explicitly
+        or let this client infer it from the supplied fields.
+
+        ``roadID``, ``laneID``, and ``dist`` remain Python-call aliases so old
+        code can migrate, but the removed ``roadId`` field is never sent on the
+        wire. The server rejects co-simulation targets, co-simulation-owned
+        vehicles, invalid geometry, and overlapping placements. Record errors
+        make the top-level response ``partial``.
         """
+        if segmentID is not None:
+            if segment_id is not None:
+                raise ValueError("Use either segment_id or segmentID, not both")
+            segment_id = segmentID
+        if roadID is not None:
+            if segment_id is not None:
+                raise ValueError("roadID is a legacy alias for segment_id; use only one")
+            segment_id = roadID
+        if laneIndex is not None:
+            if lane_index is not None:
+                raise ValueError("Use either lane_index or laneIndex, not both")
+            lane_index = laneIndex
+        if laneID is not None:
+            if lane_index is not None:
+                raise ValueError("laneID is a legacy alias for lane_index; use only one")
+            lane_index = laneID
+        if dist is not None:
+            if distance_to_segment_end is not None:
+                raise ValueError(
+                    "dist is a legacy alias for distance_to_segment_end; use only one"
+                )
+            distance_to_segment_end = dist
+        if connectorPathID is not None:
+            if connector_path_id is not None:
+                raise ValueError(
+                    "Use either connector_path_id or connectorPathID, not both"
+                )
+            connector_path_id = connectorPathID
+
         msg = {
-                "TYPE": "CTRL_teleportTraceReplayVeh",
-                "DATA": []
+                "messageType": message_type,
+                "data": []
                 }
         veh_ids = _as_list(vehID)
         count = len(veh_ids)
 
-        def _field_values(value, name):
-            if _is_sequence(value):
-                values = list(value)
-                assert len(values) == count, f"{name} must have the same length as vehID"
-                return values
-            return [value] * count
+        segment_ids = _batch_field_values(segment_id, count, "segment_id")
+        lane_indices = _batch_field_values(lane_index, count, "lane_index")
+        distances = _batch_field_values(
+            distance_to_segment_end, count, "distance_to_segment_end"
+        )
+        private_flags = _batch_field_values(private_veh, count, "private_veh")
+        xs = _batch_field_values(x, count, "x")
+        ys = _batch_field_values(y, count, "y")
+        zs = _batch_field_values(z, count, "z")
+        transform_flags = _batch_field_values(
+            transform_coords, count, "transform_coords"
+        )
+        connector_path_ids = _batch_field_values(
+            connector_path_id, count, "connector_path_id"
+        )
+        position_types = _batch_field_values(
+            position_type, count, "position_type"
+        )
 
-        road_ids = _field_values(roadID, "roadID")
-        lane_ids = _field_values(laneID, "laneID")
-        dists = _field_values(dist, "dist")
-        private_flags = _field_values(private_veh, "private_veh")
-        xs = _field_values(x, "x")
-        ys = _field_values(y, "y")
-        transform_flags = _field_values(transform_coords, "transform_coords")
+        for (veh_id, segment, lane, distance, private_flag, x_value, y_value,
+             z_value, transform_flag, connector_path, requested_mode) in zip(
+                veh_ids, segment_ids, lane_indices, distances, private_flags,
+                xs, ys, zs, transform_flags, connector_path_ids,
+                position_types):
+            if lane == -1:
+                lane = None
 
-        for veh_id, road_id, lane_id, dist_value, private_flag, x_value, y_value, transform_flag in zip(
-                veh_ids, road_ids, lane_ids, dists, private_flags, xs, ys, transform_flags):
+            has_coordinates = any(
+                value is not None for value in (x_value, y_value, z_value)
+            )
+            has_segment_position = any(
+                value is not None
+                for value in (segment, lane, connector_path, distance)
+            )
+            if requested_mode is None:
+                if has_coordinates and has_segment_position:
+                    raise ValueError(
+                        "digital-twin teleport cannot mix coordinate and segment fields"
+                    )
+                if has_coordinates:
+                    mode = "coordinate"
+                elif has_segment_position:
+                    mode = "segment"
+                else:
+                    raise ValueError(
+                        "digital-twin teleport requires coordinates or a segment position"
+                    )
+            elif isinstance(requested_mode, str):
+                mode = requested_mode.lower()
+            else:
+                raise ValueError("position_type must be 'coordinate' or 'segment'")
+
+            if mode not in {"coordinate", "segment"}:
+                raise ValueError("position_type must be 'coordinate' or 'segment'")
+
             record = {
-                "vehID": veh_id,
-                "roadID": road_id,
-                "laneID": lane_id,
-                "vehType": private_flag,
+                "vehicleId": veh_id,
+                "isPrivate": private_flag,
+                "positionType": mode,
             }
-            if x_value is not None or y_value is not None:
+
+            if mode == "coordinate":
+                if has_segment_position:
+                    raise ValueError(
+                        "coordinate digital-twin teleport cannot include segment, "
+                        "distance, lane, or connector-path fields"
+                    )
                 if x_value is None or y_value is None:
-                    raise ValueError("Both x and y are required for coordinate trace replay teleport")
+                    raise ValueError(
+                        "coordinate digital-twin teleport requires both x and y"
+                    )
                 record["x"] = x_value
                 record["y"] = y_value
-                record["transformCoord"] = transform_flag
-            elif dist_value is not None:
-                record["dist"] = dist_value
+                if z_value is not None:
+                    record["z"] = z_value
+                record["transformCoordinates"] = transform_flag
             else:
-                raise ValueError("teleport_trace_replay_vehicle requires dist or x/y")
-            msg["DATA"].append(record)
-        res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_teleportTraceReplayVeh", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
-        return res
-    
-    # enter the next road
-    def enter_next_road(self, vehID, roadID="", private_veh = False):
-        msg = {
-                "TYPE": "CTRL_enterNextRoad", 
-                "DATA": []
-                }
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-        if not isinstance(private_veh, list):
-            private_veh = [private_veh] * len(vehID)
-        if not isinstance(roadID, list):
-            roadID = [roadID] * len(vehID)
-        
-        for vehID, private_veh, roadID in zip(vehID, private_veh, roadID):
-            msg["DATA"].append({"vehID": vehID, "vehType": private_veh, "roadID": roadID})
+                if has_coordinates:
+                    raise ValueError(
+                        "segment digital-twin teleport cannot include x, y, or z"
+                    )
+                if transform_flag:
+                    raise ValueError(
+                        "transform_coords applies only to coordinate teleport"
+                    )
+                if segment is None or distance is None:
+                    raise ValueError(
+                        "segment digital-twin teleport requires segment_id and "
+                        "distance_to_segment_end"
+                    )
+                if lane is not None and connector_path is not None:
+                    raise ValueError(
+                        "lane_index and connector_path_id are mutually exclusive"
+                    )
+                record["segmentId"] = segment
+                record["distanceToSegmentEnd"] = distance
+                if lane is not None:
+                    record["laneIndex"] = lane
+                if connector_path is not None:
+                    record["connectorPathId"] = connector_path
 
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_enterNextRoad", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == message_type, res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
+
+    def teleport_digital_twin_vehicle(
+            self,
+            vehID,
+            segment_id = None,
+            lane_index = None,
+            distance_to_segment_end = None,
+            private_veh = False,
+            x = None,
+            y = None,
+            transform_coords = False,
+            z = None,
+            connector_path_id = None,
+            position_type = None,
+            roadID = None,
+            laneID = None,
+            dist = None,
+            segmentID = None,
+            laneIndex = None,
+            connectorPathID = None):
+        """Teleport digital-twin vehicles by segment distance or coordinates.
+
+        This is the canonical name in the latest METS-R SIM protocol. See
+        :meth:`_teleport_digital_twin_vehicle` for placement semantics.
+        """
+        return self._teleport_digital_twin_vehicle(
+            "teleportDigitalTwinVeh",
+            vehID,
+            segment_id=segment_id,
+            lane_index=lane_index,
+            distance_to_segment_end=distance_to_segment_end,
+            private_veh=private_veh,
+            x=x,
+            y=y,
+            transform_coords=transform_coords,
+            z=z,
+            connector_path_id=connector_path_id,
+            position_type=position_type,
+            roadID=roadID,
+            laneID=laneID,
+            dist=dist,
+            segmentID=segmentID,
+            laneIndex=laneIndex,
+            connectorPathID=connectorPathID,
+        )
+
+    def teleport_trace_replay_vehicle(
+            self,
+            vehID,
+            segment_id = None,
+            lane_index = None,
+            distance_to_segment_end = None,
+            private_veh = False,
+            x = None,
+            y = None,
+            transform_coords = False,
+            z = None,
+            connector_path_id = None,
+            position_type = None,
+            roadID = None,
+            laneID = None,
+            dist = None,
+            segmentID = None,
+            laneIndex = None,
+            connectorPathID = None):
+        """Compatibility alias for the legacy trace-replay command name."""
+        return self._teleport_digital_twin_vehicle(
+            "teleportDigitalTwinVeh",
+            vehID,
+            segment_id=segment_id,
+            lane_index=lane_index,
+            distance_to_segment_end=distance_to_segment_end,
+            private_veh=private_veh,
+            x=x,
+            y=y,
+            transform_coords=transform_coords,
+            z=z,
+            connector_path_id=connector_path_id,
+            position_type=position_type,
+            roadID=roadID,
+            laneID=laneID,
+            dist=dist,
+            segmentID=segmentID,
+            laneIndex=laneIndex,
+            connectorPathID=connectorPathID,
+        )
+
+    # enter the next road
+    def enter_next_road(
+            self,
+            vehID,
+            roadID="",
+            private_veh = False,
+            laneID = None,
+            lane_id = None):
+        """Report removal of the legacy explicit road-transition command.
+
+        METS-R SIM commit ``18aa172`` removed ``enterNextRoad``. Connector
+        entry and completion are now inferred directly from authoritative
+        poses sent through :meth:`teleport_cosim_vehicle`.
+        """
+        del vehID, roadID, private_veh, laneID, lane_id
+        raise NotImplementedError(
+            "enter_next_road is not supported by current METS-R SIM; "
+            "send the authoritative connector/road pose with "
+            "teleport_cosim_vehicle instead"
+        )
 
     # reach destination
     def reach_dest(self, vehID, private_veh = False):
         msg = {
-                "TYPE": "CTRL_reachDest",
-                "DATA": []
+                "messageType": "reachDest",
+                "data": []
                 }
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-        if not isinstance(private_veh, list):
-            private_veh = [private_veh] * len(vehID)
-        
-        for vehID, private_veh in zip(vehID, private_veh):
-            msg["DATA"].append({"vehID": vehID, "vehType": private_veh})
+        vehicle_ids = _as_list(vehID)
+        private_flags = _batch_field_values(
+            private_veh, len(vehicle_ids), "private_veh"
+        )
+
+        for vehicle_id, private_flag in zip(vehicle_ids, private_flags):
+            msg["data"].append({
+                "vehicleId": vehicle_id,
+                "isPrivate": private_flag,
+            })
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_reachDest", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "reachDest", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+        with self.viz_stream_lock:
+            for veh_id, private_flag in zip(vehicle_ids, private_flags):
+                self._attack_vehicle_keys.discard((bool(private_flag), str(veh_id)))
         return res
-    
-    # control vehicle with specified acceleration  
+
+    # control vehicle with specified acceleration
     def control_vehicle(self, vehID, acc, private_veh = False):
         msg = {
-                "TYPE": "CTRL_controlVeh",
-                "DATA": []
+                "messageType": "controlVeh",
+                "data": []
                 }
         if not isinstance(vehID, list):
             vehID = [vehID]
@@ -2665,12 +4716,64 @@ class METSRClient:
         if not isinstance(private_veh, list):
             private_veh = [private_veh] * len(vehID)
         for vehID, acc, private_veh in zip(vehID, acc, private_veh):
-            msg["DATA"].append({"vehID": vehID, "vehType": private_veh, "acc": acc})
+            msg["data"].append({"vehicleId": vehID, "isPrivate": private_veh, "acceleration": acc})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_controlVeh", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "controlVeh", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
+    def set_attack_vehicle(self, vehID, is_attack = True, private_veh = False):
+        """Mark electric taxi trip(s) for attack visualization.
+
+        The simulator accepts public electric taxis only. private_veh=False
+        therefore matches the normal use case; unsupported vehicle types are
+        reported with status='error' in the response data list. A successful
+        designation lasts for the taxi's current trip and is also cleared by
+        passing is_attack=False.
+
+        vehID, is_attack, and private_veh may be scalars or equal-length lists.
+        The request records use ``vehicleId``, ``isPrivate``, and
+        ``attackEnabled``.
+        """
+        veh_ids = _as_list(vehID)
+        count = len(veh_ids)
+
+        def _field_values(value, name):
+            if _is_sequence(value):
+                values = list(value)
+                if len(values) != count:
+                    raise ValueError(f"{name} must have the same length as vehID")
+                return values
+            return [value] * count
+
+        attack_flags = _field_values(is_attack, "is_attack")
+        private_flags = _field_values(private_veh, "private_veh")
+        msg = {"messageType": "setAttackVehicle", "data": []}
+        for veh_id, private_flag, attack_flag in zip(
+                veh_ids, private_flags, attack_flags):
+            msg["data"].append({
+                "vehicleId": veh_id,
+                "isPrivate": bool(private_flag),
+                "attackEnabled": bool(attack_flag),
+            })
+
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "setAttackVehicle", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+
+        with self.viz_stream_lock:
+            for request, status in zip(msg["data"], res.get("data") or []):
+                if not isinstance(status, dict) or status.get("status") != "ok":
+                    continue
+                key = (bool(request["isPrivate"]), str(request["vehicleId"]))
+                if request["attackEnabled"]:
+                    self._attack_vehicle_keys.add(key)
+                else:
+                    self._attack_vehicle_keys.discard(key)
+        return res
+
+    setAttackVehicle = set_attack_vehicle
+
     def update_vehicle_sensor_type(self, vehID, sensorType, private_veh = False):
         """Update vehicle sensor type used by V2X/DSRC data collection.
 
@@ -2681,8 +4784,8 @@ class METSRClient:
         travel-time and energy probe records.
         """
         msg = {
-                "TYPE": "CTRL_updateVehicleSensorType",
-                "DATA": []
+                "messageType": "updateVehicleSensorType",
+                "data": []
                 }
         vehID = _as_list(vehID)
         if not _is_sequence(private_veh):
@@ -2696,62 +4799,409 @@ class METSRClient:
         assert len(vehID) == len(sensorType) == len(private_veh), \
             "vehID, sensorType, and private_veh must have the same length"
         for vehID, sensorType, private_veh in zip(vehID, sensorType, private_veh):
-            msg["DATA"].append({
-                "vehID": vehID,
+            msg["data"].append({
+                "vehicleId": vehID,
                 "sensorType": _normalize_sensor_type(sensorType),
-                "vehType": private_veh,
+                "isPrivate": private_veh,
             })
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateVehicleSensorType", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "updateVehicleSensorType", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     set_vehicle_sensor_type = update_vehicle_sensor_type
     updateVehicleSensorType = update_vehicle_sensor_type
-    
+
+    @staticmethod
+    def _field_mask_set(field_mask, include_details=False):
+        if include_details:
+            return {"*"}
+        if field_mask is None:
+            return set()
+        if isinstance(field_mask, str):
+            return {
+                field.strip()
+                for field in field_mask.split(",")
+                if field.strip()
+            }
+        return {str(field) for field in field_mask}
+
+    @classmethod
+    def _masked_taxi_snapshot_record(cls, source, field_mask, taxi_id=None):
+        if not isinstance(source, dict):
+            return {"taxiId": taxi_id, "status": "error"}
+        fields = cls._field_mask_set(field_mask)
+        include_all = "*" in fields
+        result = {
+            "taxiId": source.get("taxiId", taxi_id),
+            "status": source.get("status", "ok"),
+        }
+
+        def wanted(name):
+            return include_all or name in fields
+
+        if wanted("state") and "state" in source:
+            result["state"] = source["state"]
+        if wanted("coordinates"):
+            for name in ("x", "y", "z"):
+                if name in source:
+                    result[name] = source[name]
+        if wanted("currentZoneId") and source.get("currentZoneId") is not None:
+            result["currentZoneId"] = source["currentZoneId"]
+        if wanted("destinationZoneId") and source.get("destinationZoneId") is not None:
+            result["destinationZoneId"] = source["destinationZoneId"]
+        if wanted("remainingDistance") and "remainingDistance" in source:
+            result["remainingDistance"] = source["remainingDistance"]
+        if wanted("requestIds"):
+            for name in ("toBoardRequestIds", "onBoardRequestIds"):
+                if name in source:
+                    result[name] = source[name]
+        return result
+
+    def query_ride_hailing_snapshot(
+            self,
+            taxi_ids=None,
+            field_mask=None,
+            include_details=False,
+            future_supply_thresholds=None,
+            event_cursor=0):
+        """Return a non-advancing, field-masked ride-hailing snapshot.
+
+        This method uses established query calls on every simulator version.
+        :meth:`advance_and_snapshot` uses the fused optimized endpoint when it
+        is available and delegates here only for its legacy fallback.
+        """
+        fields = self._field_mask_set(field_mask, include_details=include_details)
+        if taxi_ids is None:
+            fleet = self.query_taxi()
+            taxi_ids = fleet.get("taxiIds", []) or []
+        elif not isinstance(taxi_ids, list):
+            taxi_ids = [taxi_ids]
+        else:
+            taxi_ids = list(taxi_ids)
+
+        if taxi_ids:
+            taxi_response = self.query_taxi(taxi_ids)
+            raw_records = taxi_response.get("data", [])
+        else:
+            raw_records = []
+        taxis = [
+            self._masked_taxi_snapshot_record(
+                raw_records[index] if index < len(raw_records) else None,
+                fields,
+                taxi_id=taxi_id,
+            )
+            for index, taxi_id in enumerate(taxi_ids)
+        ]
+
+        partial_warnings = []
+        available_summary = {}
+        try:
+            available = self.query_available_taxis()
+            for record in available.get("data", []):
+                if not isinstance(record, dict):
+                    continue
+                zone_id = record.get("zoneId")
+                if zone_id is not None:
+                    key = str(zone_id)
+                    available_summary[key] = available_summary.get(key, 0) + 1
+        except AssertionError:
+            partial_warnings.append(
+                "availableTaxiSummary is unavailable from this simulator"
+            )
+
+        future_supply = []
+        thresholds = [] if future_supply_thresholds is None else _as_list(
+            future_supply_thresholds
+        )
+        if thresholds:
+            try:
+                zone_index = self.query_zone()
+                zone_ids = zone_index.get("zoneIds", []) or []
+                zone_response = self.query_zone(id=zone_ids) if zone_ids else {"data": []}
+                zone_records = [
+                    record
+                    for record in zone_response.get("data", [])
+                    if isinstance(record, dict)
+                ]
+                for threshold in thresholds:
+                    threshold_value = int(threshold)
+                    selected = [
+                        record.get("zoneId")
+                        for record in zone_records
+                        if record.get("zoneId") is not None
+                        and record.get("futureSupply") is not None
+                        and int(record["futureSupply"]) <= threshold_value
+                    ]
+                    selected.sort()
+                    future_supply.append({
+                        "threshold": threshold_value,
+                        "count": len(selected),
+                        "zoneIdsAtOrBelow": selected,
+                    })
+            except AssertionError:
+                future_supply = []
+                partial_warnings.append(
+                    "futureSupply is unavailable from this simulator"
+                )
+
+        response = {
+            "messageType": "rideHailingSnapshot",
+            "status": "ok",
+            "tick": self.current_tick,
+            "taxis": taxis,
+            "availableTaxiSummary": available_summary,
+            "futureSupply": future_supply,
+            "events": [],
+            "nextEventCursor": max(0, int(event_cursor)),
+            "legacyFallback": True,
+        }
+        if partial_warnings:
+            response["partial"] = True
+            response["warnings"] = partial_warnings
+        return response
+
+    ride_hailing_snapshot = query_ride_hailing_snapshot
+
+    def advance_and_snapshot(
+            self,
+            number_of_ticks=1,
+            taxi_ids=None,
+            field_mask=None,
+            include_details=False,
+            future_supply_thresholds=None,
+            event_cursor=0,
+            command_id=None,
+            starting_tick=None,
+            timeout_ms=None,
+            legacy_fallback=True):
+        """Atomically advance and return a compact ride-hailing snapshot.
+
+        The command ID is stable across retries, making the optimized control
+        idempotent. Older simulators automatically use ``tick`` followed by
+        the established query methods, with a small client-side replay cache.
+        """
+        number_of_ticks = int(number_of_ticks)
+        if number_of_ticks < 1:
+            raise ValueError("number_of_ticks must be a positive integer")
+        if self.current_tick is None:
+            raise RuntimeError("Cannot advance before the simulator reports its tick")
+        if starting_tick is None:
+            starting_tick = int(self.current_tick)
+        else:
+            starting_tick = int(starting_tick)
+        command_id = str(command_id or uuid.uuid4().hex)
+        taxi_ids = [] if taxi_ids is None else _as_list(taxi_ids)
+        fields = self._field_mask_set(field_mask, include_details=include_details)
+        thresholds = (
+            [] if future_supply_thresholds is None
+            else _as_list(future_supply_thresholds)
+        )
+        if timeout_ms is None:
+            timeout_ms = max(120000, number_of_ticks * 10000)
+        timeout_ms = max(1000, int(timeout_ms))
+
+        if self._supports_feature("advanceAndSnapshot"):
+            data = {
+                "commandId": command_id,
+                "startTick": starting_tick,
+                "tickCount": number_of_ticks,
+                "taxiIds": taxi_ids,
+                "eventCursor": max(0, int(event_cursor)),
+                "timeoutMs": timeout_ms,
+            }
+            if fields:
+                data["fieldMask"] = sorted(fields)
+            if include_details:
+                data["includeDetails"] = True
+            if thresholds:
+                data["futureSupplyThresholds"] = thresholds
+            started_at = time.perf_counter()
+
+            def matching_command(response):
+                if (
+                        not isinstance(response, dict)
+                        or response.get("messageType") != "advanceAndSnapshot"):
+                    return True
+                response_id = response.get("commandId")
+                return response_id is None or str(response_id) == command_id
+
+            response = self.send_receive_msg(
+                {"messageType": "advanceAndSnapshot", "data": data},
+                ignore_heartbeats=True,
+                max_attempts=5,
+                timeout=max(float(self.timeout), timeout_ms / 1000.0 + 5.0),
+                return_errors=True,
+                command_id=command_id,
+                response_matcher=matching_command,
+            )
+            if not self._is_unsupported_response(response):
+                if response.get("messageType") != "advanceAndSnapshot":
+                    raise RuntimeError(
+                        "Expected advanceAndSnapshot, received "
+                        f"{response.get('messageType')}"
+                    )
+                response_command_id = response.get("commandId")
+                if response_command_id is None or str(response_command_id) != command_id:
+                    raise RuntimeError(
+                        "METS-R SIM advanceAndSnapshot response commandId "
+                        f"{response_command_id!r} does not match {command_id!r}"
+                    )
+                if str(response.get("status", "ok")).lower() != "ok":
+                    raise RuntimeError(
+                        f"METS-R SIM rejected advanceAndSnapshot: {response}"
+                    )
+                self._update_current_tick_from_message(response)
+                if not self._routing_truthy(response.get("replayed", False)):
+                    self._record_server_tick_time(started_at, starting_tick)
+                return response
+            self._feature_support["advanceAndSnapshot"] = False
+
+        if not legacy_fallback:
+            raise RuntimeError("Connected METS-R SIM does not support advanceAndSnapshot")
+        fingerprint = json.dumps({
+            "startTick": starting_tick,
+            "tickCount": number_of_ticks,
+            "taxiIds": taxi_ids,
+            "fieldMask": sorted(fields),
+            "thresholds": thresholds,
+            "eventCursor": max(0, int(event_cursor)),
+        }, sort_keys=True, separators=(",", ":"))
+        cached = self._legacy_command_results.get(command_id)
+        if cached is not None:
+            if cached["fingerprint"] != fingerprint:
+                raise ValueError("command_id was already used with a different payload")
+            replay = dict(cached["response"])
+            replay["replayed"] = True
+            return replay
+        if int(self.current_tick) != starting_tick:
+            raise RuntimeError(
+                f"starting_tick {starting_tick} does not match current tick "
+                f"{self.current_tick}"
+            )
+
+        self.tick(step_num=number_of_ticks)
+        snapshot = self.query_ride_hailing_snapshot(
+            taxi_ids=taxi_ids,
+            field_mask=fields,
+            include_details=include_details,
+            future_supply_thresholds=thresholds,
+            event_cursor=event_cursor,
+        )
+        response = {
+            "messageType": "advanceAndSnapshot",
+            "status": "ok",
+            "commandId": command_id,
+            "startTick": starting_tick,
+            "finalTick": int(self.current_tick),
+            "advancedTicks": int(self.current_tick) - starting_tick,
+            "replayed": False,
+            "legacyFallback": True,
+            "taxis": snapshot["taxis"],
+            "availableTaxiSummary": snapshot["availableTaxiSummary"],
+            "futureSupply": snapshot["futureSupply"],
+            "events": snapshot["events"],
+            "nextEventCursor": snapshot["nextEventCursor"],
+        }
+        self._legacy_command_results[command_id] = {
+            "fingerprint": fingerprint,
+            "response": dict(response),
+        }
+        while len(self._legacy_command_results) > 128:
+            self._legacy_command_results.pop(next(iter(self._legacy_command_results)))
+        return response
+
     # Match available taxi(s) to existing pending request(s).
-    def dispatch_taxi(self, vehID, reqID):
+    def dispatch_taxi(
+            self,
+            vehID,
+            reqID,
+            origin_zone_id=None,
+            include_state=False,
+            command_id=None):
         """Dispatch taxi(s) to serve already-pending request(s).
 
         The METS-R SIM Control API separates request creation from dispatching.
         Use ``add_taxi_requests`` or ``add_taxi_requests_between_roads`` first,
-        read the returned ``reqID``, then pass ``vehID`` and ``reqID`` here.
+        read the returned ``requestId``, then pass it with the taxi ID here.
 
         Recent METS-R SIM versions can release a parked taxi from parking,
         queue the request after an unfinished passenger-free trip, and return
         fields such as ``remainingCapacity``, ``requestPassengers``, and
         ``parkingReservationReleased`` in each response record.
+
+        ``origin_zone_id`` activates the indexed request lookup. ``include_state``
+        requests only the taxi ``state`` field; when it is absent, the client
+        queries the taxi once after dispatch to fill it in. A
+        ``command_id`` is sent as stable retry metadata, but SIM f1818b2 does
+        not deduplicate dispatch commands; exactly-once behavior is guaranteed
+        only by :meth:`advance_and_snapshot`.
         """
-        msg = {
-                "TYPE": "CTRL_dispatchTaxi",
-                "DATA": []
-                }
+        msg = {"messageType": "dispatchTaxi", "data": []}
         if not isinstance(vehID, list):
             vehID = [vehID]
         if not isinstance(reqID, list):
             reqID = [reqID] * len(vehID)
-        assert len(vehID) == len(reqID), "vehID and reqID must have the same length"
+        if origin_zone_id is None:
+            origin_zone_id = [None] * len(vehID)
+        elif not isinstance(origin_zone_id, list):
+            origin_zone_id = [origin_zone_id] * len(vehID)
+        assert len(vehID) == len(reqID) == len(origin_zone_id), \
+            "vehID, reqID, and origin_zone_id must have the same length"
 
-        for vehID, reqID in zip(vehID, reqID):
-            msg["DATA"].append({"vehID": vehID, "reqID": reqID})
-        res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_dispatchTaxi", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        for veh_id, req_id, zone_id in zip(vehID, reqID, origin_zone_id):
+            record = {"vehicleId": veh_id, "requestId": req_id}
+            if zone_id is not None:
+                record["originZoneId"] = zone_id
+            msg["data"].append(record)
+        if include_state:
+            msg["fieldMask"] = ["state"]
+        res = self.send_receive_msg(
+            msg,
+            ignore_heartbeats=True,
+            command_id=command_id,
+        )
+        assert res["messageType"] == "dispatchTaxi", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+
+        if include_state:
+            response_records = [
+                record for record in res.get("data", []) if isinstance(record, dict)
+            ]
+            for index, record in enumerate(response_records):
+                if record.get("vehicleId") is None and index < len(vehID):
+                    record["vehicleId"] = vehID[index]
+            missing_ids = [
+                record.get("vehicleId")
+                for record in response_records
+                if record.get("vehicleId") is not None and "state" not in record
+            ]
+            if missing_ids:
+                taxi_response = self.query_taxi(missing_ids)
+                state_by_id = {
+                    record.get("taxiId"): record.get("state")
+                    for record in taxi_response.get("data", [])
+                    if isinstance(record, dict) and "state" in record
+                }
+                for record in response_records:
+                    taxi_id = record.get("vehicleId")
+                    if "state" not in record and taxi_id in state_by_id:
+                        record["state"] = state_by_id[taxi_id]
+                res["legacyFallback"] = True
         return res
 
     def cancel_requests(self, reqID, zoneID=None):
         """Cancel one or more taxi/bus requests.
 
-        The latest METS-R SIM control API uses ``CTRL_cancelRequests`` and
+        The METS-R SIM control API uses ``cancelRequests`` and
         requires the request's origin zone for each record. ``reqID`` may be a
         scalar request ID, a list of request IDs, a request record, or a list
         of request records containing request ID and origin-zone fields. When
         ``zoneID`` is omitted, the client attempts to infer it with
         :meth:`query_request`.
 
-        The returned ``DATA`` list contains per-request ``STATUS``/``WARN``
-        details from the simulator; a top-level ``CODE`` of ``OK`` only means
-        the control message itself was processed.
+        The returned ``data`` list contains per-request ``status`` and
+        ``message`` details; record errors make the top-level status ``partial``.
         """
         if zoneID is None and isinstance(reqID, dict):
             request_records = [reqID]
@@ -2772,11 +5222,11 @@ class METSRClient:
             assert len(request_ids) == len(zone_ids), \
                 "reqID and zoneID must have the same length"
             request_records = [
-                {"reqID": rid, "zoneID": zid}
+                {"requestId": rid, "zoneId": zid}
                 for rid, zid in zip(request_ids, zone_ids)
             ]
 
-        msg = {"TYPE": "CTRL_cancelRequests", "DATA": []}
+        msg = {"messageType": "cancelRequests", "data": []}
         missing_zone_ids = []
         for record in request_records:
             rid = _request_id_from_record(record)
@@ -2788,7 +5238,7 @@ class METSRClient:
             if zid is None:
                 missing_zone_ids.append(rid)
                 continue
-            msg["DATA"].append({"reqID": rid, "zoneID": zid})
+            msg["data"].append({"requestId": rid, "zoneId": zid})
 
         if missing_zone_ids:
             raise ValueError(
@@ -2797,8 +5247,8 @@ class METSRClient:
             )
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_cancelRequests", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "cancelRequests", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     cancel_request = cancel_requests
@@ -2811,7 +5261,7 @@ class METSRClient:
         release that reservation and report ``parkingReservationReleased`` in
         the response record.
         """
-        msg = {"TYPE": "CTRL_repositionTaxi", "DATA": []}
+        msg = {"messageType": "repositionTaxi", "data": []}
         if not isinstance(vehID, list):
             vehID = [vehID]
         if not isinstance(zoneID, list):
@@ -2819,10 +5269,10 @@ class METSRClient:
         assert len(vehID) == len(zoneID), "vehID and zoneID must have the same length"
 
         for vehID, zoneID in zip(vehID, zoneID):
-            msg["DATA"].append({"vehID": vehID, "zoneID": zoneID})
+            msg["data"].append({"vehicleId": vehID, "zoneId": zoneID})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_repositionTaxi", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "repositionTaxi", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def go_parking(self, vehID, zoneID=None, roadID=None):
@@ -2833,7 +5283,7 @@ class METSRClient:
         supplied, the zone is inferred from the road. When both are supplied,
         the road must belong to the zone and have available parking capacity.
         """
-        msg = {"TYPE": "CTRL_goParking", "DATA": []}
+        msg = {"messageType": "goParking", "data": []}
         vehID = _as_list(vehID)
         if zoneID is None:
             zoneID = [None] * len(vehID)
@@ -2853,22 +5303,22 @@ class METSRClient:
         for vid, zid, rid in zip(vehID, zoneID, roadID):
             if zid is None and rid is None:
                 raise ValueError("zoneID or roadID is required for go_parking")
-            record = {"vehID": vid}
+            record = {"vehicleId": vid}
             if zid is not None:
-                record["zoneID"] = zid
+                record["zoneId"] = zid
             if rid is not None:
-                record["roadID"] = rid
-            msg["DATA"].append(record)
+                record["roadId"] = rid
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_goParking", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "goParking", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     def add_taxi_requests(self, zoneID, dest, num, max_waiting_time = None, maxWaitingTime = None):
         """Add one or more pending taxi requests.
 
         ``max_waiting_time`` is optional and uses simulation ticks. It maps to
-        the API field ``maxWaitingTime``. When it is positive, the simulator
+        the API field ``maxWaitTicks``. When it is positive, the simulator
         overrides the request's default waiting tolerance; omitted, ``None``,
         or non-positive values keep the simulator default.
         """
@@ -2876,8 +5326,8 @@ class METSRClient:
             max_waiting_time = maxWaitingTime
 
         msg = {
-                "TYPE": "CTRL_addTaxiRequests",
-                "DATA": []
+                "messageType": "addTaxiRequests",
+                "data": []
                 }
         if not isinstance(zoneID, list):
             zoneID = [zoneID]
@@ -2893,19 +5343,19 @@ class METSRClient:
             "zoneID, dest, num, and max_waiting_time must have the same length"
 
         for zoneID, dest, num, max_wait in zip(zoneID, dest, num, max_waiting_time):
-            record = {"zoneID": zoneID, "dest": dest, "num": num}
+            record = {"originZoneId": zoneID, "destinationZoneId": dest, "passengerCount": num}
             if max_wait is not None:
-                record["maxWaitingTime"] = max_wait
-            msg["DATA"].append(record)
+                record["maxWaitTicks"] = max_wait
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addTaxiRequests", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addTaxiRequests", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     def add_taxi_requests_between_roads(self, orig, dest, num):
         msg = {
-                "TYPE": "CTRL_addTaxiReqBwRoads",
-                "DATA": []
+                "messageType": "addTaxiReqBwRoads",
+                "data": []
                 }
         if not isinstance(orig, list):
             orig = [orig]
@@ -2915,24 +5365,24 @@ class METSRClient:
             num = [num] * len(orig)
 
         for orig, dest, num in zip(orig, dest, num):
-            msg["DATA"].append({"orig": orig, "dest": dest, "num": num})
+            msg["data"].append({"originRoadId": orig, "destinationRoadId": dest, "passengerCount": num})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addTaxiReqBwRoads", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addTaxiReqBwRoads", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     # assign bus
     def add_bus_route(self, routeName, zone, road, paths = None):
         has_paths = paths is not None
         if not has_paths:
             msg = {
-                    "TYPE": "CTRL_addBusRoute",
-                    "DATA": []
+                    "messageType": "addBusRoute",
+                    "data": []
                     }
         else:
             msg = {
-                    "TYPE": "CTRL_addBusRouteWithPath",
-                    "DATA": []
+                    "messageType": "addBusRouteWithPath",
+                    "data": []
                     }
         if not isinstance(routeName, list):
             routeName = [routeName]
@@ -2945,39 +5395,39 @@ class METSRClient:
 
         if not has_paths:
             for routeName, zone, road in zip(routeName, zone, road):
-                msg["DATA"].append({"routeName": routeName, "zones": zone, "roads": road})
+                msg["data"].append({"routeName": routeName, "stopZoneIds": zone, "stopRoadIds": road})
         else:
             for routeName, zone, road, paths in zip(routeName, zone, road, paths):
-                msg["DATA"].append({"routeName": routeName, "zones": zone, "roads": road, "paths": paths})
+                msg["data"].append({"routeName": routeName, "stopZoneIds": zone, "stopRoadIds": road, "pathRoadIds": paths})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
 
         if not has_paths:
-            assert res["TYPE"] == "CTRL_addBusRoute", res["TYPE"]
+            assert res["messageType"] == "addBusRoute", res["messageType"]
         else:
-            assert res["TYPE"] == "CTRL_addBusRouteWithPath", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+            assert res["messageType"] == "addBusRouteWithPath", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def add_bus_run(self, routeName, departTime):
         msg = {
-                "TYPE": "CTRL_addBusRun",
-                "DATA": []
+                "messageType": "addBusRun",
+                "data": []
                 }
         if not isinstance(routeName, list):
             routeName = [routeName]
             departTime = [departTime]
 
         for routeName, departTime in zip(routeName, departTime):
-            msg["DATA"].append({"routeName": routeName, "departTime": departTime})
+            msg["data"].append({"routeName": routeName, "departureTicks": departTime})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addBusRun", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addBusRun", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     def insert_bus_stop(self, busID, routeName, zoneID, roadName, stopIndex):
         msg = {
-                "TYPE": "CTRL_insertStopToRoute",
-                "DATA": []
+                "messageType": "insertStopToRoute",
+                "data": []
                 }
         if not isinstance(busID, list):
             busID = [busID]
@@ -2987,17 +5437,17 @@ class METSRClient:
             stopIndex = [stopIndex] * len(busID)
 
         for busID, routeName, zoneID, roadName, stopIndex in zip(busID, routeName, zoneID, roadName, stopIndex):
-            msg["DATA"].append({"busID": busID, "routeName": routeName, "zone": zoneID, "road": roadName, "stopIndex": stopIndex})
+            msg["data"].append({"busId": busID, "routeName": routeName, "stopZoneId": zoneID, "stopRoadId": roadName, "stopIndex": stopIndex})
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_insertStopToRoute", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "insertStopToRoute", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     def remove_bus_stop(self, busID, routeName, stopIndex):
         msg = {
-                "TYPE": "CTRL_removeStopFromRoute",
-                "DATA": []
+                "messageType": "removeStopFromRoute",
+                "data": []
                 }
         if not isinstance(busID, list):
             busID = [busID]
@@ -3005,11 +5455,11 @@ class METSRClient:
             stopIndex = [stopIndex] * len(busID)
 
         for busID, routeName, stopIndex in zip(busID, routeName, stopIndex):
-            msg["DATA"].append({"busID": busID, "routeName": routeName, "stopIndex": stopIndex})
+            msg["data"].append({"busId": busID, "routeName": routeName, "stopIndex": stopIndex})
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_removeStopFromRoute", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "removeStopFromRoute", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
 
@@ -3021,8 +5471,8 @@ class METSRClient:
         ``reqID``, then pass ``busID`` and ``reqID`` here.
         """
         msg = {
-                "TYPE": "CTRL_assignRequestToBus",
-                "DATA": []
+                "messageType": "assignRequestToBus",
+                "data": []
                 }
         if not isinstance(busID, list):
             busID = [busID]
@@ -3031,25 +5481,25 @@ class METSRClient:
         assert len(busID) == len(reqID), "busID and reqID must have the same length"
 
         for bus_id, req_id in zip(busID, reqID):
-            msg["DATA"].append({"busID": bus_id, "reqID": req_id})
+            msg["data"].append({"busId": bus_id, "requestId": req_id})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_assignRequestToBus", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "assignRequestToBus", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     def add_bus_requests(self, zoneID, dest, routeName, num, max_waiting_time = None, maxWaitingTime = None):
         """Add one or more pending bus requests.
 
         ``max_waiting_time`` is optional and uses simulation ticks. It maps to
-        the API field ``maxWaitingTime``. When it is positive, the simulator
+        the API field ``maxWaitTicks``. When it is positive, the simulator
         overrides the request's default waiting tolerance.
         """
         if max_waiting_time is None and maxWaitingTime is not None:
             max_waiting_time = maxWaitingTime
 
         msg = {
-                "TYPE": "CTRL_addBusRequests",
-                "DATA": []
+                "messageType": "addBusRequests",
+                "data": []
                 }
         if not isinstance(zoneID, list):
             zoneID = [zoneID]
@@ -3067,20 +5517,20 @@ class METSRClient:
             "zoneID, dest, num, routeName, and max_waiting_time must have the same length"
 
         for zoneID, dest, num, routeName, max_wait in zip(zoneID, dest, num, routeName, max_waiting_time):
-            record = {"zoneID": zoneID, "dest": dest, "num": num, "routeName": routeName}
+            record = {"originZoneId": zoneID, "destinationZoneId": dest, "passengerCount": num}
             if max_wait is not None:
-                record["maxWaitingTime"] = max_wait
-            msg["DATA"].append(record)
+                record["maxWaitTicks"] = max_wait
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addBusRequests", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addBusRequests", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
-    # update vehicle route 
+
+    # update vehicle route
     def update_vehicle_route(self, vehID, route, private_veh = False):
         msg = {
-                "TYPE": "CTRL_updateVehicleRoute",
-                "DATA": []
+                "messageType": "updateVehicleRoute",
+                "data": []
                 }
         if not isinstance(vehID, list):
             vehID = [vehID]
@@ -3089,25 +5539,87 @@ class METSRClient:
             private_veh = [private_veh] * len(vehID)
 
         for vehID, route, private_veh in zip(vehID, route, private_veh):
-            msg["DATA"].append({"vehID": vehID, "route": route, "vehType": private_veh})
+            msg["data"].append({"vehicleId": vehID, "routeRoadIds": route, "isPrivate": private_veh})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateVehicleRoute", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "updateVehicleRoute", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     # update road weights in the routing map
     def update_road_weights(self, roadID, weight):
-        msg = {"TYPE": "CTRL_updateEdgeWeight", "DATA": []}
-        if not isinstance(roadID, list):
-            roadID = [roadID]
-            weight = [weight]
-        if not isinstance(weight, list):
-            weight = [weight] * len(roadID)
-        for roadID, weight in zip(roadID, weight):
-            msg["DATA"].append({"roadID": roadID, "weight": weight})
+        """Override routing-only costs for one or more roads.
+
+        This control does not change physical lane speeds, road speed limits,
+        or measured travel times. Use :meth:`update_target_speed` when vehicle
+        behavior and the corresponding free-flow routing cost should both
+        change. The latest server accepts original or internal road IDs,
+        rejects non-finite weights, clamps finite values below ``1e-3``, and
+        reports the applied ``weight`` or a per-record ``WARN``.
+        """
+        msg = {"messageType": "updateEdgeWeight", "data": []}
+        road_ids = _as_list(roadID)
+        weights = _batch_field_values(
+            weight, len(road_ids), "weight", batch_name="roadID"
+        )
+        for road_id, weight_value in zip(road_ids, weights):
+            msg["data"].append({"roadId": road_id, "routingWeight": weight_value})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateEdgeWeight", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "updateEdgeWeight", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+        return res
+
+    def update_target_speed(
+            self,
+            roadID,
+            target_speed = None,
+            targetSpeed = None,
+            speed = None):
+        """Set physical target speeds for one or more roads, in m/s.
+
+        Unlike :meth:`update_road_weights`, this updates lane/vehicle behavior,
+        the reported road speed limit, and the road's free-flow routing cost.
+        ``target_speed`` is the preferred Python argument; ``targetSpeed`` and
+        ``speed`` mirror aliases accepted by METS-R SIM. Scalars are broadcast
+        across a batched ``roadID`` argument.
+
+        The simulator requires each speed to be finite and positive. It returns
+        one result per road with ``status`` and, on success, ``targetSpeed``,
+        ``speedUnit``, ``speedLimit``, ``travelTime``, and ``routingWeight``.
+        Record errors make the top-level status ``partial``.
+        """
+        supplied_speeds = [
+            (name, value)
+            for name, value in (
+                ("target_speed", target_speed),
+                ("targetSpeed", targetSpeed),
+                ("speed", speed),
+            )
+            if value is not None
+        ]
+        if not supplied_speeds:
+            raise ValueError("target_speed is required")
+        if len(supplied_speeds) > 1:
+            names = ", ".join(name for name, _ in supplied_speeds)
+            raise ValueError(f"Use only one target-speed argument, received: {names}")
+        target_speed = supplied_speeds[0][1]
+
+        road_ids = _as_list(roadID)
+        target_speeds = _batch_field_values(
+            target_speed,
+            len(road_ids),
+            "target_speed",
+            batch_name="roadID",
+        )
+        msg = {"messageType": "updateTargetSpeed", "data": []}
+        for road_id, speed_value in zip(road_ids, target_speeds):
+            msg["data"].append({
+                "roadId": road_id,
+                "targetSpeed": speed_value,
+            })
+
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
+        assert res["messageType"] == "updateTargetSpeed", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def update_road_parking_capacity(
@@ -3125,7 +5637,7 @@ class METSRClient:
         if parking_capacity is None:
             raise ValueError("parking_capacity is required")
 
-        msg = {"TYPE": "CTRL_updateRoadParkingCapacity", "DATA": []}
+        msg = {"messageType": "updateRoadParkingCapacity", "data": []}
         roadID = _as_list(roadID)
         if not _is_sequence(parking_capacity):
             parking_capacity = [parking_capacity] * len(roadID)
@@ -3135,15 +5647,15 @@ class METSRClient:
             "roadID and parking_capacity must have the same length"
 
         for rid, cap in zip(roadID, parking_capacity):
-            msg["DATA"].append({"roadID": rid, "parkingCapacity": cap})
+            msg["data"].append({"roadId": rid, "parkingCapacity": cap})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateRoadParkingCapacity", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "updateRoadParkingCapacity", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     # update charging station prices
     def update_charging_prices(self, stationID, stationType, price):
-        msg = {"TYPE": "CTRL_updateChargingPrice", "DATA": []}
+        msg = {"messageType": "updateChargingPrice", "data": []}
         if not isinstance(stationID, list):
             stationID = [stationID]
             stationType = [stationType]
@@ -3153,17 +5665,17 @@ class METSRClient:
         if not isinstance(price, list):
             price = [price] * len(stationID)
         for stationID, stationType, price in zip(stationID, stationType, price):
-            msg["DATA"].append({"chargerID": stationID, "chargerType": stationType, "weight": price})
+            msg["data"].append({"chargingStationId": stationID, "chargerLevel": stationType, "price": price})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateChargingPrice", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "updateChargingPrice", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-    
+
     # Traffic signal phase control
     # Update the signal phase given signal ID and target phase (optionally with phase time offset)
     # If only phase is provided, starts from the beginning of that phase (phaseTime = 0)
     def update_signal(self, signalID, targetPhase, phaseTime = None):
-        msg = {"TYPE": "CTRL_updateSignal", "DATA": []}
+        msg = {"messageType": "updateSignal", "data": []}
         if not isinstance(signalID, list):
             signalID = [signalID]
             targetPhase = [targetPhase]
@@ -3178,22 +5690,22 @@ class METSRClient:
             if len(phaseTime) != len(signalID):
                 phaseTime = phaseTime * (len(signalID) // len(phaseTime) + 1)
                 phaseTime = phaseTime[:len(signalID)]
-        
+
         assert len(signalID) == len(targetPhase) == len(phaseTime), "Length of signalID, targetPhase, and phaseTime must be the same"
-        
+
         for sig_id, tgt_phase, ph_time in zip(signalID, targetPhase, phaseTime):
-            signal_data = {"signalID": sig_id, "targetPhase": tgt_phase}
+            signal_data = {"signalId": sig_id, "phase": tgt_phase}
             if ph_time is not None:
-                signal_data["phaseTime"] = ph_time
-            msg["DATA"].append(signal_data)
-        
+                signal_data["phaseOffsetSeconds"] = ph_time
+            msg["data"].append(signal_data)
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateSignal", res["TYPE"]
+        assert res["messageType"] == "updateSignal", res["messageType"]
         return res
-    
+
     # Update signal phase timing (green, yellow, red durations)
     def update_signal_timing(self, signalID, greenTime, yellowTime, redTime):
-        msg = {"TYPE": "CTRL_updateSignalTiming", "DATA": []}
+        msg = {"messageType": "updateSignalTiming", "data": []}
         if not isinstance(signalID, list):
             signalID = [signalID]
             greenTime = [greenTime]
@@ -3205,20 +5717,20 @@ class METSRClient:
             yellowTime = [yellowTime] * len(signalID)
         if not isinstance(redTime, list):
             redTime = [redTime] * len(signalID)
-        
+
         assert len(signalID) == len(greenTime) == len(yellowTime) == len(redTime), "Length of signalID, greenTime, yellowTime, and redTime must be the same"
-        
+
         for sig_id, green, yellow, red in zip(signalID, greenTime, yellowTime, redTime):
-            msg["DATA"].append({"signalID": sig_id, "greenTime": green, "yellowTime": yellow, "redTime": red})
-        
+            msg["data"].append({"signalId": sig_id, "greenSeconds": green, "yellowSeconds": yellow, "redSeconds": red})
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_updateSignalTiming", res["TYPE"]
+        assert res["messageType"] == "updateSignalTiming", res["messageType"]
         return res
-    
+
     # Set a complete new phase plan for a signal (phase timing + starting state + offset)
     # Time values are in seconds
     def set_signal_phase_plan(self, signalID, greenTime, yellowTime, redTime, startPhase, phaseOffset = None):
-        msg = {"TYPE": "CTRL_setSignalPhasePlan", "DATA": []}
+        msg = {"messageType": "setSignalPhasePlan", "data": []}
         if not isinstance(signalID, list):
             signalID = [signalID]
             greenTime = [greenTime]
@@ -3242,23 +5754,23 @@ class METSRClient:
             if len(phaseOffset) != len(signalID):
                 phaseOffset = phaseOffset * (len(signalID) // len(phaseOffset) + 1)
                 phaseOffset = phaseOffset[:len(signalID)]
-        
+
         assert len(signalID) == len(greenTime) == len(yellowTime) == len(redTime) == len(startPhase) == len(phaseOffset), "Length of all parameters must match"
-        
+
         for sig_id, green, yellow, red, start_phase, ph_offset in zip(signalID, greenTime, yellowTime, redTime, startPhase, phaseOffset):
-            signal_data = {"signalID": sig_id, "greenTime": green, "yellowTime": yellow, "redTime": red, "startPhase": start_phase}
+            signal_data = {"signalId": sig_id, "greenSeconds": green, "yellowSeconds": yellow, "redSeconds": red, "startPhase": start_phase}
             if ph_offset is not None:
-                signal_data["phaseOffset"] = ph_offset
-            msg["DATA"].append(signal_data)
-        
+                signal_data["phaseOffsetSeconds"] = ph_offset
+            msg["data"].append(signal_data)
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_setSignalPhasePlan", res["TYPE"]
+        assert res["messageType"] == "setSignalPhasePlan", res["messageType"]
         return res
-    
+
     # Set a complete new phase plan with tick-level precision
     # Time values are in simulation ticks for more precise control
     def set_signal_phase_plan_ticks(self, signalID, greenTicks, yellowTicks, redTicks, startPhase, tickOffset = None):
-        msg = {"TYPE": "CTRL_setSignalPhasePlanTicks", "DATA": []}
+        msg = {"messageType": "setSignalPhasePlanTicks", "data": []}
         if not isinstance(signalID, list):
             signalID = [signalID]
             greenTicks = [greenTicks]
@@ -3282,17 +5794,17 @@ class METSRClient:
             if len(tickOffset) != len(signalID):
                 tickOffset = tickOffset * (len(signalID) // len(tickOffset) + 1)
                 tickOffset = tickOffset[:len(signalID)]
-        
+
         assert len(signalID) == len(greenTicks) == len(yellowTicks) == len(redTicks) == len(startPhase) == len(tickOffset), "Length of all parameters must match"
-        
+
         for sig_id, green, yellow, red, start_phase, tck_offset in zip(signalID, greenTicks, yellowTicks, redTicks, startPhase, tickOffset):
-            signal_data = {"signalID": sig_id, "greenTicks": green, "yellowTicks": yellow, "redTicks": red, "startPhase": start_phase}
+            signal_data = {"signalId": sig_id, "greenTicks": green, "yellowTicks": yellow, "redTicks": red, "startPhase": start_phase}
             if tck_offset is not None:
-                signal_data["tickOffset"] = tck_offset
-            msg["DATA"].append(signal_data)
-        
+                signal_data["phaseOffsetTicks"] = tck_offset
+            msg["data"].append(signal_data)
+
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_setSignalPhasePlanTicks", res["TYPE"]
+        assert res["messageType"] == "setSignalPhasePlanTicks", res["messageType"]
         return res
 
 
@@ -3302,7 +5814,7 @@ class METSRClient:
     # transform_coord: set True for projected/local SUMO coordinates.
     # Returns assigned zone IDs.
     def add_zone(self, x, y, capacity, zone_type, z=0.0, transform_coord=False):
-        msg = {"TYPE": "CTRL_addZone", "DATA": []}
+        msg = {"messageType": "addZone", "data": []}
         if not isinstance(x, list):
             x = [x]
             y = [y]
@@ -3316,10 +5828,10 @@ class METSRClient:
         assert len(x) == len(y) == len(z) == len(capacity) == len(zone_type), \
             "x, y, z, capacity, and zone_type must have the same length"
         for xi, yi, zi, cap, ztype, tc in zip(x, y, z, capacity, zone_type, transform_coord):
-            msg["DATA"].append({"x": xi, "y": yi, "z": zi, "transformCoord": tc, "capacity": cap, "type": ztype})
+            msg["data"].append({"x": xi, "y": yi, "z": zi, "transformCoordinates": tc, "capacity": cap, "zoneType": ztype})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addZone", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addZone", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     # Dynamically add one or more roads and generated lanes.
@@ -3332,10 +5844,10 @@ class METSRClient:
                   upstream_control_type=None, downstream_control_type=None,
                   num_lanes=1, lane_width=None, transform_coord=False, roads=None,
                   parking_capacity=None):
-        msg = {"TYPE": "CTRL_addRoads", "DATA": []}
+        msg = {"messageType": "addRoads", "data": []}
 
         if roads is not None:
-            msg["DATA"] = _as_list(roads)
+            msg["data"] = _as_list(roads)
         else:
             if centerline is None:
                 raise ValueError("centerline is required when roads is not provided")
@@ -3365,46 +5877,55 @@ class METSRClient:
                     lane_counts, lane_widths, transform_coords, parking_capacities):
                 record = {
                     "centerline": cl,
-                    "numLanes": lane_count,
-                    "transformCoord": tc,
+                    "laneCount": lane_count,
+                    "transformCoordinates": tc,
+                    "upstreamRoadIds": _as_list(up),
+                    "downstreamRoadIds": _as_list(down),
                 }
                 if oid is not None:
-                    record["origID"] = oid
-                _set_road_reference(record, "upStream", up)
-                _set_road_reference(record, "downStream", down)
+                    record["roadId"] = oid
                 if r_type is not None:
                     record["roadType"] = r_type
                 if c_type is not None:
-                    record["controlType"] = c_type
+                    record["controlMode"] = (
+                        "cosim" if c_type == 1 else "native" if c_type == 0
+                        else str(c_type)
+                    )
                 if up_control is not None:
-                    record["upStreamControlType"] = up_control
+                    record["upstreamControlMode"] = (
+                        "cosim" if up_control == 1 else "native" if up_control == 0
+                        else str(up_control)
+                    )
                 if down_control is not None:
-                    record["downStreamControlType"] = down_control
+                    record["downstreamControlMode"] = (
+                        "cosim" if down_control == 1 else "native" if down_control == 0
+                        else str(down_control)
+                    )
                 if width is not None:
                     record["laneWidth"] = width
                 if pcap is not None:
                     record["parkingCapacity"] = pcap
-                msg["DATA"].append(record)
+                msg["data"].append(record)
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addRoads", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addRoads", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def remove_zone(self, zoneID):
         """Dynamically remove one or more zones by internal zone ID."""
-        msg = {"TYPE": "CTRL_removeZone", "DATA": _as_list(zoneID)}
+        msg = {"messageType": "removeZone", "data": _as_list(zoneID)}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_removeZone", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "removeZone", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def remove_road(self, roadID):
         """Dynamically remove one or more roads by SUMO/original road ID."""
-        msg = {"TYPE": "CTRL_removeRoad", "DATA": _as_list(roadID)}
+        msg = {"messageType": "removeRoad", "data": _as_list(roadID)}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_removeRoad", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "removeRoad", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     # Dynamically add one or more charging stations at given coordinates.
@@ -3413,7 +5934,7 @@ class METSRClient:
     # transform_coord: set True for projected/local SUMO coordinates.
     # Returns assigned (negative) station IDs.
     def add_charging_station(self, x, y, num_l2, num_l3, num_bus, price_l2, price_l3, z=0.0, transform_coord=False):
-        msg = {"TYPE": "CTRL_addChargingStation", "DATA": []}
+        msg = {"messageType": "addChargingStation", "data": []}
         if not isinstance(x, list):
             x = [x]
             y = [y]
@@ -3430,20 +5951,21 @@ class METSRClient:
         assert len(x) == len(y) == len(z) == len(num_l2) == len(num_l3) == len(num_bus) == len(price_l2) == len(price_l3), \
             "All positional arguments must have the same length"
         for xi, yi, zi, nl2, nl3, nbus, pl2, pl3, tc in zip(x, y, z, num_l2, num_l3, num_bus, price_l2, price_l3, transform_coord):
-            msg["DATA"].append({"x": xi, "y": yi, "z": zi, "transformCoord": tc,
-                                "numL2": nl2, "numL3": nl3, "numBus": nbus,
-                                "priceL2": pl2, "priceL3": pl3})
+            msg["data"].append({"x": xi, "y": yi, "z": zi, "transformCoordinates": tc,
+                                "level2ChargerCount": nl2, "level3ChargerCount": nl3,
+                                "busChargerCount": nbus, "level2Price": pl2,
+                                "level3Price": pl3})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addChargingStation", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addChargingStation", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def remove_charging_station(self, stationID):
         """Dynamically remove one or more charging stations by station ID."""
-        msg = {"TYPE": "CTRL_removeChargingStation", "DATA": _as_list(stationID)}
+        msg = {"messageType": "removeChargingStation", "data": _as_list(stationID)}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_removeChargingStation", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "removeChargingStation", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     remove_chargingStation = remove_charging_station
@@ -3451,35 +5973,52 @@ class METSRClient:
     # Spawn e-taxis parked at given zone(s).
     # zoneID: zone ID or list of zone IDs; num: number of taxis to spawn per zone.
     # Returns spawned vehicle IDs grouped by zone.
-    def add_taxi(self, zoneID, num):
-        msg = {"TYPE": "CTRL_addTaxi", "DATA": []}
-        if not isinstance(zoneID, list):
-            zoneID = [zoneID]
-        if not isinstance(num, list):
-            num = [num] * len(zoneID)
-        assert len(zoneID) == len(num), "zoneID and num must have the same length"
-        for zid, n in zip(zoneID, num):
-            msg["DATA"].append({"zoneID": zid, "num": n})
+    def add_taxi(self, zoneID, num, length = None):
+        """Spawn parked e-taxis, optionally with a custom length in meters.
+
+        ``length`` may be a scalar or one value per zone. When omitted, the
+        simulator uses ``DEFAULT_VEHICLE_LENGTH``. Each successful record
+        returns the applied ``length`` together with the spawned ``IDs``.
+        """
+        msg = {"messageType": "addTaxi", "data": []}
+        zone_ids = _as_list(zoneID)
+        counts = _batch_field_values(num, len(zone_ids), "num", batch_name="zoneId")
+        lengths = _optional_vehicle_lengths(length, len(zone_ids), "zoneId")
+        for zone_id, count, vehicle_length in zip(zone_ids, counts, lengths):
+            record = {"zoneId": zone_id, "vehicleCount": count}
+            if vehicle_length is not None:
+                record["vehicleLength"] = vehicle_length
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addTaxi", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addTaxi", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     # Spawn e-buses on existing named route(s).
     # routeName: route name or list of route names; num: buses to spawn per route.
     # Returns spawned vehicle IDs grouped by route.
-    def add_bus(self, routeName, num):
-        msg = {"TYPE": "CTRL_addBus", "DATA": []}
-        if not isinstance(routeName, list):
-            routeName = [routeName]
-        if not isinstance(num, list):
-            num = [num] * len(routeName)
-        assert len(routeName) == len(num), "routeName and num must have the same length"
-        for rname, n in zip(routeName, num):
-            msg["DATA"].append({"routeName": rname, "num": n})
+    def add_bus(self, routeName, num, length = None):
+        """Spawn e-buses, optionally with a custom length in meters.
+
+        ``length`` may be a scalar or one value per route. When omitted, the
+        simulator uses ``DEFAULT_VEHICLE_LENGTH``. Each successful record
+        returns the applied ``length`` together with the spawned ``IDs``.
+        """
+        msg = {"messageType": "addBus", "data": []}
+        route_names = _as_list(routeName)
+        counts = _batch_field_values(
+            num, len(route_names), "num", batch_name="routeName"
+        )
+        lengths = _optional_vehicle_lengths(length, len(route_names), "routeName")
+        for route_name, count, vehicle_length in zip(
+                route_names, counts, lengths):
+            record = {"routeName": route_name, "vehicleCount": count}
+            if vehicle_length is not None:
+                record["vehicleLength"] = vehicle_length
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_addBus", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "addBus", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     # Command vehicle(s) to interrupt current activity and go charge.
@@ -3489,7 +6028,7 @@ class METSRClient:
     # station for private EVs); nonzero int = specific station ID.
     # After charging the vehicle returns to its pre-charging destination.
     def go_charging(self, vehID, veh_type, charger_type, cs_id=0):
-        msg = {"TYPE": "CTRL_goCharging", "DATA": []}
+        msg = {"messageType": "goCharging", "data": []}
         if not isinstance(vehID, list):
             vehID = [vehID]
         if not isinstance(veh_type, list):
@@ -3501,13 +6040,13 @@ class METSRClient:
         assert len(vehID) == len(veh_type) == len(charger_type) == len(cs_id), \
             "vehID, veh_type, charger_type, and cs_id must have the same length"
         for vid, vtype, ctype, csid in zip(vehID, veh_type, charger_type, cs_id):
-            msg["DATA"].append({"vehID": vid, "vehType": vtype, "chargerType": ctype, "csID": csid})
+            msg["data"].append({"vehicleId": vid, "isPrivate": vtype, "chargerLevel": ctype, "chargingStationId": csid})
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_goCharging", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "goCharging", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
-     
-    
+
+
     def _remember_config(self, config_json=None, config_signature=None, config=None):
         if config_json is not None:
             self.config_json = _normalize_config_json_path(config_json)
@@ -3519,6 +6058,15 @@ class METSRClient:
             )
         if config is not None:
             self.config = config
+            try:
+                self._client_config_values = dict(vars(config))
+            except TypeError:
+                self._client_config_values = {}
+        elif self.config_signature:
+            try:
+                self._client_config_values = json.loads(self.config_signature)
+            except (TypeError, ValueError):
+                self._client_config_values = {}
 
     def _read_reset_config(self, config_json):
         config_json_path = _normalize_config_json_path(config_json)
@@ -3539,14 +6087,19 @@ class METSRClient:
         return target_port is not None and int(target_port) != int(self.port)
 
     def _reset_current_simulation(self):
-        msg = {"TYPE": "CTRL_reset"}
+        msg = {"messageType": "reset"}
         res = self.send_receive_msg(msg, ignore_heartbeats=True, max_attempts=-1)
 
-        assert res["TYPE"] == "CTRL_reset", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "reset", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+        self._legacy_command_results.clear()
+        self._capabilities_cache = None
 
-        if "TICK" in res or "tick" in res:
-            self.current_tick = int(res.get("TICK", res.get("tick")))
+        with self.viz_stream_lock:
+            self._attack_vehicle_keys.clear()
+
+        if "tick" in res:
+            self.current_tick = int(res["tick"])
         else:
             self.current_tick = -1
             self.tick()
@@ -3590,11 +6143,11 @@ class METSRClient:
         if self.ws is None:
             return None
         try:
-            msg = {"TYPE": "CTRL_end"}
+            msg = {"messageType": "end"}
             res = self.send_receive_msg(msg, ignore_heartbeats=True)
             if res is not None:
-                assert res["TYPE"] == "CTRL_end", res["TYPE"]
-                assert res["CODE"] == "OK", res["CODE"]
+                assert res["messageType"] == "end", res["messageType"]
+                assert res["status"] in {"ok", "partial"}, res["status"]
             return res
         finally:
             if self.ws is not None:
@@ -3631,6 +6184,7 @@ class METSRClient:
         self._terminate_simulation_only()
         self._wait_for_sim_port_release(old_host, old_port)
         run_simulation_in_docker(config)
+        self._legacy_command_results.clear()
 
         self.host = target_host
         self.port = int(target_port)
@@ -3644,6 +6198,8 @@ class METSRClient:
         self.current_tick = None
         self._remember_config(config_json_path, config_signature, config)
         self._connect(**self._connection_settings)
+        with self.viz_stream_lock:
+            self._attack_vehicle_keys.clear()
         self._restore_viz_state(live_kwargs, offline_kwargs)
 
     # reset the current simulation; restart the simulator if a different config json is supplied
@@ -3662,11 +6218,11 @@ class METSRClient:
 
     # save the simulation instance to zip
     def save(self, filename):
-        msg = {"TYPE": "CTRL_save", "DATA": {"path": filename}}
+        msg = {"messageType": "save", "data": {"path": filename}}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        
-        assert res["TYPE"] == "CTRL_save", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+
+        assert res["messageType"] == "save", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         return res
 
     def load(self, filename, reload_network=True):
@@ -3685,12 +6241,14 @@ class METSRClient:
             an experiment from a preheated checkpoint).  The response includes
             a ``fastLoad`` field confirming whether fast restoration was used.
         """
-        msg = {"TYPE": "CTRL_load", "DATA": {"path": filename, "reloadNetwork": bool(reload_network)}}
+        msg = {"messageType": "load", "data": {"path": filename, "reloadNetwork": bool(reload_network)}}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_load", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
-        if "TICK" in res or "tick" in res:
-            self.current_tick = int(res.get("TICK", res.get("tick")))
+        assert res["messageType"] == "load", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
+        self._legacy_command_results.clear()
+        self._capabilities_cache = None
+        if "tick" in res:
+            self.current_tick = int(res["tick"])
         else:
             synced_tick = self.query_tick()
             self.current_tick = int(synced_tick)
@@ -3698,12 +6256,12 @@ class METSRClient:
 
     # terminate the simulation
     def terminate(self):
-        msg = {"TYPE": "CTRL_end"}
+        msg = {"messageType": "end"}
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
-        assert res["TYPE"] == "CTRL_end", res["TYPE"]
-        assert res["CODE"] == "OK", res["CODE"]
+        assert res["messageType"] == "end", res["messageType"]
+        assert res["status"] in {"ok", "partial"}, res["status"]
         self.close()
-    
+
     # close the client but keep the simulator running
     def close(self):
         if self.ws is not None:
@@ -3724,7 +6282,7 @@ class METSRClient:
             response = self.query_road()
         except Exception:
             return []
-        ids = response.get("orig_id") or response.get("id_list") or []
+        ids = response.get("roadIds") or []
         return sorted(str(road_id) for road_id in ids if road_id is not None)
 
     def _query_viz_zone_dictionary(self):
@@ -3732,14 +6290,14 @@ class METSRClient:
             response = self.query_zone()
         except Exception:
             return []
-        return [zone_id for zone_id in (response.get("id_list") or []) if zone_id is not None]
+        return [zone_id for zone_id in (response.get("zoneIds") or []) if zone_id is not None]
 
     def _query_viz_charging_station_dictionary(self):
         try:
             response = self.query_chargingStation()
         except Exception:
             return []
-        return [station_id for station_id in (response.get("id_list") or []) if station_id is not None]
+        return [station_id for station_id in (response.get("chargingStationIds") or []) if station_id is not None]
 
     def _query_viz_records_by_ids(self, query_func, ids, batch_size=1000):
         ids = [item for item in (ids or []) if item is not None]
@@ -3754,9 +6312,9 @@ class METSRClient:
                 response = query_func(id=batch_ids)
             except Exception:
                 continue
-            if response.get("CODE") == "KO":
+            if response.get("status") == "error":
                 continue
-            for record in response.get("DATA", []):
+            for record in response.get("data", []):
                 if isinstance(record, dict):
                     records.append(record)
         return records
@@ -3766,32 +6324,27 @@ class METSRClient:
             response = self.query_active_roads()
         except Exception:
             return []
-        if response.get("CODE") == "KO":
+        if response.get("status") == "error":
             return []
 
-        ids = response.get("orig_id") or response.get("id_list") or []
+        ids = (response.get("roadIds") or []) + (response.get("connectorIds") or [])
         if not ids:
             ids = [
-                _viz_first(record, "ID", "originID", "roadID", "origID", default=None)
-                for record in response.get("DATA", [])
+                _viz_first(record, "segmentId", default=None)
+                for record in response.get("data", [])
                 if isinstance(record, dict)
             ]
         return [str(road_id) for road_id in ids if road_id is not None]
 
     def _viz_clear_link_record(self, road_id):
         return {
-            "ID": road_id,
-            "originID": road_id,
-            "num_veh": 0,
-            "nVehicles": 0,
+            "segmentId": road_id,
+            "vehicleCount": 0,
             "speed": 0.0,
             "flow": 0,
-            "energy": 0.0,
-            "energy_consumed": 0.0,
+            "energyConsumed": 0.0,
             "parkingCapacity": 0,
-            "parking_capacity": 0,
-            "parkedNum": 0,
-            "parked_num": 0,
+            "parkedVehicleCount": 0,
         }
 
     def _query_viz_link_records(self, active_road_ids=None, batch_size=1000):
@@ -3807,7 +6360,7 @@ class METSRClient:
             batch_size=batch_size,
         )
         returned_ids = {
-            str(_viz_first(record, "ID", "originID", "roadID", "origID", default=""))
+            str(_viz_first(record, "segmentId", default=""))
             for record in records
             if isinstance(record, dict)
         }
@@ -3867,33 +6420,70 @@ class METSRClient:
                 False,
             )
 
+        automatic_fleet_query = not query_groups
+        public_fleet_keys = None
+
         if not query_groups:
+            private_ids = []
+            public_ids = []
             try:
                 fleet = self.query_on_road_vehicles(roadID=road_ids)
             except Exception:
-                return []
-            if not isinstance(fleet, dict) or fleet.get("CODE") == "KO":
-                return []
-            if fleet.get("DATA"):
-                private_ids = []
-                public_ids = []
-                for road_record in fleet.get("DATA", []):
-                    if isinstance(road_record, dict) and road_record.get("STATUS") != "KO":
-                        private_ids.extend(road_record.get("private_vids") or [])
-                        public_ids.extend(road_record.get("public_vids") or [])
-                fleet = {
-                    "private_vids": list(dict.fromkeys(private_ids)),
-                    "public_vids": list(dict.fromkeys(public_ids)),
-                }
+                fleet = {}
+            if isinstance(fleet, dict) and fleet.get("status") != "error":
+                private_ids.extend(fleet.get("privateVehicleIds") or [])
+                public_ids.extend(fleet.get("publicVehicleIds") or [])
+                for road_record in fleet.get("data", []):
+                    if isinstance(road_record, dict) and road_record.get("status") != "error":
+                        private_ids.extend(road_record.get("privateVehicleIds") or [])
+                        public_ids.extend(road_record.get("publicVehicleIds") or [])
+
+            # Vehicles controlled by Scenic can be detached from METS-R's
+            # active-road index while they are inside the co-simulation bubble.
+            # Merge the authoritative co-sim ownership list so those actors are
+            # still represented in live visualization frames.
+            try:
+                cosim_fleet = self.query_cosim_vehicle()
+            except Exception:
+                cosim_fleet = {}
+            if isinstance(cosim_fleet, dict) and cosim_fleet.get("status") != "error":
+                for record in cosim_fleet.get("data", []):
+                    if not isinstance(record, dict) or record.get("status") == "error":
+                        continue
+                    vehicle_id = _viz_vehicle_id(record)
+                    if vehicle_id in (None, -1, ""):
+                        continue
+                    is_private = bool(_viz_first(
+                        record,
+                        "isPrivate", "privateVehicle", "_viz_private_veh",
+                        default=False,
+                    ))
+                    (private_ids if is_private else public_ids).append(vehicle_id)
+
+            private_ids = list(dict.fromkeys(private_ids))
+            public_ids = list(dict.fromkeys(public_ids))
             if include_private:
-                add_query_group(fleet.get("private_vids") or [], True)
+                add_query_group(private_ids, True)
             if include_public:
-                add_query_group(fleet.get("public_vids") or [], False)
+                add_query_group(public_ids, False)
+                public_fleet_keys = {
+                    (False, str(veh_id)) for veh_id in public_ids
+                }
+
+        if automatic_fleet_query and include_public:
+            with self.viz_stream_lock:
+                self._attack_vehicle_keys = {
+                    key
+                    for key in self._attack_vehicle_keys
+                    if key[0] or key in (public_fleet_keys or set())
+                }
 
         if not query_groups:
             return []
 
         records = []
+        with self.viz_stream_lock:
+            attack_vehicle_keys = set(self._attack_vehicle_keys)
         batch_size = max(1, int(batch_size or 1))
         for group_ids, private_flag in query_groups:
             for start in range(0, len(group_ids), batch_size):
@@ -3906,12 +6496,16 @@ class METSRClient:
                     )
                 except Exception:
                     continue
-                if response.get("CODE") == "KO":
+                if response.get("status") == "error":
                     continue
-                for record in response.get("DATA", []):
+                for record in response.get("data", []):
                     if _viz_stream_record(record):
                         record = dict(record)
                         record["_viz_private_veh"] = bool(private_flag)
+                        record["_viz_attack_vehicle"] = (
+                            (bool(private_flag), str(_viz_vehicle_id(record)))
+                            in attack_vehicle_keys
+                        )
                         records.append(record)
         return records
 
@@ -4013,8 +6607,8 @@ class METSRClient:
             private_vehicle_ids=None,
             batch_size=1000,
             coord_scale=_VIZ_STREAM_DEFAULT_COORD_SCALE,
-            initial_x=None,
-            initial_y=None,
+            initial_x=0.0,
+            initial_y=0.0,
             link_snapshot_interval=1,
             road_id_dictionary=None,
             zone_dictionary=None,
@@ -4031,9 +6625,10 @@ class METSRClient:
         to each connected browser. Call :meth:`render` whenever you want to
         query METS-R and push a new frame into METSR_VIS.
 
-        If `initial_x` and `initial_y` are omitted, they are read from
-        `sim_folder/data/Data.properties` so the live stream uses the same
-        origin as the run config prepared for METS-R.
+        `sim_folder` is optional for live streaming. If `initial_x` and
+        `initial_y` are both 0 and `sim_folder` is available, they are read
+        from `sim_folder/data/Data.properties`; otherwise the provided origin
+        values are used as-is.
         """
         start_kwargs = {
             "server_port": server_port,
@@ -4582,13 +7177,13 @@ class METSRClient:
             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), direction, tuple(msg.items()))
         )
         print(self._messagesLog[-1])
-        
-    # override __str__ for logging 
+
+    # override __str__ for logging
     def __str__(self):
         s = f"-----------\n" \
             f"Client INFO\n" \
             f"-----------\n" \
             f"output folder :\t {self.sim_folder}\n" \
             f"address :\t {self.uri}\n" \
-            f"state :\t {self.state}\n" 
+            f"state :\t {self.state}\n"
         return s

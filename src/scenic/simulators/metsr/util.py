@@ -326,6 +326,23 @@ _PROPERTY_OPTION_ALIASES = {
     "EV_DEMAND_FILE": ("private_ev_demand_file",),
     "GV_DEMAND_FILE": ("private_gv_demand_file",),
     "EV_CHARGING_PREFERENCE": ("private_ev_charging_preference",),
+    "ENABLE_INTERSECTION_SWEPT_COLLISION_CHECK": (
+        "intersection_swept_collision_check",
+        "intersection_collision_avoidance",
+    ),
+    "NO_LANECHANGING_LENGTH": ("no_lane_changing_length",),
+    "MAX_ROAD_TRAVERSAL_PATIENCE": ("max_stuck_time",),
+}
+
+# Append properties introduced by newer SIM versions when an older or custom
+# template omits them. Values mirror the current HPC template defaults.
+_REQUIRED_SIM_PROPERTY_DEFAULTS = {
+    "ENABLE_NETWORK": True,
+    "ENABLE_INTERSECTION_SWEPT_COLLISION_CHECK": False,
+    "NO_LANECHANGING_LENGTH": 2.5,
+    "LANE_CHANGE_LATERAL_SPEED": 1.0,
+    "LANE_CHANGE_MIN_DURATION": 1.0,
+    "MAX_ROAD_TRAVERSAL_PATIENCE": 600,
 }
 
 
@@ -404,6 +421,9 @@ def _property_override_value(key, options, port, instance):
         return True, False
     if key == "SYNCHRONIZED":
         return True, True
+    if key == "ENABLE_NETWORK":
+        # Current SIM rejects synchronized mode without the control network.
+        return True, True
     if key == "AGG_DEFAULT_PATH":
         return True, "agg_output"
     if key == "JSON_DEFAULT_PATH":
@@ -459,22 +479,38 @@ def modify_property_file(options, src_data_dir, dest_data_dir, port, instance, t
         print("ERROR, cannot find the property template file at ", fname)
         sys.exit(-1)
 
-    f = open(fname, "r")
-    lines = f.readlines()
-    f.close()
+    with open(fname, "r") as property_template:
+        lines = property_template.readlines()
     fname = dest_data_dir + "/Data.properties"
-    f_new = open(fname, "w")
-    for l in lines:
-        match = _PROPERTY_RE.match(l)
-        if match:
-            _, key, _, newline = match.groups()
-            found, value = _property_override_value(key, options, port, instance)
-            if found:
-                l = _property_line(key, value, newline)
-        l = _rewrite_data_path(l, src_data_dir)
-        
-        f_new.write(l)
-    f_new.close()
+    seen_properties = set()
+    with open(fname, "w") as generated_properties:
+        for line in lines:
+            match = _PROPERTY_RE.match(line)
+            if match:
+                _, key, _, newline = match.groups()
+                seen_properties.add(key)
+                found, value = _property_override_value(
+                    key, options, port, instance
+                )
+                if found:
+                    line = _property_line(key, value, newline)
+            line = _rewrite_data_path(line, src_data_dir)
+            generated_properties.write(line)
+
+        missing_required = [
+            (key, default)
+            for key, default in _REQUIRED_SIM_PROPERTY_DEFAULTS.items()
+            if key not in seen_properties
+        ]
+        if missing_required and lines and not lines[-1].endswith(("\n", "\r")):
+            generated_properties.write("\n")
+        for key, default in missing_required:
+            found, value = _property_override_value(
+                key, options, port, instance
+            )
+            generated_properties.write(
+                _property_line(key, value if found else default, "\n")
+            )
 
 def force_copytree(src, dst):
     """
