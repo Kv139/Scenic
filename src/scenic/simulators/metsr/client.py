@@ -944,7 +944,7 @@ class METSRClient:
         return default if value is None else value
 
     def _await_simulator_ready(self):
-        """Wait for the simulator's explicit readiness acknowledgement."""
+        """Wait for startup readiness or a valid late-connection heartbeat."""
         ready_timeout = max(
             0.1,
             float(self._client_config_value("startup_ready_timeout", self.timeout)),
@@ -960,12 +960,22 @@ class METSRClient:
             if response is None:
                 raise TimeoutError(
                     f"METS-R SIM accepted the WebSocket connection at {self.uri} "
-                    f"but did not report ready within {ready_timeout:.1f} seconds"
+                    f"but did not report ready or step within "
+                    f"{ready_timeout:.1f} seconds"
                 )
-            if response.get("messageType") != "ready":
+            message_type = response.get("messageType")
+            # METS-R sends ready once during startup. A later connection may
+            # receive only its periodic step heartbeat; receive_msg has already
+            # synchronized current_tick from that message.
+            late_connection_heartbeat = (
+                message_type == "step"
+                and response.get("status") == "ok"
+                and response.get("tick") is not None
+            )
+            if message_type != "ready" and not late_connection_heartbeat:
                 raise RuntimeError(
-                    "Expected METS-R SIM ready response, received "
-                    + str(response.get("messageType"))
+                    "Expected METS-R SIM ready response or step heartbeat, received "
+                    + str(message_type)
                 )
             return response
         except Exception:
@@ -4679,7 +4689,6 @@ class METSRClient:
             "teleport_cosim_vehicle instead"
         )
 
-    # reach destination
     def reach_dest(self, vehID, private_veh = False):
         msg = {
                 "messageType": "reachDest",

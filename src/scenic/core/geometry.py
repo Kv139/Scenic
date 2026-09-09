@@ -298,6 +298,9 @@ def triangulatePolygon(polygon):
 def triangulatePolygon_mapbox(polygon):
     import mapbox_earcut
 
+    if polygon.is_empty:
+        return []
+
     vertices, rings = [], []
     ring = polygon.exterior.coords[:-1]  # despite 'ring' name, actually need a chain
     vertices.extend(ring)
@@ -310,11 +313,10 @@ def triangulatePolygon_mapbox(polygon):
     rings = np.array(rings)
     result = mapbox_earcut.triangulate_float64(vertices, rings)
 
-    triangles = []
-    points = vertices[result]
-    coords = np.split(points, len(points) / 3)
-    triangles = shapely.polygons(coords)
-    return triangles
+    # Clipping can leave precision-scale slivers for which Earcut emits no
+    # triangles. Reshaping handles zero triangles without splitting into zero parts.
+    coords = vertices[result].reshape((-1, 3, 2))
+    return shapely.polygons(coords)
 
 
 def allChains(polygon):

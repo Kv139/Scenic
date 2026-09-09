@@ -12,6 +12,7 @@ from scenic.domains.driving.simulators import DrivingSimulation, DrivingSimulato
 
 import pygame
 import inspect
+import sys
 import warnings
 import os
 import math
@@ -627,6 +628,12 @@ class CosimSimulation(DrivingSimulation):
 
         self.carla_world.tick()  ## allowing manualgearshift to take effect
 
+        # The core reads every object's properties immediately after setup,
+        # including native NPCs which have not reached the first step yet.
+        self.obj_data_cache = self._collect_metsr_vehicle_data(
+            self.metsr_actors + self.carla_actors
+        )
+
         for obj in self.scene.objects:
             if obj.carla_actor_flag:
                 if obj.speed is not None and obj.speed != 0:
@@ -942,7 +949,54 @@ class CosimSimulation(DrivingSimulation):
         # only selects a reachable destination; do not write that road sequence
         # back or impose it on CARLA/PCLA's driving decisions.
 
-    def createObjectInCarla(self, obj: Object, update_velocity: bool = False) -> None:
+    def _degenerate_connector_spawn_orientation(self, state, position):
+        """Recover a zero-length connector's direction from its mapped lane.
+
+        SUMO continuity connectors can contain only repeated points. Native
+        displacement into such a connector then reflects lateral lane placement,
+        not a driving tangent. Keep ordinary native headings; only recover this
+        undefined direction when the exact path topology and 3D pose agree.
+        """
+        connector_id = state.get("connectorId")
+        path_id = self._normalized_connector_path_id(state.get("connectorPathId"))
+        if path_id is None or not self._is_controlled_connector_id(connector_id):
+            return None
+        connector_id = str(connector_id)
+        record = self.metsr_connector_records[connector_id]
+        source, target = record.get("sourceRoadId"), record.get("targetRoadId")
+        if source is None or target is None:
+            return None
+        mapped_endpoints = set()
+        connections = getattr(self, "metsr_internal_lane_connections", {})
+        for via_lane in state.get("connectorPathViaLaneIds", ()):
+            for source_lane, target_lane in connections.get(str(via_lane), ()):
+                if (
+                    self._mapped_lane_query(source_lane)[0] == str(source)
+                    and self._mapped_lane_query(target_lane)[0] == str(target)
+                ):
+                    mapped_endpoints.update((str(source_lane), str(target_lane)))
+        if not mapped_endpoints:
+            return None
+
+        centerline = self._query_connector_path_centerline(connector_id, path_id)
+        point = (position.x, position.y, position.z)
+        if self._point_to_polyline_distance_3d(point, centerline) > CARLA_OWNED_PROJECTION_TOLERANCE:
+            return None
+        points = [tuple(map(float, vertex[:3])) for vertex in centerline]
+        if any(math.dist(points[0], vertex) > 1e-6 for vertex in points[1:]):
+            return None
+        waypoint, error = self._projected_carla_driving_waypoint(
+            carla.Location(position.x, -position.y, position.z)
+        )
+        if waypoint is None or error > CARLA_OWNED_PROJECTION_TOLERANCE:
+            return None
+        if not mapped_endpoints.intersection(self._mapped_lanes_for_carla_waypoint(waypoint)):
+            return None
+        return utils.carlaToScenicOrientation(waypoint.transform.rotation)
+
+    def createObjectInCarla(
+        self, obj: Object, update_velocity: bool = False, *, native_state=None
+    ) -> bool:
         """
         Docstring for createObjectInCarla
 
@@ -976,14 +1030,42 @@ class CosimSimulation(DrivingSimulation):
         # set walker as not invincible
         if blueprint.has_attribute("is_invincible"):
             blueprint.set_attribute("is_invincible", "False")
-        # Set up transform
+        # Queue admission can change the native pose during this step, before
+        # Scenic refreshes obj's dynamic properties. Use the same current record
+        # which establishes ownership for position, heading, and initial velocity.
+        position = obj.position
+        orientation = obj.orientation
+        native_velocity = None
+        if native_state is not None:
+            try:
+                x, y = float(native_state["x"]), float(native_state["y"])
+                z = float(native_state.get("z") or 0.0)
+                bearing = float(native_state["bearing"])
+                speed = float(native_state["speed"])
+                if not all(math.isfinite(value) for value in (x, y, z, bearing, speed)):
+                    raise ValueError("non-finite pose or speed")
+                if speed < 0:
+                    raise ValueError("negative speed")
+            except (KeyError, TypeError, ValueError) as error:
+                raise SimulationCreationError(
+                    f"METS-R admission has no valid current pose for {obj}"
+                ) from error
+            position = Vector(x, y, z)
+            heading = math.radians(-bearing)
+            orientation = self._degenerate_connector_spawn_orientation(
+                native_state, position
+            )
+            if orientation is None:
+                orientation = Orientation.fromEuler(heading, 0, 0)
+            native_velocity = Vector(0, speed, 0).rotatedBy(orientation)
+
         loc = utils.scenicToCarlaLocation(
-            obj.position,
+            position,
             world=self.carla_world,
             blueprint=obj.blueprint,
             snapToGround=obj.snapToGround
         )
-        rot = utils.scenicToCarlaRotation(obj.orientation)
+        rot = utils.scenicToCarlaRotation(orientation)
         transform = carla.Transform(loc, rot)
         if blueprint.has_attribute("color") and obj.color is not None:
             c = obj.color
@@ -1060,9 +1142,30 @@ class CosimSimulation(DrivingSimulation):
         obj.spawn_guard = 2
         obj.carla_actor_flag = True
 
+        scenic_velocity = Vector(0, 0, 0)
         if update_velocity:
-            velocity = carla.Vector3D(obj.velocity.x, -obj.velocity.y, obj.velocity.z)
+            scenic_velocity = native_velocity if native_velocity is not None else obj.velocity
+            velocity = carla.Vector3D(
+                scenic_velocity.x, -scenic_velocity.y, scenic_velocity.z
+            )
             carlaActor.set_target_velocity(velocity)
+
+        # CARLA's actor proxy can report a zero transform until its first world
+        # snapshot. Preserve only this exact admission seed for that interval;
+        # later native queries must not supply a CARLA owner's motion state.
+        global_orientation = utils.carlaToScenicOrientation(rot)
+        yaw, pitch, roll = obj.parentOrientation.localAnglesFor(global_orientation)
+        if not hasattr(self, "_carla_spawn_property_seeds"):
+            self._carla_spawn_property_seeds = {}
+        self._carla_spawn_property_seeds[obj] = dict(
+            position=utils.carlaToScenicPosition(loc),
+            velocity=scenic_velocity,
+            speed=math.hypot(*scenic_velocity),
+            angularSpeed=0,
+            angularVelocity=Vector(0, 0, 0),
+            yaw=yaw, pitch=pitch, roll=roll,
+            elevation=utils.carlaToScenicElevation(loc),
+        )
 
         return True
 
@@ -1183,7 +1286,9 @@ class CosimSimulation(DrivingSimulation):
         bearing = math.radians(-raw_data["bearing"])
         globalOrientation = Orientation.fromEuler(bearing,0,0)
         yaw, pitch, roll = obj.parentOrientation.localAnglesFor(globalOrientation)
-        velocity = Vector(0, speed, 0).rotatedBy(yaw)
+        # Velocity is global; yaw above is relative to parentOrientation.
+        # Using local yaw here launches admitted CARLA actors sideways.
+        velocity = Vector(0, speed, 0).rotatedBy(bearing)
         angularSpeed = 0
         angularVelocity = Vector(0,0,0)
 
@@ -1210,11 +1315,17 @@ class CosimSimulation(DrivingSimulation):
         return objects properties for any CoSim object
         """
         assert hasattr(obj, "carla_actor_flag"), f"Object is not assigned properly to a simulator instance"
-        if (obj.carla_actor_flag and obj.spawn_guard == 0) or obj.name == "ego":
-            properties = self.getCarlaProperties(obj,properties)
-        else:
-            properties =  self.getMetsrProperties(obj,properties)
-        return properties
+        if obj.carla_actor_flag:
+            seeds = getattr(self, "_carla_spawn_property_seeds", {})
+            if obj in seeds:
+                # Setup also advances CARLA directly. Its cached world snapshot
+                # identifies publication without assuming a nonzero actor pose.
+                snapshot = self.carla_world.get_snapshot()
+                if snapshot.find(obj.carlaActor.id) is None:
+                    return dict(seeds[obj])
+                seeds.pop(obj)
+            return self.getCarlaProperties(obj, properties)
+        return self.getMetsrProperties(obj, properties)
 
     def getMetsrPrivateVehId(self, obj: Object) -> int:
         """
@@ -1245,6 +1356,9 @@ class CosimSimulation(DrivingSimulation):
             for obj in tuple(getattr(self, "road_entry_holds", ())):
                 self._enforce_road_entry_hold(obj)
             self.carla_world.tick()
+            # All successful spawns are now present in CARLA's published state;
+            # spawn_guard does not choose the source of an owner's properties.
+            getattr(self, "_carla_spawn_property_seeds", {}).clear()
 
 
     def _boundary_vehicle_blueprint(self, key, state, scenic_object):
@@ -1433,7 +1547,7 @@ class CosimSimulation(DrivingSimulation):
         new_roads, old_roads = self.classify_bubble_roads(bubble_roads)
         # Acquire the new roads before advancing CARLA. Old roads remain owned
         # until after CARLA's current pose has been published and all resulting
-        # promotions/demotions have been applied below.
+        # handbacks and completions have been applied below.
         self.freeze_roads(new_roads)
         # Remove obsolete obstacles before promotion/queue admission, and make
         # native exit occupancy visible before any CARLA physics/sensor tick.
@@ -1447,13 +1561,12 @@ class CosimSimulation(DrivingSimulation):
         # demotion until after CARLA's authoritative pose has been mirrored to
         # METS-R. This removes the stale-snapshot boundary heuristic.
         # METS-R has not advanced between promotion and CARLA publication, so
-        # one batched snapshot can serve both bubble passes and synchronization.
+        # one batched snapshot can serve promotion and synchronization.
         state_objects = list(dict.fromkeys((*self.objects[1:], *self.carla_actors)))
         step_vehicle_data = self._collect_metsr_vehicle_data(state_objects)
         self.update_bubble_objects(
             bubble_road_ids,
             intersection_ids,
-            allow_demotion=False,
             vehicle_data=step_vehicle_data,
         )
 
@@ -1461,17 +1574,10 @@ class CosimSimulation(DrivingSimulation):
         self._refresh_carla_destination_paths(step_vehicle_data)
         self.tick_carla()
         self.synchronize_clients(vehicle_data=step_vehicle_data)
-        self.update_bubble_objects(
-            bubble_road_ids,
-            intersection_ids,
-            allow_promotion=False,
-            advance_spawn_guards=False,
-            count_density=False,
-            vehicle_data=step_vehicle_data,
-        )
+        self._remove_completed_carla_objects()
         releasable_roads = self._releasable_old_roads(old_roads)
         if releasable_roads:
-            self.release_roads(releasable_roads)
+            self.release_roads(releasable_roads, allow_defer=True)
         self._report_road_entry_holds()
         self.tick_metsr()
         self.obj_data_cache = self._collect_metsr_vehicle_data(self.metsr_actors + self.carla_actors)
@@ -1527,36 +1633,22 @@ class CosimSimulation(DrivingSimulation):
 
 
     def get_bubble_intersections(self, bubble_roads: list[Road], bubble_region: CircularRegion) -> list[Intersection]:
+        """Include intersections attached to the selected road component.
+
+        Every incident intersection is needed for METS-R ownership consistency.
+        XY overlap alone is insufficient because it can select another level.
         """
-        Docstring for get_bubble_intersections
-
-        Collect any intersections that are either
-            (1) Intersecting the CoSim bubble
-            (2) Are connected to the bubble via AT LEAST 1 roads
-                Since METS-R does not not manage intersections all connected
-                intersections must be included for consistency
-
-        :param bubble_roads: list of Roads which are within the cosim region
-        :type bubble_roads:  list[Road]
-        :param bubble_region: Scenic region which constitues immediate high fidelity zone
-        :type bubble_regions: CircularRegion [Region]
-
-        :return: The set of all intersections meeting the above criteria
-        :rtype: list[Intersection]
-        """
+        road_ids = {str(road.id) for road in bubble_roads}
         bubble_intersections = []
         for intersection in self.network_helper.network_intersections:
-            if intersection.intersects(bubble_region):
+            attached_roads = list(intersection.roads)
+            attached_roads.extend(
+                maneuver.connectingLane.road
+                for maneuver in intersection.maneuvers
+                if maneuver.connectingLane is not None
+            )
+            if any(str(road.id) in road_ids for road in attached_roads):
                 bubble_intersections.append(intersection)
-                continue
-            intersection_roads = intersection.roads
-            count = 0
-            for road in intersection_roads:
-                if road in bubble_roads:
-                    count += 1
-                if count > 0:
-                    bubble_intersections.append(intersection)
-                    break
         return bubble_intersections
 
     def initiate_autopilot(self, obj : Object) -> bool:
@@ -1568,7 +1660,7 @@ class CosimSimulation(DrivingSimulation):
 
         Activates autopilot for a simulation vehicle
          (i) If the vehicle is in CARLA, enables Traffic Manager after its
-             destination path has been installed by executeActions
+             destination path has been installed during admission or executeActions
          (2) If the vehicle is in METSR updates the overwrite flag for manually controlling the vehicle
         """
         if obj.carla_actor_flag:
@@ -2069,428 +2161,69 @@ class CosimSimulation(DrivingSimulation):
             obj.trajectory = None
 
     def _releasable_old_roads(self, old_roads):
-        """Return old bubble roads which no CARLA-owned actor still requires."""
-        candidates = [str(road_id) for road_id in old_roads]
-        if not candidates:
-            return []
-
-        self._ensure_connector_ownership_state()
-        self._ensure_carla_authority_state()
-        retained = set()
-        unresolved_actor = False
-
-        for obj in tuple(getattr(self, "carla_actors", ())):
-            segment = self._carla_authoritative_segments.get(obj)
+        """Keep native segments controlled until their CARLA occupants leave."""
+        occupied = set()
+        segments = getattr(self, "_carla_authoritative_segments", {})
+        for obj in self.carla_actors:
+            segment = segments.get(obj)
             if segment is None:
-                # Releasing any candidate while an externally-owned actor has no
-                # resolved segment can make that actor disappear from
-                # coSimVehicle before its first authoritative publication.
-                unresolved_actor = True
-                continue
+                # No accepted observation yet: releasing a road could resume
+                # native motion while this actor is still controlled by CARLA.
+                return []
+            occupied.add(str(segment))
+        held = set(occupied)
+        for road, connectors in getattr(self, "metsr_road_connectors", {}).items():
+            if occupied.intersection(map(str, connectors)):
+                held.add(str(road))
+        for admission in getattr(self, "admitted_queue_vehicles", {}).values():
+            held.add(str(admission["roadId"]))
+        return [str(road) for road in old_roads if str(road) not in held]
 
-            segment = str(segment)
-            if segment in self.carla_control_roads:
-                retained.add(segment)
-            elif self._is_controlled_internal_segment(segment):
-                segment = self.metsr_internal_edge_to_connector[segment]
+    def _native_handoff_target(self, obj, location):
+        """Resolve an outgoing NPC's native placement; ordinary poses need no hint.
 
-            if self._is_controlled_connector_id(segment):
-                connector = self.metsr_connector_records.get(segment, {})
-                for field in ("sourceRoadId", "targetRoadId"):
-                    road_id = connector.get(field)
-                    if road_id is not None:
-                        retained.add(str(road_id))
-
-        if unresolved_actor:
-            retained.update(candidates)
-        return [road_id for road_id in candidates if road_id not in retained]
-
-    def _carla_segment_transition_is_compatible(self, obj, previous, candidate):
-        """Check continuity using road/connector topology, never ID parsing."""
-        if previous is None or candidate is None or str(previous) == str(candidate):
-            return True
-        previous = str(previous)
-        candidate = str(candidate)
-
-        if self._is_controlled_connector_id(previous):
-            record = self.metsr_connector_records[previous]
-            target = record.get("targetRoadId")
-            return target is not None and candidate == str(target)
-        if self._is_controlled_connector_id(candidate):
-            record = self.metsr_connector_records[candidate]
-            source = record.get("sourceRoadId")
-            return source is not None and previous == str(source)
-
-        connector_id, _ = self._connector_record_for_transition(previous, candidate)
-        if connector_id is not None:
-            return True
-        return bool(getattr(self, "metsr_lane_connections", {}).get(
-            (previous, candidate)
-        ))
-
-    def _resolve_overlapping_connector_observation(
-        self, previous, observed, location, *records
-    ):
-        """Resolve overlapping merge/fork paths without prescribing a turn."""
-        if (
-            previous == observed
-            or not self._is_controlled_connector_id(previous)
-            or not self._is_controlled_connector_id(observed)
-        ):
-            return None
-        occupied = self.metsr_connector_records[previous]
-        projected = self.metsr_connector_records[observed]
-
-        def shares_endpoint(field):
-            first, second = occupied.get(field), projected.get(field)
-            return first is not None and second is not None and str(first) == str(second)
-
-        same_source = shares_endpoint("sourceRoadId")
-        if not same_source and not shares_endpoint("targetRoadId"):
-            return None
-        intersection = occupied.get("intersectionId")
-        observed_intersection = projected.get("intersectionId")
-        if (
-            intersection is not None
-            and observed_intersection is not None
-            and str(intersection) != str(observed_intersection)
-        ):
-            return None
-
-        waypoint, error = self._projected_carla_driving_waypoint(location)
-        if (
-            waypoint is None
-            or not getattr(waypoint, "is_junction", False)
-            or not error <= CARLA_OWNED_PROJECTION_TOLERANCE
-        ):
-            return None
-        path_id = self._connector_path_id_for_pose(previous, location, *records)
-        if path_id is None:
-            return None
-        point = (float(location.x), float(-location.y))
-        error = self._point_to_polyline_distance(
-            point, self._query_connector_path_centerline(previous, path_id)
-        )
-        if not math.isfinite(error):
-            return None
-        if error <= CARLA_OWNED_PROJECTION_TOLERANCE:
-            return previous
-
-        # A fork may initially be ambiguous, then resolve to a different turn
-        # as CARLA drives away from the first inferred path. The shared source
-        # establishes continuity; the observed path must independently fit the
-        # actual pose. A merge from a different source cannot change provenance.
-        if same_source:
-            observed_path = self._connector_path_id_for_pose(observed, location)
-            if observed_path is not None:
-                error = self._point_to_polyline_distance(
-                    point, self._query_connector_path_centerline(observed, observed_path)
-                )
-                if error <= CARLA_OWNED_PROJECTION_TOLERANCE:
-                    return observed
-        return None
-
-    def _constrained_carla_owned_road_match(self, obj, location, allowed_roads):
-        """Return the nearest topology-compatible controlled lane and its error."""
-        self._ensure_carla_authority_state()
-        previous = self._carla_authoritative_segments.get(obj)
-        point = (float(location.x), float(-location.y))
-        candidates = set()
-        for lane_id, lane_index in getattr(self, "metsr_lane_indices", {}).items():
-            road_id, _ = self._mapped_lane_query(lane_id)
-            if road_id in allowed_roads:
-                candidates.add((str(road_id), int(lane_index)))
-        for road_id, lane_index in getattr(self, "metsr_road_cache", {}):
-            if str(road_id) in allowed_roads:
-                candidates.add((str(road_id), int(lane_index)))
-
-        best_road = None
-        best_lane = None
-        best_error = math.inf
-        for road_id, lane_index in sorted(candidates):
-            if not self._carla_segment_transition_is_compatible(
-                obj, previous, road_id
-            ):
-                continue
-            centerline = self._query_mapped_centerline(road_id, lane_index)
-            error = self._point_to_polyline_distance(point, centerline)
-            if error < best_error:
-                best_road, best_lane, best_error = road_id, lane_index, error
-        if best_error <= CARLA_OWNED_PROJECTION_TOLERANCE:
-            return best_road, best_lane, best_error
-        return None, None, best_error
-
-    def _raise_carla_ownership_domain_error(
-        self,
-        obj,
-        vehicle_id,
-        raw_road_id,
-        raw_lane_id,
-        allowed_segments,
-        projection_error,
-    ):
-        self._ensure_carla_authority_state()
-        previous = self._carla_authoritative_segments.get(obj)
-        error_text = (
-            "unavailable"
-            if not math.isfinite(projection_error)
-            else f"{projection_error:.3f} m"
-        )
-        raise SimulationCreationError(
-            "CARLA-owned vehicle pose is outside its METS-R ownership domain: "
-            f"object={getattr(obj, 'name', obj)}, vehicleID={vehicle_id}, "
-            f"raw CARLA road/lane={raw_road_id}/{raw_lane_id}, "
-            f"last authoritative segment={previous}, "
-            f"allowed segments={sorted(map(str, allowed_segments))}, "
-            f"projection error={error_text}, "
-            f"route={list(self._normalized_road_route(getattr(obj, 'route', ())))}"
-        )
-
-    def _resolve_carla_owned_observation(
-        self,
-        obj,
-        location,
-        raw_road_id,
-        raw_lane_id,
-        vehicle_state,
-        cosim_record,
-        *,
-        vehicle_id=None,
-    ):
-        """Select an owned physical segment from CARLA's raw map observation.
-
-        Returns ``(segment_id, lane_index, logical_road_id)``. The first value
-        may be an opaque connector ID; the logical road never is.
+        CARLA's current waypoint identifies a possible boundary crossing. Only
+        an ordinary road outside the controlled region triggers handback;
+        junctions and ambiguous/unmapped poses use ordinary native association.
         """
-        self._ensure_connector_ownership_state()
-        self._ensure_carla_authority_state()
-        controlled_roads = set(map(str, self.carla_control_roads))
-        controlled_connectors = self._owned_connector_ids()
-        allowed_segments = controlled_roads | controlled_connectors
-        previous = self._initialize_carla_authoritative_segment(
-            obj, vehicle_state, cosim_record
-        )
-        raw_road = None if raw_road_id is None else str(raw_road_id)
-        raw_lane = raw_lane_id
-        candidate = None
-        candidate_lane = None
-        logical_road = None
-        explicit_observation_rejected = False
-
-        # A target-road observation accepted on a previous tick cannot regress
-        # to its uncontrolled inbound source because of global-map flicker.
-        if previous in controlled_roads and raw_road not in controlled_roads:
-            for connector_id in controlled_connectors:
-                record = self.metsr_connector_records[connector_id]
-                source = record.get("sourceRoadId")
-                target = record.get("targetRoadId")
-                if (
-                    source is not None
-                    and target is not None
-                    and raw_road == str(source)
-                    and previous == str(target)
-                    and str(source) not in controlled_roads
-                ):
-                    return previous, None, previous
-
-        if raw_road in controlled_roads:
-            candidate, candidate_lane, logical_road = raw_road, raw_lane, raw_road
-        elif self._is_controlled_internal_segment(raw_road):
-            candidate = self.metsr_internal_edge_to_connector[raw_road]
-            record = self.metsr_connector_records.get(candidate, {})
-            logical_road = record.get("targetRoadId") or record.get("sourceRoadId")
-        elif raw_road in controlled_connectors:
-            candidate = raw_road
-            record = self.metsr_connector_records.get(candidate, {})
-            logical_road = record.get("targetRoadId") or record.get("sourceRoadId")
+        if obj is getattr(self, "ego", None):
+            return None
+        waypoint, distance = self._projected_carla_driving_waypoint(location)
+        if (waypoint is None or waypoint.is_junction
+                or distance > CARLA_OWNED_PROJECTION_TOLERANCE):
+            return None
+        mapped_lanes = self._mapped_lanes_for_carla_waypoint(waypoint)
+        candidates = []
+        for mapped_lane in mapped_lanes:
+            road, index = self._mapped_lane_query(mapped_lane)
+            if (road is not None and not str(road).startswith(":")
+                    and index is not None and index >= 0):
+                candidates.append((str(road), index, mapped_lane))
+        if not candidates or all(road in self.carla_control_roads
+                                 for road, _, _ in candidates):
+            return None
+        if len(candidates) == 1:
+            road, lane, _ = candidates[0]
         else:
-            # A native vehicle may still be geometrically mapped to an inbound
-            # source road while METS-R reports that it is on the incident COSIM
-            # connector. Keep publishing the server-returned opaque connector;
-            # no transition-state fields or locally constructed IDs are needed.
-            connector_id = self._canonical_connector_hint(cosim_record, raw_road)
-            if connector_id is not None:
-                connector = self.metsr_connector_records[connector_id]
-                candidate = connector_id
-                logical_road = connector.get("targetRoadId")
-
-            # An explicit native successor is the one-call CARLA -> METS-R
-            # handoff added by the current API. Topology proves the boundary;
-            # the authoritative native segment and lane are sent immediately.
-            if (
-                candidate is None
-                and raw_road is not None
-                and raw_road not in controlled_roads
-                and not self._is_pcla_controlled_ego(obj)
-            ):
-                boundary_verified = False
-                if previous in controlled_roads:
-                    connector_id, _ = self._connector_record_for_transition(
-                        previous, raw_road, cosim_record
-                    )
-                    boundary_verified = connector_id is not None
-                elif self._is_controlled_connector_id(previous):
-                    connector = self.metsr_connector_records[previous]
-                    target = connector.get("targetRoadId")
-                    boundary_verified = (
-                        target is not None and str(target) == raw_road
-                    )
-                if boundary_verified:
-                    candidate, candidate_lane, logical_road = (
-                        raw_road,
-                        raw_lane,
-                        raw_road,
-                    )
-                    allowed_segments.add(raw_road)
-            if candidate is None and raw_road is not None:
-                explicit_observation_rejected = True
-
-        # Shared junction geometry can make the nearest internal lane ambiguous.
-        # Resolve it from path geometry and observed motion, independently of routes.
-        resolved_connector = self._resolve_overlapping_connector_observation(
-            previous, candidate, location, cosim_record, vehicle_state
-        )
-        if resolved_connector is not None:
-            candidate, candidate_lane = resolved_connector, None
-            logical_road = self.metsr_connector_records[candidate]["targetRoadId"]
-
-        if (
-            candidate is not None
-            and resolved_connector is None
-            and not self._carla_segment_transition_is_compatible(obj, previous, candidate)
-        ):
-            # A global projection can flicker to a direct physical predecessor
-            # at a shared endpoint. Use network topology here: METS-R's remaining
-            # route excludes the current road and does not constrain CARLA.
-            predecessor_connector, _ = self._connector_record_for_transition(
-                candidate, previous
+            position = (location.x, -location.y, location.z)
+            road = self.identify_nearest_road(
+                position, [entry[2] for entry in candidates]
             )
-            if (
-                previous in allowed_segments
-                and (
-                    predecessor_connector is not None
-                    or bool(getattr(self, "metsr_lane_connections", {}).get(
-                        (candidate, previous)
-                    ))
-                )
-            ):
-                candidate, candidate_lane, logical_road = previous, None, previous
-            else:
-                candidate = candidate_lane = logical_road = None
-                explicit_observation_rejected = True
-
-        projection_error = math.inf
-        if candidate is None:
-            projection_api_available = callable(
-                getattr(getattr(self, "map", None), "get_waypoint", None)
-            )
-            waypoint, waypoint_error = self._projected_carla_driving_waypoint(
-                location
-            )
-            projection_error = waypoint_error
-            mapped_lanes = self._mapped_lanes_for_carla_waypoint(waypoint)
-
-            # A projected CARLA waypoint is evidence only inside the existing
-            # ownership tolerance. In particular, project_to_road must not turn
-            # a genuinely off-road pose into connector continuity.
-            if (
-                raw_road is None
-                and projection_api_available
-                and waypoint is None
-            ):
-                self._raise_carla_ownership_domain_error(
-                    obj,
-                    vehicle_id,
-                    raw_road_id,
-                    raw_lane_id,
-                    allowed_segments,
-                    projection_error,
-                )
-            if (
-                waypoint is not None
-                and waypoint_error > CARLA_OWNED_PROJECTION_TOLERANCE
-            ):
-                self._raise_carla_ownership_domain_error(
-                    obj,
-                    vehicle_id,
-                    raw_road_id,
-                    raw_lane_id,
-                    allowed_segments,
-                    projection_error,
-                )
-
-            # CARLA can expose an internal driving lane which the SUMO conversion
-            # did not map. Preserve an already-authoritative connector only while
-            # the close projected waypoint is such an unmapped junction lane.
-            # The previous connector is the continuity proof: it could only have
-            # been accepted from METS-R ownership metadata or a mapped internal
-            # segment on an earlier tick.
-            if (
-                raw_road is None
-                and waypoint is not None
-                and not mapped_lanes
-                and getattr(waypoint, "is_junction", False)
-                and self._is_controlled_connector_id(previous)
-            ):
-                candidate = str(previous)
-                connector = self.metsr_connector_records[candidate]
-                logical_road = connector.get("targetRoadId") or connector.get(
-                    "sourceRoadId"
-                )
-            elif (
-                raw_road is None
-                and waypoint is not None
-                and not mapped_lanes
-                and not getattr(waypoint, "is_junction", False)
-            ):
-                # A gap on an ordinary road is not connector geometry and must
-                # not be hidden by a nearby controlled-road centerline.
-                self._raise_carla_ownership_domain_error(
-                    obj,
-                    vehicle_id,
-                    raw_road_id,
-                    raw_lane_id,
-                    allowed_segments,
-                    projection_error,
-                )
-
-        if candidate is None and explicit_observation_rejected:
-            # An explicit but unrelated CARLA road is stronger evidence than a
-            # nearby centerline and must fail closed instead of being projected
-            # back into the previous ownership domain.
-            self._raise_carla_ownership_domain_error(
-                obj,
-                vehicle_id,
-                raw_road_id,
-                raw_lane_id,
-                allowed_segments,
-                projection_error,
-            )
-
-        if candidate is None:
-            candidate, candidate_lane, projection_error = (
-                self._constrained_carla_owned_road_match(
-                    obj, location, controlled_roads
-                )
-            )
-            logical_road = candidate
-        if candidate is None:
-            self._raise_carla_ownership_domain_error(
-                obj,
-                vehicle_id,
-                raw_road_id,
-                raw_lane_id,
-                allowed_segments,
-                projection_error,
-            )
-
-        candidate = str(candidate)
-        if self._is_controlled_connector_id(candidate):
-            candidate_lane = None
-        self._carla_authoritative_segments[obj] = candidate
-        return candidate, candidate_lane, (
-            None if logical_road is None else str(logical_road)
-        )
+            if road is None or str(road) in self.carla_control_roads:
+                return None
+            road = str(road)
+            lane, _ = self._nearest_mapped_lane(position, mapped_lanes, road)
+            if lane is None:
+                return None
+        # CARLA and SUMO place the start of a junction at slightly different
+        # positions. A newly admitted connector may still project onto its
+        # upstream CARLA road; handing it back there causes immediate re-entry
+        # and repeated promotion. This is entry, not an outgoing boundary.
+        current = getattr(self, "_carla_authoritative_segments", {}).get(obj)
+        connector = getattr(self, "metsr_connector_records", {}).get(current, {})
+        if str(connector.get("sourceRoadId")) == road:
+            return None
+        return road, lane, None
 
     def _classify_physical_road_observation(
         self,
@@ -2789,59 +2522,6 @@ class CosimSimulation(DrivingSimulation):
             obj, None
         )
         getattr(self, "_pending_pcla_pose_resets", set()).discard(obj)
-
-    def _synchronize_pcla_ego_shadow(
-        self,
-        obj,
-        vehicle_id,
-        vehicle_state,
-        cosim_record,
-        location,
-        authoritative_segment_id,
-        authoritative_lane_id,
-        logical_road_id,
-        authoritative_connector_path_id=None,
-    ):
-        """Copy the PCLA/CARLA ego state into METS-R without touching CARLA."""
-        self._clear_pcla_ego_reconciliation_state(obj)
-        # METS-R discards its route assertions when mirroring a CARLA-owned
-        # pose and rebuilds a native route to the destination at handoff.
-
-        transform = obj.carlaActor.get_transform()
-        velocity = obj.carlaActor.get_velocity()
-        speed = math.sqrt(
-            velocity.x * velocity.x
-            + velocity.y * velocity.y
-            + velocity.z * velocity.z
-        )
-        try:
-            _require_single_vehicle_response(
-                self.metsr_client.teleport_cosim_vehicle(
-                    vehicle_id,
-                    location.x,
-                    -location.y,
-                    z=location.z,
-                    bearing=_utils.get_metsr_rotation(transform.rotation.yaw),
-                    speed=speed,
-                    private_veh=True,
-                    transform_coords=True,
-                    segment_id=authoritative_segment_id,
-                    lane_index=authoritative_lane_id,
-                    connector_path_id=authoritative_connector_path_id,
-                ),
-                "teleportCoSimVeh",
-                vehicle_id,
-            )
-        except METSRControlError as error:
-            if not error.retryable:
-                raise
-            warnings.warn(
-                f"METS-R temporarily rejected the PCLA ego shadow update for "
-                f"{obj}; CARLA/PCLA remains authoritative and will publish "
-                f"the then-current pose on the next normal tick: {error}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
     def _defer_pcla_pose_reset(self, obj):
         """Reset PCLA only after CARLA publishes the corrected actor pose."""
@@ -3467,7 +3147,7 @@ class CosimSimulation(DrivingSimulation):
         return synchronized_any and count % 200 == 0
 
     def _publish_carla_vehicle_updates(self, updates):
-        """Publish ordinary CARLA actors in one METS-R teleport request."""
+        """Publish each pose once, with a native target only for handback."""
         if not updates:
             return
 
@@ -3475,94 +3155,93 @@ class CosimSimulation(DrivingSimulation):
             values = [update.get(name) for update in updates]
             return values[0] if len(values) == 1 else values
 
+        targets = [update.get("handoff") for update in updates]
+        selectors = {}
+        if any(targets):
+            for index, name in enumerate(("segment_id", "lane_index", "connector_path_id")):
+                values = [target[index] if target else None for target in targets]
+                if any(value is not None for value in values):
+                    selectors[name] = values[0] if len(values) == 1 else values
         response = self.metsr_client.teleport_cosim_vehicle(
-            field("vehicle_id"),
-            field("x"),
-            field("y"),
-            z=field("z"),
-            bearing=field("bearing"),
-            speed=field("speed"),
+            field("vehicle_id"), field("x"), field("y"),
+            z=field("z"), bearing=field("bearing"), speed=field("speed"),
             private_veh=field("private_veh"),
-            transform_coords=field("transform_coords"),
-            segment_id=field("authoritative_segment"),
-            lane_index=field("authoritative_lane"),
-            connector_path_id=field("authoritative_connector_path"),
+            transform_coords=field("transform_coords"), **selectors,
         )
         _, acknowledgements = _require_vehicle_batch_response(
-            response,
-            "teleportCoSimVeh",
+            response, "teleportCoSimVeh",
             [update["vehicle_id"] for update in updates],
         )
-
-        for update in updates:
-            carla_object = update["object"]
+        # Validate the entire batch before committing any local owner changes.
+        # A rejected or ambiguous batch aborts the run; teardown resets METS-R.
+        for update, target in zip(updates, targets):
             vehicle_id = update["vehicle_id"]
-            authoritative_segment = update["authoritative_segment"]
-            authoritative_lane = update["authoritative_lane"]
-            authoritative_connector_path = update.get(
-                "authoritative_connector_path"
-            )
-            logical_road = update["logical_road"]
-            vehicle_state = update["vehicle_state"]
-            cosim_record = update["cosim_record"]
-            acknowledgement = acknowledgements[str(vehicle_id)]
+            record = acknowledgements[str(vehicle_id)]
+            if target:
+                segment, lane, path = target
+                valid = (
+                    record.get("controlMode") == "native"
+                    and record.get("releasedFromCoSim") is True
+                    and str(record.get("segmentId")) == segment
+                    and (lane is None or record.get("laneIndex") == lane)
+                    and (path is None or record.get("connectorPathId") == path)
+                )
+            else:
+                valid = (record.get("controlMode") == "cosim"
+                         and record.get("releasedFromCoSim") is False)
+            if not valid:
+                raise METSRControlError(
+                    f"METS-R did not confirm {'native handback' if target else 'CARLA pose update'} "
+                    f"for vehicle {vehicle_id}", response=response, record=record,
+                )
 
-            outbound_handoff = (
-                authoritative_segment not in self.carla_control_roads
-                and not self._is_controlled_connector_id(authoritative_segment)
-            )
-            if outbound_handoff:
-                acknowledged_segment = acknowledgement.get("segmentId")
-                acknowledged_lane = acknowledgement.get("laneIndex")
-                if (
-                    acknowledgement.get("controlMode") != "native"
-                    or acknowledgement.get("releasedFromCoSim") is not True
-                    or acknowledged_segment is None
-                    or str(acknowledged_segment) != authoritative_segment
-                    or (
-                        authoritative_lane is not None
-                        and acknowledged_lane != authoritative_lane
-                    )
-                ):
-                    raise METSRControlError(
-                        "teleportCoSimVeh did not confirm the requested direct "
-                        f"native handoff of vehicle {vehicle_id} to "
-                        f"{authoritative_segment}/{authoritative_lane}",
-                        response=response,
-                        record=acknowledgement,
-                    )
-                carla_object.spawn_guard = 0
-                self.remove_bubble_object(carla_object)
+        self._ensure_carla_authority_state()
+        for update, target in zip(updates, targets):
+            obj = update["object"]
+            record = acknowledgements[str(update["vehicle_id"])]
+            if target:
+                obj.spawn_guard = 0
+                self.remove_bubble_object(obj)
                 continue
-            if authoritative_connector_path is not None:
-                acknowledged_segment = acknowledgement.get("segmentId")
-                if (
-                    acknowledged_segment is None
-                    or str(acknowledged_segment) != authoritative_segment
-                    or acknowledgement.get("laneIndex")
-                    not in (None, METSR_CONNECTOR_NO_LANE)
-                    or acknowledgement.get("connectorPathId")
-                    != authoritative_connector_path
-                ):
-                    raise METSRControlError(
-                        "teleportCoSimVeh did not confirm connector path "
-                        f"{authoritative_connector_path} of {authoritative_segment} "
-                        f"for vehicle {vehicle_id}; acknowledgement="
-                        f"{acknowledgement!r}",
-                        response=response,
-                        record=acknowledgement,
-                    )
-            destination = vehicle_state.get("destinationRoadId")
+            segment = record.get("segmentId")
+            self._carla_authoritative_segments[obj] = (
+                str(segment) if segment is not None else None
+            )
+            destination = update["vehicle_state"].get("destinationRoadId")
             if destination is None:
-                destination = cosim_record.get("destinationRoadId")
-            if (
-                destination is not None
-                and logical_road is not None
-                and authoritative_segment == str(logical_road)
-                and str(logical_road) == str(destination)
-            ):
-                self.completed_route[carla_object] = True
-                carla_object.finished_route = self.count
+                destination = update["cosim_record"].get("destinationRoadId")
+            if (destination is not None and segment is not None
+                    and record.get("segmentType") == "road"
+                    and str(segment) == str(destination)
+                    and obj not in self.completed_route):
+                if obj is not getattr(self, "ego", None):
+                    retirement = self.metsr_client.reach_dest(
+                        update["vehicle_id"], private_veh=update["private_veh"]
+                    )
+                    _require_all_success_control_response(retirement, "reachDest")
+                    records = retirement.get("data", ())
+                    # The native reachDest handler returns one OK record but
+                    # does not include vehicleId on successful scalar requests.
+                    if (not isinstance(records, (list, tuple)) or len(records) != 1
+                            or not isinstance(records[0], dict)
+                            or records[0].get("status") != "ok"
+                            or (records[0].get("vehicleId") is not None
+                                and str(records[0]["vehicleId"]) != str(update["vehicle_id"]))):
+                        raise METSRControlError(
+                            f"reachDest did not confirm completion of vehicle {update['vehicle_id']}",
+                            response=retirement,
+                        )
+                self.completed_route[obj] = True
+                obj.finished_route = self.count
+
+    def _remove_completed_carla_objects(self):
+        """Remove completed NPCs once, after native retirement is acknowledged."""
+        for obj in tuple(self.carla_actors):
+            if obj is getattr(self, "ego", None) or obj not in self.completed_route:
+                continue
+            vehicle_id = self.pv_id_map.get(obj)
+            getattr(self, "admitted_queue_vehicles", {}).pop(vehicle_id, None)
+            self.remove_bubble_object(obj)
 
     def synchronize_clients(
         self,
@@ -3570,12 +3249,10 @@ class CosimSimulation(DrivingSimulation):
         *,
         vehicle_data=None,
     ):
-        """Publish CARLA actor states and complete direct native handoffs.
+        """Publish CARLA states without required segment hints inside the region.
 
-        A controlled segment update mirrors the CARLA pose into METS-R. When
-        the resolver selects a topology-verified native successor, that same
-        teleport call transfers ownership to METS-R; Scenic destroys the CARLA
-        actor only after the native-release acknowledgement is validated.
+        Only an outgoing NPC supplies a native handback target. METS-R's
+        acknowledgment determines when CARLA ownership can end.
         """
         if obj is None:
             carla_actors = list(self.carla_actors)
@@ -3607,18 +3284,14 @@ class CosimSimulation(DrivingSimulation):
         for carla_object in carla_actors:
             try:
                 actor = carla_object.carlaActor
+                if not self._carla_actor_is_alive(actor):
+                    raise RuntimeError("CARLA actor is no longer alive")
                 location = actor.get_location()
             except Exception as error:
-                print(f"Caught error {error}")
-                warnings.warn(
-                    f"Object {getattr(carla_object, 'name', carla_object)} "
-                    "automatically removed by CARLA likely due to deadlock"
-                )
-                self.remove_bubble_object(carla_object, destroy=False)
-                continue
-            if (location.x, location.y, location.z) == (0, 0, 0):
-                continue
-
+                raise SimulationCreationError(
+                    f"Cannot read CARLA actor {getattr(carla_object, 'name', carla_object)}: "
+                    f"{error}. Aborting this run so METS-R can be reset."
+                ) from error
             vehicle_state = all_veh_data[carla_object]
             vehicle_id = self.getMetsrPrivateVehId(carla_object)
             records = live_private_records.get(str(vehicle_id), ())
@@ -3634,65 +3307,22 @@ class CosimSimulation(DrivingSimulation):
             # authoritative update or completed a native ownership transfer.
             cosim_record = records[0] if records else {}
 
-            raw_road_id, raw_lane_id = self._mapped_carla_observation(location)
-            (
-                authoritative_segment,
-                authoritative_lane,
-                logical_road,
-            ) = self._resolve_carla_owned_observation(
-                carla_object,
-                location,
-                raw_road_id,
-                raw_lane_id,
-                vehicle_state,
-                cosim_record,
-                vehicle_id=vehicle_id,
-            )
-            authoritative_connector_path = None
-            if self._is_controlled_connector_id(authoritative_segment):
-                authoritative_connector_path = self._connector_path_id_for_pose(
-                    authoritative_segment,
-                    location,
-                    cosim_record,
-                    vehicle_state,
-                )
-                if authoritative_connector_path is None:
-                    raise SimulationCreationError(
-                        f"Unable to resolve connectorPathId for CARLA-owned "
-                        f"vehicle {vehicle_id} on connector "
-                        f"{authoritative_segment!r}"
-                    )
-
             if self._is_pcla_controlled_ego(carla_object):
-                self._synchronize_pcla_ego_shadow(
-                    carla_object,
-                    vehicle_id,
-                    vehicle_state,
-                    cosim_record,
-                    location,
-                    authoritative_segment,
-                    authoritative_lane,
-                    logical_road,
-                    authoritative_connector_path,
-                )
-                synchronized_any = True
-                continue
+                self._clear_pcla_ego_reconciliation_state(carla_object)
 
             transform = actor.get_transform()
             bearing = _utils.get_metsr_rotation(transform.rotation.yaw)
-            try:
-                velocity = actor.get_velocity()
-                speed = math.sqrt(
-                    velocity.x * velocity.x
-                    + velocity.y * velocity.y
-                    + velocity.z * velocity.z
-                )
-            except Exception:
-                speed = vehicle_state.get("speed", 0.0)
+            velocity = actor.get_velocity()
+            speed = math.sqrt(
+                velocity.x * velocity.x
+                + velocity.y * velocity.y
+                + velocity.z * velocity.z
+            )
 
             pending_updates.append(
                 {
                     "object": carla_object,
+                    "location": location,
                     "vehicle_id": vehicle_id,
                     "x": location.x,
                     "y": -location.y,
@@ -3701,11 +3331,7 @@ class CosimSimulation(DrivingSimulation):
                     "speed": speed,
                     "private_veh": True,
                     "transform_coords": True,
-                    "authoritative_segment": authoritative_segment,
-                    "authoritative_lane": authoritative_lane,
-                    "authoritative_connector_path":
-                        authoritative_connector_path,
-                    "logical_road": logical_road,
+                    "handoff": self._native_handoff_target(carla_object, location),
                     "vehicle_state": vehicle_state,
                     "cosim_record": cosim_record,
                 }
@@ -3744,8 +3370,16 @@ class CosimSimulation(DrivingSimulation):
                 best_dist = dist
                 best_road = road
 
-        if best_road is None and len(unlocated_internal_segments) == 1:
-            return unlocated_internal_segments.pop()
+        if best_road is None and unlocated_internal_segments:
+            owners = {
+                self.metsr_internal_edge_to_connector[segment]
+                for segment in unlocated_internal_segments
+            }
+            # SUMO may split one CARLA junction lane into consecutive edges.
+            # They are unambiguous for ownership when every edge has one owner;
+            # the exact connector path is resolved separately from the pose.
+            if len(owners) == 1:
+                return min(unlocated_internal_segments)
         return best_road
 
     def _mapped_lane_query(self, road_lane):
@@ -3967,6 +3601,77 @@ class CosimSimulation(DrivingSimulation):
         cache[cache_key] = centerline
         return centerline
 
+    def _carla_connector_path_distance(self, connector_id, path_id, location):
+        """Measure the actual CARLA curves mapped to one native connector path.
+
+        Converted SUMO curves can differ from the physical CARLA lane. Only
+        exact via-lane mappings for the selected connector-local path qualify;
+        a nearby lane belonging to another movement is not an alternative.
+        """
+        path_id = self._normalized_connector_path_id(path_id)
+        if path_id is None:
+            return math.inf
+        cache = getattr(self, "_carla_connector_path_geometry", None)
+        if cache is None:
+            cache = self._carla_connector_path_geometry = {}
+        key = (str(connector_id), path_id)
+        if key not in cache:
+            paths = [record for record in self._connector_path_records(connector_id)
+                     if record["connectorPathId"] == path_id]
+            if len(paths) != 1:
+                return math.inf
+            reverse_mapping = getattr(self, "_sumo_lane_to_carla_keys", {})
+            carla_keys = {
+                str(carla_key)
+                for via_lane in paths[0].get("viaLaneIds", ())
+                for carla_key in reverse_mapping.get(str(via_lane), ())
+            }
+            if not carla_keys:
+                return math.inf
+            if getattr(self, "_carla_waypoints_by_key", None) is None:
+                if not callable(getattr(getattr(self, "map", None),
+                                        "generate_waypoints", None)):
+                    return math.inf
+                self._index_carla_waypoints()
+            polylines = []
+            for carla_key in sorted(carla_keys):
+                sections = {}
+                for waypoint in self._carla_waypoints_by_key.get(carla_key, ()):
+                    if not waypoint.is_junction:
+                        continue
+                    sections.setdefault(waypoint.section_id, []).append(waypoint)
+                # Never join separate roads, lanes, or lane sections: the
+                # artificial joining chord could otherwise admit an unrelated pose.
+                for waypoints in sections.values():
+                    points = []
+                    for waypoint in sorted(waypoints, key=lambda item: item.s):
+                        position = waypoint.transform.location
+                        point = (float(position.x), float(-position.y),
+                                 float(position.z))
+                        if not points or point != points[-1]:
+                            points.append(point)
+                    if len(points) >= 2:
+                        polylines.append(points)
+            cache[key] = polylines
+        point = (float(location.x), float(-location.y), float(location.z))
+        return min((self._point_to_polyline_distance_3d(point, line)
+                    for line in cache[key]), default=math.inf)
+
+    def _nearest_carla_connector_path(self, connector_id, location):
+        """Rank only the mapped physical paths of an already eligible connector."""
+        candidates = []
+        for record in self._connector_path_records(connector_id):
+            path_id = record["connectorPathId"]
+            distance = self._carla_connector_path_distance(
+                connector_id, path_id, location
+            )
+            if math.isfinite(distance):
+                candidates.append((distance, path_id))
+        if not candidates:
+            return None, math.inf
+        distance, path_id = min(candidates)
+        return path_id, distance
+
     def _nearest_mapped_connector_path_projection(
         self, position, mapped_lanes, connector_id=None
     ):
@@ -4053,7 +3758,39 @@ class CosimSimulation(DrivingSimulation):
         paths = self._connector_path_records(connector_id)
         if len(paths) == 1:
             return paths[0]["connectorPathId"]
+        # A junction branch may be selected while the nearest global waypoint
+        # still belongs to a crossing. Resolve its lane path from the same
+        # physical geometry used for selection, including during publication.
+        path_id, distance = self._nearest_carla_connector_path(connector_id, location)
+        if path_id is not None and distance <= CARLA_OWNED_PROJECTION_TOLERANCE:
+            return path_id
         return None
+
+    @staticmethod
+    def _point_to_polyline_distance_3d(point, polyline):
+        """Measure a pose against path geometry with an explicit elevation."""
+        if not polyline or any(len(vertex) < 3 for vertex in polyline):
+            return math.inf
+        points = [tuple(map(float, vertex[:3])) for vertex in polyline]
+        if not all(
+            math.isfinite(value) for vertex in [point, *points] for value in vertex
+        ):
+            return math.inf
+        if len(points) == 1:
+            return math.dist(point, points[0])
+        best = math.inf
+        for start, end in zip(points, points[1:]):
+            delta = tuple(b - a for a, b in zip(start, end))
+            length_squared = sum(value * value for value in delta)
+            ratio = (
+                sum((p - a) * d for p, a, d in zip(point, start, delta))
+                / length_squared
+                if length_squared else 0.0
+            )
+            ratio = min(1.0, max(0.0, ratio))
+            closest = tuple(a + ratio * d for a, d in zip(start, delta))
+            best = min(best, math.dist(point, closest))
+        return best
 
     @staticmethod
     def _point_to_polyline_distance(point, polyline):
@@ -4169,112 +3906,80 @@ class CosimSimulation(DrivingSimulation):
 
 
 
-    def update_bubble_objects(
-        self,
-        bubble_roads: list[Road],
-        bubble_intersections: list[Intersection],
-        *,
-        allow_promotion=True,
-        allow_demotion=True,
-        advance_spawn_guards=True,
-        count_density=True,
-        vehicle_data=None,
-    ) -> None:
+    def _initialize_promoted_carla_autopilot(self, obj, vehicle_state):
+        """Install default NPC control before its first moving CARLA tick.
+
+        A frame of uncontrolled movement can take an admitted actor past a
+        junction fork before Traffic Manager initializes its waypoint buffer.
+        The actor snapshot is not published yet, so plan from the same fresh
+        native pose used to spawn it instead of querying actor.get_location().
         """
-        Docstring for update_bubble_objects
-
-        :param bubble_roads: a list of Scenic lanes which constitute the cosimulation region
-        :type bubble_roads: list[Road]
-        :param intersections: a list of Scenic intersections which are contained or touching the cosimulated region
-                              (A lane must either intersect or have to connecting roads in the cosimulation region)
-        :type intersections: list[intersection]
-
-        Promote before the CARLA tick. CARLA-owned actors are demoted only by
-        the explicit connector-validated outbound handoff in
-        :meth:`synchronize_clients`; queried METS-R shadow fields never trigger
-        their removal.
-
-        Spawn new objects in the Cosimulation region if
-            (i)   Their is enough room in the obj's current location to spawn
-            (ii)  The vehicle is not currently waiting to spawn in a metsr queue
-
-        """
-        all_veh_data = (
-            vehicle_data
-            if vehicle_data is not None
-            else self._collect_metsr_vehicle_data(self.objects[1:])
+        if (
+            obj is getattr(self, "ego", None)
+            or getattr(obj, "pcla", None) is not None
+            or not getattr(obj, "autopilot_action", False)
+            or getattr(obj, "active_autopilot", False)
+            or getattr(obj, "trajectory", None) is not None
+        ):
+            return False
+        destination = self._vehicle_destination_road(obj, vehicle_state)
+        start = carla.Location(
+            float(vehicle_state["x"]), -float(vehicle_state["y"]),
+            float(vehicle_state.get("z") or 0.0),
         )
+        path = self.generate_carla_destination_trajectory(
+            destination, obj, target_start=start, vehicle_state=vehicle_state
+        )
+        self.tm.set_path(obj.carlaActor, path)
+        self.initiate_autopilot(obj)
+        obj.trajectory = path
+        obj._control = None
+        if not hasattr(self, "_carla_destination_plans"):
+            self._carla_destination_plans = {}
+        self._carla_destination_plans[obj] = (destination, path)
+        return True
+
+    def update_bubble_objects(
+        self, bubble_roads, bubble_intersections, *, vehicle_data=None,
+    ) -> None:
+        """Promote native vehicles in controlled segments before CARLA advances."""
+        all_veh_data = (vehicle_data if vehicle_data is not None
+                        else self._collect_metsr_vehicle_data(self.objects[1:]))
         self.bubble_roads_by_id = [road.id for road in self.bubble_roads]
         for obj in self.objects[1:]:
+            if obj in self.completed_route:
+                continue
             veh_data = all_veh_data[obj]
             metsr_road = _metsr_vehicle_road(veh_data)
-            if advance_spawn_guards:
-                obj.spawn_guard = max(
-                    0, obj.spawn_guard - self.sim_ticks_per_carla
-                )
-
-            # CARLA completion is recorded only after the authoritative CARLA
-            # segment reaches the destination. A missing/different shadow road
-            # cannot itself remove a CARLA-owned actor.
-            if obj.carla_actor_flag and obj in self.completed_route:
-                vehicle_id = self.pv_id_map.get(obj)
-                if vehicle_id is not None:
-                    getattr(self, "admitted_queue_vehicles", {}).pop(
-                        vehicle_id, None
-                    )
-                if allow_demotion:
-                    print(f"Removing obj: {obj.name} after completeing route")
-                    self.remove_bubble_object(obj) # TODO this is a feature for the case studies not the simulator interface itself
+            obj.spawn_guard = max(0, obj.spawn_guard - self.sim_ticks_per_carla)
+            if metsr_road is not None:
+                self.road_pop_density[metsr_road] += 1
+            if obj.carla_actor_flag:
                 continue
-            if not obj.carla_actor_flag and metsr_road is None:
-                # generateTripsByRoad adds new native vehicles to METS-R's
-                # pending-entry queue. Such a vehicle has no segment until it
-                # is admitted on a later tick; that is not route completion.
-                if veh_data.get("queuedRoadId") is not None:
-                    continue
-                if obj not in self.completed_route:
+            if metsr_road is None:
+                # A new trip has no segment while it waits for native admission.
+                if veh_data.get("queuedRoadId") is None:
                     self.completed_route[obj] = True
                     obj.finished_route = self.count
                 continue
-            if metsr_road is not None and count_density:
-                self.road_pop_density[metsr_road] += 1
-
-            if obj.carla_actor_flag:
-                outside_bubble = False
-            elif self._vehicle_record_in_cosim_region(veh_data):
-                outside_bubble = False
-            else:
-                outside_bubble = True
-
-            # Remove vehicles which have left the cosimulation region and spawn vehicles which have entered
-            if outside_bubble:
-                if obj.carla_actor_flag and allow_demotion:
-                    if obj.spawn_guard == 0: # only remove vehicles AFTER entering a new non-CoSim road
-                        print(f"Removing bubble object: {obj.name} at {self.count} with road: {metsr_road} at step {self.count}")
-                        print(f"Obj was in position {obj.position} with metsr position: {veh_data['x'], veh_data['y']}" )
-                        self.remove_bubble_object(obj)
-                    else:
-                        continue
-
-            else:  # inside bubble
-                if not obj.carla_actor_flag and allow_promotion:
-                    success = self.createObjectInCarla(obj,update_velocity=True)
-                    if success:
-                        print(f'creating Obj: {obj.name} : METS-R properties were: {veh_data["x"], veh_data["y"]} with road: {metsr_road} at {self.count}')
-                        self.carla_actors.append(obj)
-                        self._initialize_carla_authoritative_segment(
-                            obj, veh_data, veh_data
-                        )
-                        if obj in self.metsr_actors:
-                            self.metsr_actors.remove(obj)
-                        vehicle_id = self.pv_id_map.get(obj)
-                        if vehicle_id is not None:
-                            getattr(self, "admitted_queue_vehicles", {}).pop(
-                                vehicle_id, None
-                            )
-
-
-
+            if not self._vehicle_record_in_cosim_region(veh_data):
+                continue
+            if not self.createObjectInCarla(obj, update_velocity=True, native_state=veh_data):
+                # Already-present native vehicles need the same bounded spawn
+                # retry as vehicles admitted through enterRoadFromQueue.
+                self._ensure_queue_admission_state()
+                self.admitted_queue_vehicles.setdefault(self.pv_id_map[obj], {
+                    "roadId": metsr_road, "admittedAt": self.count,
+                })
+                continue
+            self._initialize_carla_authoritative_segment(obj, veh_data, veh_data)
+            self._initialize_promoted_carla_autopilot(obj, veh_data)
+            # Commit promotion only after velocity and controller initialization.
+            self.carla_actors.append(obj)
+            if obj in self.metsr_actors:
+                self.metsr_actors.remove(obj)
+            vehicle_id = self.pv_id_map.get(obj)
+            getattr(self, "admitted_queue_vehicles", {}).pop(vehicle_id, None)
 
     def _ensure_connector_ownership_state(self):
         """Initialize connector ownership for lightweight/legacy instances."""
@@ -4580,7 +4285,7 @@ class CosimSimulation(DrivingSimulation):
         self._commit_takeover_ownership(requested, *ownership)
 
 
-    def release_roads(self, keys: list[str]) -> None:
+    def release_roads(self, keys: list[str], *, allow_defer=False) -> None:
         """Return controlled roads to METS-R and update shared connectors."""
         keys = sorted({str(key) for key in keys})
         if not keys:
@@ -4596,13 +4301,22 @@ class CosimSimulation(DrivingSimulation):
                     f"Cannot release unrepresented METS-R road {key!r}"
                 )
 
-            # The updated server guarantees release for valid roads. Any error
-            # response is therefore a fatal contract violation; Scenic neither
-            # retries nor mutates its local ownership state.
-            response = _require_all_success_control_response(
-                self.metsr_client.release_cosim_road(key),
-                "releaseCoSimRoad",
-            )
+            # Commit local release only after native placement succeeds. The
+            # server can reject a release when vehicle placement is blocked.
+            response = self.metsr_client.release_cosim_road(key)
+            if allow_defer and isinstance(response, dict):
+                records = response.get("data")
+                if (response.get("messageType") == "releaseCoSimRoad"
+                        and response.get("status") in ("ok", "partial")
+                        and isinstance(records, (list, tuple)) and len(records) == 1
+                        and isinstance(records[0], dict)
+                        and str(records[0].get("roadId")) == key
+                        and records[0].get("status") == "error"
+                        and records[0].get("errorCode") == "RELEASE_BLOCKED"
+                        and records[0].get("retryable") is True):
+                    # Keep the road owned and reconsider it on the next step.
+                    continue
+            _require_all_success_control_response(response, "releaseCoSimRoad")
             records = [
                 record
                 for record in response.get("data", ())
@@ -5055,15 +4769,8 @@ class CosimSimulation(DrivingSimulation):
             return
         self._cosim_destroyed = True
 
-        release_error = None
-        try:
-            # Finish the ownership lifecycle while METS-R is still available.
-            # release_roads validates every response and never retries; an error
-            # is retained while the remaining local cleanup is completed below.
-            self.release_roads(list(getattr(self, "carla_control_roads", ())))
-        except Exception as error:
-            release_error = error
-
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error = None
         verbosePrint("Closing METS-R visualization server")
         print("Logging trip times")
         print("=" * 25)
@@ -5073,6 +4780,21 @@ class CosimSimulation(DrivingSimulation):
             except Exception as error:
                 self._report_cleanup_failure("logging trip times", error)
         print("=" * 25)
+
+        # Log first. Reset an aborted run (or a blocked release) using the
+        # existing server lifecycle, without counting interrupted trips as arrivals.
+        try:
+            if active_error:
+                self.metsr_client.reset()
+            else:
+                try:
+                    self.release_roads(list(getattr(self, "carla_control_roads", ())))
+                except Exception as error:
+                    self._report_cleanup_failure("releasing METS-R roads; resetting the run", error)
+                    self.metsr_client.reset()
+        except Exception as error:
+            cleanup_error = error
+            self._report_cleanup_failure("resetting METS-R during cleanup", error)
 
         # METSR destroy
         try:
@@ -5098,7 +4820,14 @@ class CosimSimulation(DrivingSimulation):
             except Exception as error:
                 self._report_cleanup_failure("destroying a boundary vehicle", error)
         # "CARLA destroy"
-        for obj in tuple(getattr(self, "carla_actors", ())):
+        cleanup_objects = list(getattr(self, "carla_actors", ()))
+        # Include actors whose initialization failed before promotion completed.
+        cleanup_objects.extend(
+            obj for obj in getattr(self, "objects", ())
+            if getattr(obj, "carlaActor", None) is not None
+            and not any(obj is existing for existing in cleanup_objects)
+        )
+        for obj in cleanup_objects:
             try:
                 self._destroy_carla_object_during_teardown(obj)
             except Exception as error:
@@ -5116,8 +4845,8 @@ class CosimSimulation(DrivingSimulation):
         except Exception as error:
             self._report_cleanup_failure("finalizing the Scenic simulation", error)
 
-        if release_error is not None:
-            raise release_error
+        if cleanup_error is not None and not active_error:
+            raise cleanup_error
 
     def map_scenic_to_metsr_road(self, road: Road) -> list[str]:
         """Maps Scenic road to equvialent METSR roads, 1->M mapping"""
@@ -5143,13 +4872,29 @@ class CosimSimulation(DrivingSimulation):
         """Returns the intersection the obj is on if any"""
         return self.network_helper._get_intersection(obj, road)
 
-    def _get_bubble_roads(self, bubble_region: CircularRegion | None = None) -> list[Lane]:
-        """Collect all roads which overlap the designated bubble region"""
-        if bubble_region == None: # Default is attached to ego
+    def _get_bubble_roads(self, bubble_region: CircularRegion | None = None) -> list[Road]:
+        """Select nearby roads connected to the ego's current CARLA road layer."""
+        if bubble_region is None:
             bubble_region = self.ego.bubble
-        else:
-            bubble_region = bubble_region # User specified (for added functionality later)
-        return self.network_helper._get_bubble_roads(bubble_region)
+        actor = getattr(self.ego, "carlaActor", None)
+        location = (
+            actor.get_location() if actor is not None
+            else utils.scenicToCarlaLocation(self.ego.position)
+        )
+        waypoint, _ = self._projected_carla_driving_waypoint(location)
+        if waypoint is None:
+            raise SimulationCreationError(
+                "Cannot determine the ego's CARLA road for bubble selection"
+            )
+        roads = self.network_helper._get_bubble_roads(
+            bubble_region, anchor_road_id=waypoint.road_id
+        )
+        if not roads:
+            raise SimulationCreationError(
+                "The ego's CARLA road is absent from the Scenic bubble: "
+                f"road={waypoint.road_id}, location={location}"
+            )
+        return roads
 
 
     def executeActions(self, allActions) -> None:
@@ -5244,7 +4989,9 @@ class CosimSimulation(DrivingSimulation):
             "vehicle", vehicle_id,
         )
         destination = self._vehicle_destination_road(obj, state)
-        path = self.generate_carla_destination_trajectory(destination, obj)
+        path = self.generate_carla_destination_trajectory(
+            destination, obj, vehicle_state=state
+        )
         if not hasattr(self, "_carla_destination_plans"):
             self._carla_destination_plans = {}
         self._carla_destination_plans[obj] = (destination, path)
@@ -5267,13 +5014,15 @@ class CosimSimulation(DrivingSimulation):
             current_destination = self._vehicle_destination_road(obj, vehicle_data[obj])
             if current_destination == destination:
                 continue
-            new_path = self.generate_carla_destination_trajectory(current_destination, obj)
+            new_path = self.generate_carla_destination_trajectory(
+                current_destination, obj, vehicle_state=vehicle_data[obj]
+            )
             self.tm.set_path(obj.carlaActor, new_path)
             obj.trajectory = new_path
             plans[obj] = (current_destination, new_path)
 
     def generate_carla_destination_trajectory(
-        self, destination_road_id, obj, *, target_start=None
+        self, destination_road_id, obj, *, target_start=None, vehicle_state=None
     ):
         """Choose a CARLA route to any reachable driving lane on the target road."""
         destination = str(destination_road_id)
@@ -5344,7 +5093,27 @@ class CosimSimulation(DrivingSimulation):
                 )
                 previous = location
             if length < best_length:
-                best_path, best_length = locations, length
+                # Traffic Manager's ImportPath selects junction branches by
+                # their exit road relative to the next imported coordinate.
+                # Dense points inside a junction instead make it choose the
+                # exit nearest that interior point, which can be another turn.
+                # Keep the CARLA-planned exit anchors and ordinary road curves;
+                # use the complete trace above when comparing route lengths.
+                anchors = []
+                for waypoint, _ in trace:
+                    if waypoint.is_junction:
+                        continue
+                    projected = self.map.get_waypoint(waypoint.transform.location)
+                    if projected is None or projected.is_junction:
+                        # A road entry may share its exact coordinates with the
+                        # junction endpoint. Use the next point inside the road.
+                        continue
+                    anchors.append(waypoint)
+                if not anchors or not on_destination(anchors[-1]):
+                    failures.append(f"{lane}: no unambiguous destination road anchor")
+                    continue
+                best_path = [waypoint.transform.location for waypoint in anchors]
+                best_length = length
         if best_path is not None:
             return best_path
         detail = failures[0] if failures else "no mapped destination lane has a CARLA anchor"
