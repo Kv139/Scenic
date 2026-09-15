@@ -42,6 +42,7 @@ PENDING_LANE_RECONCILIATION_MAX_HEADING_DELTA = 30.0
 PENDING_LANE_RECONCILIATION_MAP_TOLERANCE = 4.25
 PENDING_LANE_RECONCILIATION_COLLISION_MARGIN = 0.5
 CARLA_OWNED_PROJECTION_TOLERANCE = 4.25
+METSR_BOUNDARY_DISTANCE = 15.0
 METSR_CONNECTOR_NO_LANE = -1
 ROAD_OBSERVATION_UNKNOWN = "unknown"
 ROAD_OBSERVATION_SAME = "same"
@@ -1429,14 +1430,18 @@ class CosimSimulation(DrivingSimulation):
     def _synchronize_boundary_vehicles(self):
         """Mirror native exit occupancy without acquiring METS-R vehicle control.
 
-        Boundary membership is selected by METS-R. Its coordinateTrail contains
-        upcoming route points, so a separate batched vehicle query supplies the
-        current pose. Obstacles stay fixed throughout all CARLA substeps.
+        METS-R selects vehicles within 10 meters of downstream lane entries.
+        Its coordinateTrail contains upcoming route points, so a separate
+        batched vehicle query supplies the current pose. Obstacles stay fixed
+        throughout all CARLA substeps.
         """
         if not hasattr(self, "boundary_actors"):
             self.boundary_actors = {}
         response = _require_all_success_control_response(
-            self.metsr_client.query_boundary_vehicle(), "boundaryVehicle"
+            self.metsr_client.query_boundary_vehicle(
+                boundary_dist=METSR_BOUNDARY_DISTANCE
+            ),
+            "boundaryVehicle",
         )
         if not isinstance(response.get("data"), (list, tuple)):
             raise METSRControlError("boundaryVehicle omitted data", response=response)

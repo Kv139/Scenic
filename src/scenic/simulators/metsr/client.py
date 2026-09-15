@@ -2553,22 +2553,38 @@ class METSRClient:
     # Historical camel-case spelling retained for source compatibility.
     query_coSimVehicle = query_cosim_vehicle
 
-    def query_boundary_vehicle(self):
+    def query_boundary_vehicle(self, boundary_dist=10.0):
         """Query native vehicles blocking exits from controlled connectors.
 
         Sends ``boundaryVehicle`` (the server's ``queryBoundaryVeh`` handler).
-        No input data is required. METS-R selects vehicles on native downstream
-        roads whose distance from their current lane's entry is strictly less
-        than 1.2 times their length. The query does not change vehicle control
-        or reserve a connector.
+        Sends the top-level ``boundaryDist`` parameter in meters. METS-R selects
+        vehicles on native downstream roads whose distance from their current
+        lane's entry is strictly less than this threshold. The query does not
+        change vehicle control or reserve a connector.
 
         Records use the :meth:`query_cosim_vehicle` schema, with the actual
         native road/lane and ``controlMode='native'``. Use ``vehicleId`` together
         with ``isPrivate`` as the identity, and :meth:`query_vehicle` with
         ``transform_coords=True`` for current positions and headings.
+
+        Parameters
+        ----------
+        boundary_dist : float, optional
+            Finite, non-negative distance from the lane entry in meters.
+            Defaults to 10 meters; zero selects no vehicles.
         """
+        error = "boundary_dist must be a finite, non-negative distance in meters"
+        if isinstance(boundary_dist, bool):
+            raise ValueError(error)
+        try:
+            boundary_dist = float(boundary_dist)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(error) from exc
+        if not math.isfinite(boundary_dist) or boundary_dist < 0.0:
+            raise ValueError(error)
         res = self.send_receive_msg(
-            {"messageType": "boundaryVehicle"}, ignore_heartbeats=True
+            {"messageType": "boundaryVehicle", "boundaryDist": boundary_dist},
+            ignore_heartbeats=True,
         )
         assert res["messageType"] == "boundaryVehicle", res["messageType"]
         return res
