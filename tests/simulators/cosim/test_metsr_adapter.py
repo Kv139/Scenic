@@ -9,27 +9,26 @@ import unittest
 from unittest.mock import patch
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.carla.utils import routing as carla_routing
+from scenic.simulators.carla import coordinate_utils, routing_utils as carla_routing
 from scenic.simulators.cosim import (
-    cosim_routing_utils as bubble_routing,
-    cosim_utils as runtime,
+    bubble_utils as bubble_routing,
+    runtime_utils as runtime,
 )
-from scenic.simulators.cosim.cosim_utils import (
+from scenic.simulators.cosim.runtime_utils import (
     render_step_interval as _render_step_interval,
 )
 from scenic.simulators.cosim.simulator import carla
-from scenic.simulators.cosim.utils import utils as cosim_utils
 from scenic.simulators.metsr import (
-    cosim_routing_utils as routing,
-    cosim_utils as native,
-    network as metsr_network,
+    bridge_utils as native,
+    network_utils as metsr_network,
+    routing_utils as routing,
 )
-from scenic.simulators.metsr.cosim_utils import (
+from scenic.simulators.metsr.bridge_utils import (
     COSIM_ADMISSION_SPAWN_MAX_TICKS,
     METSRControlError,
     METSRCosimState,
 )
-from scenic.simulators.metsr.network import NetworkMetadata
+from scenic.simulators.metsr.network_utils import NetworkMetadata
 from tests.simulators.cosim.helpers import Vehicle, make_simulation, metsr_response
 
 
@@ -270,9 +269,7 @@ class AdapterStateTests(unittest.TestCase):
         destination_waypoint = SimpleNamespace(road_id=100, lane_id=1)
 
         simulation = make_simulation()
-        simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: origin_lane
-        )
+        obj._lane = origin_lane
         simulation.metsr_state.metadata = replace(
             simulation.metsr_state.metadata,
             lane_mapping={"333_5": [":332_0_4"], "100_1": ["D_0"]},
@@ -399,9 +396,7 @@ class AdapterStateTests(unittest.TestCase):
         )
         calls = {"initialize": [], "route": []}
         simulation = make_simulation()
-        simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: SimpleNamespace(road=SimpleNamespace(id=1), id=1)
-        )
+        obj._lane = SimpleNamespace(road=SimpleNamespace(id=1), id=1)
         simulation.metsr_state.metadata = replace(
             simulation.metsr_state.metadata, lane_mapping={"1_1": ["A_0"], "2_1": ["D_0"]}
         )
@@ -521,9 +516,7 @@ class AdapterStateTests(unittest.TestCase):
         destination_waypoint = SimpleNamespace(road_id=100, lane_id=1)
 
         simulation = make_simulation()
-        simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: origin_lane
-        )
+        obj._lane = origin_lane
         simulation.metsr_state.metadata = replace(
             simulation.metsr_state.metadata,
             lane_mapping={"333_5": ["A_0"], "100_1": ["D_0"]},
@@ -587,9 +580,7 @@ class AdapterStateTests(unittest.TestCase):
         # netOffset removed. SUMO truncates this driving lane to four metres.
         obj.position = type(obj.position)(-5.303203, -378.247755)
         obj.width = 2.1
-        simulation.network_helper._nearest_lane = lambda target: SimpleNamespace(
-            road=SimpleNamespace(id=64), id=-3
-        )
+        obj._lane = SimpleNamespace(road=SimpleNamespace(id=64), id=-3)
         simulation.metsr_state.metadata = replace(
             simulation.metsr_state.metadata,
             lane_mapping={
@@ -1315,9 +1306,6 @@ class AdapterStateTests(unittest.TestCase):
             simulation.metsr_state.metadata,
             lane_indices={lane: index for index, lane in enumerate(sorted(lane_ids))},
         )
-        simulation.network_helper = SimpleNamespace(
-            metsr_represented_roads=set(map(str, represented_roads))
-        )
         simulation.metsr_state.valid_roads = list(map(str, represented_roads))
         return simulation
 
@@ -1470,7 +1458,6 @@ class AdapterStateTests(unittest.TestCase):
             ),
         )
         simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: waypoint)
-        simulation.network_helper = SimpleNamespace()
         simulation.metsr_state.metadata = replace(
             simulation.metsr_state.metadata, lane_mapping={"334_4": [":332_8_2"]}
         )
@@ -2104,13 +2091,8 @@ class AdapterStateTests(unittest.TestCase):
         simulation._service_metsr_entering_queues = lambda: events.append(
             ("queues", None)
         )
-        simulation.get_bubble_intersections = lambda **kwargs: []
         helper_patch = patch.object(
-            bubble_routing,
-            "get_bubble_intersections",
-            lambda _simulation, *args, **kwargs: simulation.get_bubble_intersections(
-                *args, **kwargs
-            ),
+            bubble_routing, "intersections_for_roads", return_value=[]
         )
         self.addCleanup(helper_patch.stop)
         helper_patch.start()
@@ -2423,10 +2405,10 @@ class AdapterStateTests(unittest.TestCase):
         )
 
         with patch(
-            "scenic.simulators.cosim.cosim_utils.utils.scenicToCarlaLocation",
+            "scenic.simulators.cosim.runtime_utils.utils.scenicToCarlaLocation",
             return_value=carla.Location(x=1.0, y=2.0, z=0.0),
         ), patch(
-            "scenic.simulators.cosim.cosim_utils.utils.scenicToCarlaRotation",
+            "scenic.simulators.cosim.runtime_utils.utils.scenicToCarlaRotation",
             return_value=carla.Rotation(),
         ):
             self.assertFalse(simulation.createObjectInCarla(obj))
@@ -2810,7 +2792,7 @@ class AdapterStateTests(unittest.TestCase):
         args, kwargs = teleport_calls[0]
         self.assertEqual(args[:3], (7, 10.0, 2.0))
         self.assertEqual(kwargs["z"], 0.5)
-        self.assertEqual(kwargs["bearing"], cosim_utils.get_metsr_rotation(15.0))
+        self.assertEqual(kwargs["bearing"], coordinate_utils.carlaToCompassBearing(15.0))
         self.assertNotIn("segment_id", kwargs)
         self.assertNotIn("lane_index", kwargs)
         self.assertEqual(kwargs["speed"], 5.0)

@@ -6,9 +6,9 @@ from unittest.mock import Mock
 import pytest
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.cosim import cosim_utils
+from scenic.simulators.cosim import runtime_utils
 from scenic.simulators.cosim.simulator import CosimSimulation, carla
-from scenic.simulators.metsr.cosim_utils import METSRControlError, METSRCosimState
+from scenic.simulators.metsr.bridge_utils import METSRControlError, METSRCosimState
 
 
 def response(message_type, data):
@@ -114,10 +114,10 @@ def boundary_simulation(monkeypatch):
 
     simulation.blueprintLib = SimpleNamespace(find=find)
     monkeypatch.setattr(
-        "scenic.simulators.cosim.cosim_utils.carModels", ["vehicle.test.car"]
+        "scenic.simulators.cosim.runtime_utils.carModels", ["vehicle.test.car"]
     )
     monkeypatch.setattr(
-        "scenic.simulators.cosim.cosim_utils.busModels", ["vehicle.test.bus"]
+        "scenic.simulators.cosim.runtime_utils.busModels", ["vehicle.test.bus"]
     )
     records = [
         {
@@ -165,9 +165,7 @@ def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(
 ):
     simulation, _, states, queries = boundary_simulation
     simulation._synchronize_boundary_vehicles()
-    simulation.metsr_client.query_boundary_vehicle.assert_called_once_with(
-        boundary_dist=15.0
-    )
+    simulation.metsr_client.query_boundary_vehicle.assert_called_once_with()
     actor = simulation.boundary_actors[(True, "42")]
     assert actor.type_id.startswith("vehicle.")
     assert actor.attributes["role_name"] == "metsr_boundary_private_42"
@@ -191,7 +189,7 @@ def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(
     simulation.tick_carla()
     assert simulation.carla_world.tick_poses == [[(actor.id, 10.0, False)]] * 3
     simulation._synchronize_boundary_vehicles()
-    simulation.metsr_client.query_boundary_vehicle.assert_called_with(boundary_dist=15.0)
+    simulation.metsr_client.query_boundary_vehicle.assert_called_with()
     assert simulation.metsr_client.query_boundary_vehicle.call_count == 2
     assert simulation.boundary_actors[(True, "42")] is actor
     assert len(simulation.carla_world.actors) == 1
@@ -354,5 +352,5 @@ def test_failed_obstacle_configuration_remains_tracked_for_cleanup(
     with pytest.raises(RuntimeError, match="CARLA configuration failed"):
         simulation._synchronize_boundary_vehicles()
     assert len(simulation.boundary_actors) == 1
-    cosim_utils.remove_boundary_actor(simulation, (True, "42"))
+    runtime_utils.remove_boundary_actor(simulation, (True, "42"))
     assert simulation.carla_world.actors[0].destroy_calls == 1

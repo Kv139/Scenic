@@ -9,15 +9,15 @@ import networkx as nx
 import pytest
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.carla.utils import routing as carla_routing
-from scenic.simulators.cosim import cosim_utils as runtime
+from scenic.simulators.carla import routing_utils as carla_routing
+from scenic.simulators.carla.global_route_planner import GlobalRoutePlanner
+from scenic.simulators.cosim import runtime_utils as runtime
 from scenic.simulators.cosim.simulator import CosimSimulation, carla
-from scenic.simulators.cosim.utils.global_route_planner import GlobalRoutePlanner
 from scenic.simulators.metsr import (
-    cosim_routing_utils as routing,
-    network as metsr_network,
+    network_utils as metsr_network,
+    routing_utils as routing,
 )
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
 
 
 class Vehicle(SimpleNamespace):

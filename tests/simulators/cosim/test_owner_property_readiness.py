@@ -6,10 +6,10 @@ from unittest.mock import Mock
 import pytest
 
 from scenic.core.vectors import Orientation, Vector
-from scenic.simulators.carla.utils import actors as actor_utils
+from scenic.simulators.carla import actor_utils
 from scenic.simulators.cosim.simulator import CosimSimulation, carla
-from scenic.simulators.metsr import cosim_utils as native
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
+from scenic.simulators.metsr import bridge_utils as native
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
 from tests.simulators.cosim.helpers import make_admission_simulation
 
 

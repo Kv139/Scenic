@@ -3,9 +3,9 @@
 import math
 from types import SimpleNamespace
 
-from scenic.simulators.metsr import cosim_routing_utils as routing
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
-from scenic.simulators.metsr.network import NetworkMetadata
+from scenic.simulators.metsr import routing_utils
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
+from scenic.simulators.metsr.network_utils import NetworkMetadata
 
 
 def test_bubble_selection_repairs_shared_fragments_without_committing_state():
@@ -22,7 +22,7 @@ def test_bubble_selection_repairs_shared_fragments_without_committing_state():
     state.active_bubble_roads = {"old"}
     source = [first]
 
-    selection = routing.classify_bubble_roads(
+    selection = routing_utils.classify_bubble_roads(
         state, source, {"first": first, "second": second}
     )
 
@@ -34,7 +34,7 @@ def test_bubble_selection_repairs_shared_fragments_without_committing_state():
     assert state.controlled_roads == {"old": True}
     assert state.active_bubble_roads == {"old"}
     # Selecting both fragments still proposes only one native takeover.
-    together = routing.classify_bubble_roads(
+    together = routing_utils.classify_bubble_roads(
         state, [first, second], {"first": first, "second": second}
     )
     assert together == selection
@@ -57,8 +57,8 @@ def test_road_and_lane_selection_share_projection_cache_and_tie_order():
     client = SimpleNamespace(query_centerline=centerline)
     lanes = ["road_9", "road_4", "road_5"]  # The first lane is filtered out.
     position = (12.0, 1.0, 0.0)
-    assert routing.identify_nearest_road(state, client, position, lanes) == "road"
-    lane, distance, terminal = routing.nearest_mapped_lane_projection(
+    assert routing_utils.identify_nearest_road(state, client, position, lanes) == "road"
+    lane, distance, terminal = routing_utils.nearest_mapped_lane_projection(
         state, client, position, lanes, "road"
     )
     assert lane == 0

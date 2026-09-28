@@ -16,9 +16,9 @@ if errors.verbosityLevel == 0:  # suppress pygame advertisement at zero verbosit
 import pygame
 
 from scenic.domains.driving.simulators import DrivingSimulation, DrivingSimulator
-from scenic.simulators.carla.utils import actors as carla_actor_utils
-import scenic.simulators.carla.utils.utils as utils
-import scenic.simulators.carla.utils.visuals as visuals
+from scenic.simulators.carla import actor_utils as carla_actor_utils
+import scenic.simulators.carla.coordinate_utils as utils
+import scenic.simulators.carla.visualization_utils as visuals
 from scenic.syntax.veneer import verbosePrint
 
 

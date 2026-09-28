@@ -56,7 +56,7 @@ try:
     from scenic.simulators.carla.simulator import CarlaSimulator    # for use in scenarios
     from scenic.simulators.carla.actions import *
     from scenic.simulators.carla.actions import _CarlaVehicle, _CarlaPedestrian
-    import scenic.simulators.carla.utils.utils as _utils
+    import scenic.simulators.carla.coordinate_utils as _utils
 except ModuleNotFoundError:
     # for convenience when testing without the carla package
     from scenic.core.simulators import SimulatorInterfaceWarning

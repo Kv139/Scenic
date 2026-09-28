@@ -1,6 +1,6 @@
 """Orchestrate CARLA/METS-R co-simulation and vehicle ownership.
 
-Native state, protocol handling, and routing live in ``metsr``. CARLA actor
+Native state, protocol handling, and native routing live in ``metsr``. CARLA actor
 support and controller integration live in the local utility modules.
 """
 
@@ -15,33 +15,31 @@ from scenic.core.regions import CircularRegion
 from scenic.core.simulators import SimulationCreationError
 from scenic.core.vectors import Orientation, Vector
 from scenic.domains.driving.simulators import DrivingSimulation, DrivingSimulator
-from scenic.simulators.carla.utils import actors as carla_actor_utils
-import scenic.simulators.cosim.utils.utils as _utils
-from scenic.simulators.metsr import (
-    cosim_routing_utils as metsr_routing,
-    cosim_utils as metsr_utils,
-    network as metsr_network,
-)
+from scenic.simulators.carla import actor_utils, coordinate_utils
+from scenic.simulators.carla.global_route_planner import GlobalRoutePlanner
+from scenic.simulators.cosim import pcla_utils, runtime_utils
+from scenic.simulators.metsr import bridge_utils, network_utils, routing_utils
+from scenic.simulators.metsr.bridge_utils import METSRControlError, METSRCosimState
 from scenic.simulators.metsr.client import METSRClient
-from scenic.simulators.metsr.cosim_utils import METSRControlError, METSRCosimState
-from scenic.simulators.metsr.util import build_metsr_vis_url
+from scenic.simulators.metsr.server_utils import build_metsr_vis_url
 from scenic.syntax.veneer import verbosePrint
-
-from . import cosim_utils as runtime, pcla_utils
-from .utils.global_route_planner import GlobalRoutePlanner
-from .utils.network_helper import network_cache
 
 try:
     import carla
 except ImportError as e:
     raise ModuleNotFoundError('CARLA scenarios require the "carla" Python package') from e
 
-from . import cosim_routing_utils as routing
-
-METSR_BOUNDARY_DISTANCE = 15.0
+from scenic.simulators.cosim import bubble_utils
 
 
 class CosimSimulator(DrivingSimulator):
+    """Reusable CARLA/METS-R connections and options for one implementation.
+
+    Scenic calls createSimulation for each run. CosimSimulation below is that
+    per-run state, not a second simulator backend. Rendering is controlled by
+    render, CARLA recording by record, and run statistics by run_name.
+    """
+
     def __init__(
         self,
         carla_map,
@@ -86,7 +84,7 @@ class CosimSimulator(DrivingSimulator):
 
         self.map_path = map_path
         self.network_metadata = (
-            metsr_network.load_network_metadata(xml_map)
+            network_utils.load_network_metadata(xml_map)
             if network_metadata is None
             else network_metadata
         )
@@ -96,7 +94,9 @@ class CosimSimulator(DrivingSimulator):
         self.record = record
         self.run_name = run_name
         self.metsr_sim_dir = metsr_sim_dir
-        self.metsr_render_freq = runtime.render_step_interval(timestep, metsr_render_freq)
+        self.metsr_render_freq = runtime_utils.render_step_interval(
+            timestep, metsr_render_freq
+        )
 
         # Setting up the Carla Simulator
         verbosePrint(f"Connection to CARLA on port {carla_port}")
@@ -155,8 +155,8 @@ class CosimSimulator(DrivingSimulator):
     def createSimulation(self, scene, *, timestep, **kwargs):
         if timestep is not None and timestep != self.timestep:
             raise RuntimeError(
-                "cannot customize timestep for individual CARLA simulations; "
-                "set timestep when creating the CarlaSimulator instead"
+                "cannot customize timestep for individual co-simulations; "
+                "set timestep when creating the CosimSimulator instead"
             )
         return CosimSimulation(
             scene=scene,
@@ -188,7 +188,10 @@ class CosimSimulator(DrivingSimulator):
 
 
 class CosimSimulation(DrivingSimulation):
-    """Coordinate simulator ticks, vehicle ownership, and Scenic actions."""
+    """One run created by CosimSimulator, following Scenic's Simulation lifecycle.
+
+    All rendering, recording, and controller options share this execution path.
+    """
 
     def __init__(
         self,
@@ -228,7 +231,9 @@ class CosimSimulation(DrivingSimulation):
         self._carla_waypoints_by_key = None
         self.count = 0
         self.metsr_viz_port = metsr_viz_port
-        self.metsr_render_freq = runtime.render_step_interval(timestep, metsr_render_freq)
+        self.metsr_render_freq = runtime_utils.render_step_interval(
+            timestep, metsr_render_freq
+        )
         self.stream_url = f"ws://127.0.0.1:{self.metsr_viz_port}"
 
         # CoSim related params
@@ -264,7 +269,9 @@ class CosimSimulation(DrivingSimulation):
 
         self.metsr_state.valid_roads = self.metsr_client.query_road()["roadIds"]
 
-        self.network_helper = network_cache(self.workspace)
+        self.bubble_topology = bubble_utils.BubbleTopology.from_network(
+            self.workspace.network
+        )
 
         self.grp = GlobalRoutePlanner(self.map, sampling_resolution=2.0)
 
@@ -276,7 +283,7 @@ class CosimSimulation(DrivingSimulation):
                 self.carla_world.set_weather(carla.WeatherParameters(**weather))
 
         if self.render:
-            runtime.initialize_display(self)
+            runtime_utils.initialize_display(self)
 
         if self.record:
             print("starting recording")
@@ -317,13 +324,13 @@ class CosimSimulation(DrivingSimulation):
         self.carla_world.tick()
 
         if self.render:
-            runtime.initialize_camera(self)
+            runtime_utils.initialize_camera(self)
 
         self.carla_world.tick()  ## allowing manualgearshift to take effect
 
         # The core reads every object's properties immediately after setup,
         # including native NPCs which have not reached the first step yet.
-        self.obj_data_cache = metsr_utils.collect_metsr_vehicle_data(
+        self.obj_data_cache = bridge_utils.collect_metsr_vehicle_data(
             self.metsr_client,
             {
                 obj: self.getMetsrPrivateVehId(obj)
@@ -343,13 +350,13 @@ class CosimSimulation(DrivingSimulation):
         self, obj: Object, route_generation_attempts=100, origin: str = None
     ) -> None:
         """Choose a reachable destination and create a native or CARLA-owned trip."""
-        requested = metsr_routing.select_spawn_placement(self, obj, origin)
-        obj.route = metsr_routing.choose_destination_route(
+        requested = routing_utils.select_spawn_placement(self, obj, origin)
+        obj.route = routing_utils.choose_destination_route(
             self, obj, requested, route_generation_attempts
         )
         vehicle_id = self.getMetsrPrivateVehId(obj)
         if not requested["is_cosim"]:
-            metsr_utils.require_metsr_response(
+            bridge_utils.require_metsr_response(
                 self.metsr_client.generate_trip_between_roads(
                     vehID=vehicle_id, origin=obj.route[0], destination=obj.route[-1]
                 ),
@@ -372,7 +379,7 @@ class CosimSimulation(DrivingSimulation):
             destination_road_id=obj.route[-1],
         )
         try:
-            placement = metsr_utils.require_metsr_response(
+            placement = bridge_utils.require_metsr_response(
                 self.metsr_client.initialize_cosim_vehicle(
                     **pose,
                     segment_id=requested["segment_id"],
@@ -389,14 +396,14 @@ class CosimSimulation(DrivingSimulation):
                 raise
             # Adjacent road geometry can reject a road hint at a junction.
             # Retry road placement once, preserving exact connector selections.
-            placement = metsr_utils.require_metsr_response(
+            placement = bridge_utils.require_metsr_response(
                 self.metsr_client.initialize_cosim_vehicle(**pose, segment_id=None),
                 "initializeCoSimVeh",
             )
         state = self.metsr_client.query_vehicle(
             vehicle_id, private_veh=True, transform_coords=True
         )["data"][0]
-        metsr_routing.validate_spawn_placement(
+        routing_utils.validate_spawn_placement(
             obj, requested, placement["data"][0], state
         )
 
@@ -404,7 +411,7 @@ class CosimSimulation(DrivingSimulation):
         self, obj: Object, update_velocity: bool = False, *, native_state=None
     ) -> bool:
         """Spawn or queue a CARLA actor, then initialize its motion state."""
-        blueprint, transform, native_velocity = runtime.prepare_carla_spawn(
+        blueprint, transform, native_velocity = runtime_utils.prepare_carla_spawn(
             self, obj, native_state
         )
         carlaActor = None
@@ -415,7 +422,7 @@ class CosimSimulation(DrivingSimulation):
             spawn_error = exc
 
         if carlaActor is None:
-            runtime.clear_carla_route_state(self, obj)
+            runtime_utils.clear_carla_route_state(self, obj)
             first_failure = obj not in self.bubble_spawn_queue
             self.bubble_spawn_queue.add(obj)
             if first_failure:
@@ -427,11 +434,11 @@ class CosimSimulation(DrivingSimulation):
                     "The actor will remain queued and retry."
                 )
                 threshold = 1.2 * max(obj.length, obj.width)
-                is_close, danger_veh = _utils.within_threshold_to(
+                is_close, danger_veh = runtime_utils.within_threshold_to(
                     obj, self.carla_actors, threshold=threshold, verbose=True
                 )
                 if danger_veh is not None:
-                    veh_data = metsr_utils.collect_metsr_vehicle_data(
+                    veh_data = bridge_utils.collect_metsr_vehicle_data(
                         self.metsr_client,
                         {
                             obj: self.getMetsrPrivateVehId(obj)
@@ -455,9 +462,9 @@ class CosimSimulation(DrivingSimulation):
         carlaActor.set_simulate_physics(obj.physics)
 
         try:
-            carla_actor_utils.configure_actor(obj, self.carla_world, self.blueprintLib)
+            actor_utils.configure_actor(obj, self.carla_world, self.blueprintLib)
         except SimulationCreationError:
-            runtime.clear_carla_route_state(self, obj)
+            runtime_utils.clear_carla_route_state(self, obj)
             raise
 
         scenic_velocity = Vector(0, 0, 0)
@@ -470,7 +477,7 @@ class CosimSimulation(DrivingSimulation):
             )
             carlaActor.set_target_velocity(velocity)
 
-        runtime.seed_carla_spawn_properties(self, obj, transform, scenic_velocity)
+        runtime_utils.seed_carla_spawn_properties(self, obj, transform, scenic_velocity)
 
         return True
 
@@ -502,7 +509,7 @@ class CosimSimulation(DrivingSimulation):
             center=[obj.position.x, obj.position.y], radius=self.bubble_size
         )
 
-        bubble_roads = routing.get_bubble_roads(self)
+        bubble_roads = bubble_utils.get_bubble_roads(self)
         selection = self._select_bubble_roads(bubble_roads)
         self.freeze_roads(selection.entering)
         self.metsr_client.tick()
@@ -532,10 +539,8 @@ class CosimSimulation(DrivingSimulation):
                 if snapshot.find(obj.carlaActor.id) is None:
                     return dict(seeds[obj])
                 seeds.pop(obj)
-            return carla_actor_utils.actor_properties(
-                obj.carlaActor, obj.parentOrientation
-            )
-        return metsr_utils.metsr_properties(
+            return actor_utils.actor_properties(obj.carlaActor, obj.parentOrientation)
+        return bridge_utils.metsr_properties(
             self.obj_data_cache[obj], obj.parentOrientation
         )
 
@@ -564,7 +569,7 @@ class CosimSimulation(DrivingSimulation):
             (True, str(vehicle_id)): obj
             for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
         }
-        states = metsr_utils.native_boundary_states(
+        states = bridge_utils.native_boundary_states(
             self.metsr_client,
             self.metsr_state,
             {
@@ -572,24 +577,25 @@ class CosimSimulation(DrivingSimulation):
                 for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
                 if getattr(obj, "carlaActor", None) is not None
             },
-            METSR_BOUNDARY_DISTANCE,
         )
         # Validate every pose before changing obstacle membership.
         for key, state in states.items():
-            runtime.boundary_vehicle_transform(self, state, scenic_objects.get(key))
+            runtime_utils.boundary_vehicle_transform(self, state, scenic_objects.get(key))
 
         for key in tuple(self.boundary_actors):
             if key not in states:
-                runtime.remove_boundary_actor(self, key)
+                runtime_utils.remove_boundary_actor(self, key)
         for key, state in states.items():
             obj = scenic_objects.get(key)
             actor = self.boundary_actors.get(key)
-            if actor is not None and not runtime.carla_actor_is_alive(actor):
-                runtime.remove_boundary_actor(self, key)
+            if actor is not None and not runtime_utils.carla_actor_is_alive(actor):
+                runtime_utils.remove_boundary_actor(self, key)
                 actor = None
             if actor is None:
-                blueprint = runtime.boundary_vehicle_blueprint(self, key, state, obj)
-                transform = runtime.boundary_vehicle_transform(self, state, obj)
+                blueprint = runtime_utils.boundary_vehicle_blueprint(
+                    self, key, state, obj
+                )
+                transform = runtime_utils.boundary_vehicle_transform(self, state, obj)
                 actor = self.carla_world.try_spawn_actor(blueprint, transform)
                 if actor is None:
                     raise SimulationCreationError(
@@ -602,7 +608,7 @@ class CosimSimulation(DrivingSimulation):
                 actor.set_autopilot(False, self.tm.get_port())
                 actor.set_simulate_physics(False)
             actor.set_transform(
-                runtime.boundary_vehicle_transform(self, state, obj, actor)
+                runtime_utils.boundary_vehicle_transform(self, state, obj, actor)
             )
 
     def tick_metsr(self) -> None:
@@ -616,8 +622,8 @@ class CosimSimulation(DrivingSimulation):
 
     def _select_bubble_roads(self, roads):
         """Commit the mapping result explicitly before acquiring the new bubble."""
-        selection = metsr_routing.classify_bubble_roads(
-            self.metsr_state, roads, self.network_helper.roads_by_id
+        selection = routing_utils.classify_bubble_roads(
+            self.metsr_state, roads, self.bubble_topology.roads_by_id
         )
         self.bubble_roads = selection.roads
         self.metsr_state.active_bubble_roads = set(selection.native_road_ids)
@@ -626,7 +632,7 @@ class CosimSimulation(DrivingSimulation):
     def step(self) -> None:
         """Update bubble ownership, advance both simulators, and publish state."""
         self.road_pop_density = {road: 0 for road in self.metsr_state.valid_roads}
-        bubble_roads = routing.get_bubble_roads(
+        bubble_roads = bubble_utils.get_bubble_roads(
             self, CircularRegion(center=[self.ego.x, self.ego.y], radius=self.bubble_size)
         )
         selection = self._select_bubble_roads(bubble_roads)
@@ -639,14 +645,16 @@ class CosimSimulation(DrivingSimulation):
         # native exit occupancy visible before any CARLA physics/sensor tick.
         self._synchronize_boundary_vehicles()
         self._service_metsr_entering_queues()
-        intersections = routing.get_bubble_intersections(self, bubble_roads=bubble_roads)
+        intersections = bubble_utils.intersections_for_roads(
+            self.bubble_topology, bubble_roads
+        )
         # Promote newly-controlled vehicles before CARLA advances, but defer
         # demotion until after CARLA's authoritative pose has been mirrored to
         # METS-R. This removes the stale-snapshot boundary heuristic.
         # METS-R has not advanced between promotion and CARLA publication, so
         # one batched snapshot can serve promotion and synchronization.
         state_objects = list(dict.fromkeys((*self.objects[1:], *self.carla_actors)))
-        step_vehicle_data = metsr_utils.collect_metsr_vehicle_data(
+        step_vehicle_data = bridge_utils.collect_metsr_vehicle_data(
             self.metsr_client,
             {obj: self.getMetsrPrivateVehId(obj) for obj in state_objects},
         )
@@ -656,13 +664,13 @@ class CosimSimulation(DrivingSimulation):
         self.tick_carla()
         self.synchronize_clients(vehicle_data=step_vehicle_data)
         self._remove_completed_carla_objects()
-        releasable_roads = metsr_utils.releasable_old_roads(
+        releasable_roads = bridge_utils.releasable_old_roads(
             self.metsr_state, selection.leaving, self.carla_actors
         )
         if releasable_roads:
             self.release_roads(releasable_roads, allow_defer=True)
         self.tick_metsr()
-        self.obj_data_cache = metsr_utils.collect_metsr_vehicle_data(
+        self.obj_data_cache = bridge_utils.collect_metsr_vehicle_data(
             self.metsr_client,
             {
                 obj: self.getMetsrPrivateVehId(obj)
@@ -679,7 +687,7 @@ class CosimSimulation(DrivingSimulation):
                 if self.count % 100 == 0:
                     print("Warning no registered connection to streaming client")
 
-        runtime.record_step_statistics(self)
+        runtime_utils.record_step_statistics(self)
 
         self.count += 1
         # Update the Scenic region used by behaviors on the next step.
@@ -721,7 +729,7 @@ class CosimSimulation(DrivingSimulation):
 
     def _service_metsr_entering_queues(self):
         """Admit ready Scenic vehicles from controlled-road departure queues."""
-        metsr_utils.check_queue_admission_spawn_deadlines(
+        bridge_utils.check_queue_admission_spawn_deadlines(
             self.metsr_state,
             self.count,
             {
@@ -732,17 +740,17 @@ class CosimSimulation(DrivingSimulation):
         )
         if not self.metsr_state.controlled_roads:
             return
-        response = metsr_utils.require_metsr_response(
+        response = bridge_utils.require_metsr_response(
             self.metsr_client.query_cosim_entering_vehicle_queue(),
             "coSimEnteringVehicleQueue",
         )
-        requests = metsr_utils.select_queue_admissions(self.metsr_state, response)
+        requests = bridge_utils.select_queue_admissions(self.metsr_state, response)
         if not requests:
             return
         response = self.metsr_client.enter_road_from_queue(
             requests=requests[0] if len(requests) == 1 else requests
         )
-        for vehicle_id, road_id in metsr_utils.validate_queue_admissions(
+        for vehicle_id, road_id in bridge_utils.validate_queue_admissions(
             response, requests
         ).items():
             self.metsr_state.admitted_vehicles[vehicle_id] = {
@@ -779,7 +787,7 @@ class CosimSimulation(DrivingSimulation):
             transform_coords=field("transform_coords"),
             **selectors,
         )
-        acknowledgements = metsr_utils.validate_pose_update_acknowledgements(
+        acknowledgements = bridge_utils.validate_pose_update_acknowledgements(
             response, updates, targets
         )
 
@@ -807,7 +815,7 @@ class CosimSimulation(DrivingSimulation):
                     retirement = self.metsr_client.reach_dest(
                         update["vehicle_id"], private_veh=update["private_veh"]
                     )
-                    metsr_utils.validate_completion_response(
+                    bridge_utils.validate_completion_response(
                         retirement, update["vehicle_id"]
                     )
                 self._commit_retirement(obj)
@@ -842,12 +850,12 @@ class CosimSimulation(DrivingSimulation):
         all_veh_data = (
             vehicle_data
             if vehicle_data is not None
-            else metsr_utils.collect_metsr_vehicle_data(
+            else bridge_utils.collect_metsr_vehicle_data(
                 self.metsr_client,
                 {obj: self.getMetsrPrivateVehId(obj) for obj in carla_actors},
             )
         )
-        cosim_response = metsr_utils.require_metsr_response(
+        cosim_response = bridge_utils.require_metsr_response(
             self.metsr_client.query_cosim_vehicle(), "coSimVehicle"
         )
         live_private_records = {}
@@ -862,7 +870,7 @@ class CosimSimulation(DrivingSimulation):
         for carla_object in carla_actors:
             try:
                 actor = carla_object.carlaActor
-                if not runtime.carla_actor_is_alive(actor):
+                if not runtime_utils.carla_actor_is_alive(actor):
                     raise RuntimeError("CARLA actor is no longer alive")
                 location = actor.get_location()
             except Exception as error:
@@ -886,7 +894,7 @@ class CosimSimulation(DrivingSimulation):
             cosim_record = records[0] if records else {}
 
             transform = actor.get_transform()
-            bearing = _utils.get_metsr_rotation(transform.rotation.yaw)
+            bearing = coordinate_utils.carlaToCompassBearing(transform.rotation.yaw)
             velocity = actor.get_velocity()
             speed = math.sqrt(
                 velocity.x * velocity.x
@@ -906,7 +914,7 @@ class CosimSimulation(DrivingSimulation):
                     "speed": speed,
                     "private_veh": True,
                     "transform_coords": True,
-                    "handoff": metsr_routing.native_handoff_target(
+                    "handoff": routing_utils.native_handoff_target(
                         self, carla_object, location
                     ),
                     "vehicle_state": vehicle_state,
@@ -916,8 +924,8 @@ class CosimSimulation(DrivingSimulation):
 
         self._publish_carla_vehicle_updates(pending_updates)
 
-        if runtime.client_sync_diagnostic_due(self.count, bool(pending_updates)):
-            runtime.check_client_synchronization(self)
+        if runtime_utils.client_sync_diagnostic_due(self.count, bool(pending_updates)):
+            runtime_utils.check_client_synchronization(self)
 
     def _initialize_promoted_carla_autopilot(self, obj, vehicle_state):
         """Install default NPC control before its first moving CARLA tick.
@@ -950,7 +958,7 @@ class CosimSimulation(DrivingSimulation):
         all_veh_data = (
             vehicle_data
             if vehicle_data is not None
-            else metsr_utils.collect_metsr_vehicle_data(
+            else bridge_utils.collect_metsr_vehicle_data(
                 self.metsr_client,
                 {obj: self.getMetsrPrivateVehId(obj) for obj in self.objects[1:]},
             )
@@ -959,7 +967,7 @@ class CosimSimulation(DrivingSimulation):
             if obj in self.completed_route:
                 continue
             veh_data = all_veh_data[obj]
-            metsr_road = metsr_utils.metsr_vehicle_road(veh_data)
+            metsr_road = bridge_utils.metsr_vehicle_road(veh_data)
             if metsr_road is not None:
                 self.road_pop_density[metsr_road] += 1
             if obj.carla_actor_flag:
@@ -969,7 +977,9 @@ class CosimSimulation(DrivingSimulation):
                 if veh_data.get("queuedRoadId") is None:
                     self._commit_retirement(obj)
                 continue
-            if not metsr_utils.vehicle_record_in_cosim_region(self.metsr_state, veh_data):
+            if not bridge_utils.vehicle_record_in_cosim_region(
+                self.metsr_state, veh_data
+            ):
                 continue
             if not self.createObjectInCarla(
                 obj, update_velocity=True, native_state=veh_data
@@ -990,8 +1000,8 @@ class CosimSimulation(DrivingSimulation):
     def _commit_promotion(self, obj, vehicle_state=None):
         """Publish CARLA ownership only after actor and controller initialization."""
         if vehicle_state is not None:
-            metsr_utils.initialize_carla_authoritative_segment(
-                self.metsr_state, obj, vehicle_state, vehicle_state
+            bridge_utils.initialize_carla_authoritative_segment(
+                self.metsr_state, obj, vehicle_state
             )
         if obj in self.metsr_actors:
             self.metsr_actors.remove(obj)
@@ -1004,16 +1014,6 @@ class CosimSimulation(DrivingSimulation):
         vehicle_id = self.metsr_state.private_vehicle_ids.get(obj)
         self.metsr_state.admitted_vehicles.pop(vehicle_id, None)
         self.bubble_spawn_queue.discard(obj)
-
-    def _commit_demotion(self, obj):
-        """Record native ownership after accepted handback and CARLA cleanup."""
-        runtime.clear_carla_route_state(self, obj)
-        self._carla_spawn_property_seeds.pop(obj, None)
-        self._clear_pending_admission(obj)
-        self.carla_actors.remove(obj)
-        if obj not in self.metsr_actors:
-            self.metsr_actors.append(obj)
-        obj.carla_actor_flag = False
 
     def _commit_retirement(self, obj):
         """Record confirmed completion once; actor removal follows publication."""
@@ -1034,11 +1034,7 @@ class CosimSimulation(DrivingSimulation):
             return
         print(f"Freezing roads: {requested}")
         response = self.metsr_client.set_cosim_road(requested)
-        metsr_utils.require_metsr_response(response, "setCoSimRoad", require_all=True)
-        ownership = metsr_utils.parse_takeover_ownership(
-            self.metsr_state, response, requested
-        )
-        metsr_utils.commit_takeover_ownership(self.metsr_state, requested, *ownership)
+        bridge_utils.apply_road_takeover(self.metsr_state, response, requested)
 
     def release_roads(self, keys: list[str], *, allow_defer=False) -> None:
         """Return controlled roads to METS-R and update shared connectors."""
@@ -1058,12 +1054,9 @@ class CosimSimulation(DrivingSimulation):
             # Commit local release only after native placement succeeds. The
             # server can reject a release when vehicle placement is blocked.
             response = self.metsr_client.release_cosim_road(key)
-            ownership = metsr_utils.parse_release_ownership(
+            bridge_utils.apply_road_release(
                 self.metsr_state, key, response, allow_defer=allow_defer
             )
-            if ownership is None:
-                continue
-            metsr_utils.commit_release_ownership(self.metsr_state, key, *ownership)
 
     def destroy_carla_obj(self, obj) -> None:
         """Destroy a live Scenic CARLA actor and its attached controller."""
@@ -1077,24 +1070,29 @@ class CosimSimulation(DrivingSimulation):
             if isinstance(obj.carlaActor, carla.Vehicle):
                 obj.carlaActor.set_autopilot(False, self.tm.get_port())
             if isinstance(obj.carlaActor, carla.Walker):
-                carla_actor_utils.destroy_walker_controller(obj.carlaController)
-            runtime.destroy_attached_carla_sensors(self, obj.carlaActor)
+                actor_utils.destroy_walker_controller(obj.carlaController)
+            runtime_utils.destroy_attached_carla_sensors(self, obj.carlaActor)
             obj.carlaActor.destroy()
             obj.carlaActor = None
 
-    def remove_bubble_object(self, obj, destroy=True) -> None:
+    def remove_bubble_object(self, obj) -> None:
         """Release the CARLA actor and return the Scenic object to native control."""
         if pcla_utils.is_pcla_controlled_ego(self, obj):
             raise SimulationCreationError(
                 "A PCLA-controlled ego cannot be demoted from CARLA into the "
                 "METS-R background simulation"
             )
+        self.destroy_carla_obj(obj)
         if obj.autopilot_action and obj.active_autopilot:
-            obj.active_autopilot = not (_utils.disable_carla_autopilot(obj, self.tm))
+            obj.active_autopilot = False
             obj.trajectory = None
-        if destroy:
-            self.destroy_carla_obj(obj)
-        self._commit_demotion(obj)
+        runtime_utils.clear_carla_route_state(self, obj)
+        self._carla_spawn_property_seeds.pop(obj, None)
+        self._clear_pending_admission(obj)
+        self.carla_actors.remove(obj)
+        if obj not in self.metsr_actors:
+            self.metsr_actors.append(obj)
+        obj.carla_actor_flag = False
 
     def add_pre_actor_teardown_callback(self, callback) -> None:
         """Register cleanup which must run before Scenic destroys CARLA actors."""
@@ -1122,9 +1120,9 @@ class CosimSimulation(DrivingSimulation):
         print("=" * 25)
         if getattr(self, "run_name", None) is not None:
             try:
-                runtime.log_trip_times(self)
+                runtime_utils.log_trip_times(self)
             except Exception as error:
-                runtime.report_cleanup_failure("logging trip times", error)
+                runtime_utils.report_cleanup_failure("logging trip times", error)
         print("=" * 25)
 
         # Log first. Reset an aborted run (or a blocked release) using the
@@ -1136,13 +1134,13 @@ class CosimSimulation(DrivingSimulation):
                 try:
                     self.release_roads(list(self.metsr_state.controlled_roads))
                 except Exception as error:
-                    runtime.report_cleanup_failure(
+                    runtime_utils.report_cleanup_failure(
                         "releasing METS-R roads; resetting the run", error
                     )
                     self.metsr_client.reset()
         except Exception as error:
             cleanup_error = error
-            runtime.report_cleanup_failure("resetting METS-R during cleanup", error)
+            runtime_utils.report_cleanup_failure("resetting METS-R during cleanup", error)
 
         # METSR destroy
         try:
@@ -1153,20 +1151,22 @@ class CosimSimulation(DrivingSimulation):
                     print(f"    {call},")
                 print("]")
         except Exception as error:
-            runtime.report_cleanup_failure("printing the METS-R message log", error)
+            runtime_utils.report_cleanup_failure("printing the METS-R message log", error)
 
         # Each visualization owner closes its sensors before the parent vehicle.
         if getattr(self, "render", False) and getattr(self, "cameraManager", None):
             try:
                 self.cameraManager.destroy_sensor()
             except Exception as error:
-                runtime.report_cleanup_failure("destroying the CARLA camera", error)
-        runtime.run_pre_actor_teardown_callbacks(self)
+                runtime_utils.report_cleanup_failure("destroying the CARLA camera", error)
+        runtime_utils.run_pre_actor_teardown_callbacks(self)
         for key in tuple(getattr(self, "boundary_actors", ())):
             try:
-                runtime.remove_boundary_actor(self, key)
+                runtime_utils.remove_boundary_actor(self, key)
             except Exception as error:
-                runtime.report_cleanup_failure("destroying a boundary vehicle", error)
+                runtime_utils.report_cleanup_failure(
+                    "destroying a boundary vehicle", error
+                )
         # "CARLA destroy"
         cleanup_objects = list(getattr(self, "carla_actors", ()))
         # Include actors whose initialization failed before promotion completed.
@@ -1178,21 +1178,23 @@ class CosimSimulation(DrivingSimulation):
         )
         for obj in cleanup_objects:
             try:
-                runtime.destroy_carla_object_during_teardown(self, obj)
+                runtime_utils.destroy_carla_object_during_teardown(self, obj)
             except Exception as error:
-                runtime.report_cleanup_failure("cleaning up a CARLA object", error)
+                runtime_utils.report_cleanup_failure("cleaning up a CARLA object", error)
         self.metsr_state.authoritative_segments.clear()
         getattr(self, "_carla_destination_plans", {}).clear()
 
         try:
             self.carla_client.stop_recorder()
         except Exception as error:
-            runtime.report_cleanup_failure("stopping the CARLA recorder", error)
+            runtime_utils.report_cleanup_failure("stopping the CARLA recorder", error)
 
         try:
             super().destroy()
         except Exception as error:
-            runtime.report_cleanup_failure("finalizing the Scenic simulation", error)
+            runtime_utils.report_cleanup_failure(
+                "finalizing the Scenic simulation", error
+            )
 
         if cleanup_error is not None and not active_error:
             raise cleanup_error
@@ -1205,9 +1207,8 @@ class CosimSimulation(DrivingSimulation):
                 if (
                     not obj.autopilot_action and obj.active_autopilot
                 ):  # Disable autopilot first to enable smooth transitions
-                    obj.active_autopilot = not (
-                        _utils.disable_carla_autopilot(obj, self.tm)
-                    )
+                    obj.carlaActor.set_autopilot(False, self.tm.get_port())
+                    obj.active_autopilot = False
                 elif obj.autopilot_action and not obj.active_autopilot:
                     if getattr(obj, "trajectory", None) is None:
                         self._install_carla_destination_path(obj)
@@ -1224,7 +1225,7 @@ class CosimSimulation(DrivingSimulation):
             else:
                 if not obj.autopilot_action:  # Default is autopilot
                     target_acc = getattr(obj, "target_acceleration", 0)
-                    metsr_utils.require_metsr_response(
+                    bridge_utils.require_metsr_response(
                         self.metsr_client.control_vehicle(
                             self.getMetsrPrivateVehId(obj), target_acc, private_veh=True
                         ),
@@ -1233,11 +1234,11 @@ class CosimSimulation(DrivingSimulation):
                 if hasattr(obj, "trajectory"):
                     if obj.trajectory and not obj.autopilot_action:
                         if not obj.trajectory_is_active:
-                            metsr_trajectory = metsr_network.generate_metsr_trajectory(
+                            metsr_trajectory = network_utils.generate_metsr_trajectory(
                                 self.metsr_state, obj.trajectory
                             )
                             if metsr_trajectory:
-                                metsr_utils.require_metsr_response(
+                                bridge_utils.require_metsr_response(
                                     self.metsr_client.update_vehicle_route(
                                         self.getMetsrPrivateVehId(obj),
                                         metsr_trajectory,
@@ -1256,11 +1257,11 @@ class CosimSimulation(DrivingSimulation):
         CARLA's choice of intermediate roads or lanes.
         """
         if vehicle_state is None:
-            vehicle_state = metsr_utils.collect_metsr_vehicle_data(
+            vehicle_state = bridge_utils.collect_metsr_vehicle_data(
                 self.metsr_client, {obj: self.getMetsrPrivateVehId(obj)}
             )[obj]
-        destination = metsr_routing.vehicle_destination_road(obj, vehicle_state)
-        path = metsr_routing.generate_carla_destination_trajectory(
+        destination = routing_utils.vehicle_destination_road(obj, vehicle_state)
+        path = routing_utils.generate_carla_destination_trajectory(
             self, destination, obj, target_start=target_start
         )
         self.tm.set_path(obj.carlaActor, path)
@@ -1282,7 +1283,7 @@ class CosimSimulation(DrivingSimulation):
                 or obj not in vehicle_data
             ):
                 continue
-            current_destination = metsr_routing.vehicle_destination_road(
+            current_destination = routing_utils.vehicle_destination_road(
                 obj, vehicle_data[obj]
             )
             if current_destination == destination:

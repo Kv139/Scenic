@@ -6,9 +6,9 @@ import pytest
 
 carla = pytest.importorskip("carla")
 
-from scenic.simulators.cosim import cosim_utils as runtime
+from scenic.simulators.cosim import runtime_utils as runtime
 from scenic.simulators.cosim.simulator import CosimSimulation
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
 
 
 def test_ordinary_walker_removal_stops_controller_and_destroys_actor(monkeypatch):

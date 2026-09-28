@@ -9,16 +9,16 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.carla.utils import actors as actor_utils, routing as carla_routing
-from scenic.simulators.cosim import cosim_utils
+from scenic.simulators.carla import actor_utils, routing_utils as carla_routing
+from scenic.simulators.carla.global_route_planner import GlobalRoutePlanner
+from scenic.simulators.cosim import runtime_utils
 from scenic.simulators.cosim.simulator import carla
-from scenic.simulators.cosim.utils.global_route_planner import GlobalRoutePlanner
 from scenic.simulators.metsr import (
-    cosim_routing_utils as routing,
-    cosim_utils as native,
-    network as metsr_network,
+    bridge_utils as native,
+    network_utils as metsr_network,
+    routing_utils as routing,
 )
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
 from tests.simulators.cosim.helpers import make_simulation
 
 
@@ -384,7 +384,7 @@ def test_handoff_is_one_request_and_removal_follows_native_ack(target):
     ],
 )
 def test_native_rejection_aborts_without_changing_carla_actor(code, target):
-    from scenic.simulators.metsr.cosim_utils import METSRControlError
+    from scenic.simulators.metsr.bridge_utils import METSRControlError
 
     simulation, obj, update = publication_fixture(target=target)
     failure = {
@@ -413,7 +413,7 @@ def test_native_rejection_aborts_without_changing_carla_actor(code, target):
     ],
 )
 def test_incomplete_handoff_ack_keeps_actor(changes):
-    from scenic.simulators.metsr.cosim_utils import METSRControlError
+    from scenic.simulators.metsr.bridge_utils import METSRControlError
 
     simulation, obj, update = publication_fixture(target=("outside", 1, None))
     fields = dict(
@@ -521,12 +521,12 @@ def cleanup_fixture(monkeypatch):
         reach_dest=Mock(side_effect=AssertionError("cleanup is not arrival")),
     )
     monkeypatch.setattr(
-        cosim_utils, "log_trip_times", lambda simulation: events.append("log")
+        runtime_utils, "log_trip_times", lambda simulation: events.append("log")
     )
     simulation.carla_client = SimpleNamespace(stop_recorder=Mock())
     simulation.release_roads = Mock(side_effect=lambda roads: events.append("release"))
     monkeypatch.setattr(
-        cosim_utils,
+        runtime_utils,
         "destroy_carla_object_during_teardown",
         Mock(side_effect=lambda simulation, obj: events.append("destroy")),
     )
@@ -542,7 +542,7 @@ def test_normal_cleanup_logs_releases_and_destroys_once(partially_promoted, monk
     simulation.destroy()
     assert events == ["log", "release", "destroy"]
     simulation.metsr_client.reset.assert_not_called()
-    cosim_utils.destroy_carla_object_during_teardown.assert_called_once_with(
+    runtime_utils.destroy_carla_object_during_teardown.assert_called_once_with(
         simulation, obj
     )
 
@@ -596,7 +596,7 @@ def test_lost_or_unreadable_actor_aborts_without_cancellation_or_arrival(
 
 
 def test_partial_batch_never_commits_local_handback():
-    from scenic.simulators.metsr.cosim_utils import METSRControlError
+    from scenic.simulators.metsr.bridge_utils import METSRControlError
 
     simulation, obj, update = publication_fixture(target=("outside", 1, None))
     other = Vehicle(name="other", carla_actor_flag=True)
@@ -722,7 +722,7 @@ def test_failed_controller_initialization_does_not_commit_promotion():
 
 
 def test_existing_native_vehicle_spawn_failure_has_bounded_retry():
-    from scenic.simulators.metsr.cosim_utils import COSIM_ADMISSION_SPAWN_MAX_TICKS
+    from scenic.simulators.metsr.bridge_utils import COSIM_ADMISSION_SPAWN_MAX_TICKS
 
     simulation, obj, state = promotion_fixture()
     simulation.createObjectInCarla = Mock(return_value=False)
@@ -797,7 +797,7 @@ def test_initial_native_npc_has_properties_before_first_step(monkeypatch):
     simulation.scene = SimpleNamespace(objects=[obj], params={})
     simulation.metsr_actors = [obj]
     simulation.carla_actors = []
-    simulation.workspace = object()
+    simulation.workspace = SimpleNamespace(network=object())
     simulation.metsr_state.metadata = replace(
         simulation.metsr_state.metadata, lane_mapping={}
     )
@@ -819,7 +819,7 @@ def test_initial_native_npc_has_properties_before_first_step(monkeypatch):
         Mock(side_effect=AssertionError("native NPC has no CARLA actor")),
     )
     with patch("scenic.simulators.cosim.simulator.DrivingSimulation.setup"), patch(
-        "scenic.simulators.cosim.simulator.network_cache"
+        "scenic.simulators.cosim.simulator.bubble_utils.BubbleTopology.from_network"
     ), patch("scenic.simulators.cosim.simulator.GlobalRoutePlanner"):
         simulation.setup()
     # Scenic's core requests these properties immediately after setup, before step().

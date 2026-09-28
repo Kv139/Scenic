@@ -10,8 +10,7 @@ import math
 from scenic.core.object_types import Object
 from scenic.core.simulators import SimulationCreationError
 from scenic.core.vectors import Orientation, Vector
-
-from .network import NetworkMetadata, mapped_lane_query
+from scenic.simulators.metsr.network_utils import NetworkMetadata, mapped_lane_query
 
 COSIM_ADMISSION_SPAWN_MAX_TICKS = 100
 
@@ -281,8 +280,9 @@ def normalize_incident_connector(connector, road_id, response, operation):
     return normalized
 
 
-def parse_takeover_ownership(state, response, requested):
-    """Validate setCoSimRoad records and return uncommitted ownership."""
+def apply_road_takeover(state, response, requested):
+    """Validate the complete road takeover before changing local ownership."""
+    require_metsr_response(response, "setCoSimRoad", require_all=True)
     requested = tuple(sorted({str(road_id) for road_id in requested}))
     expected_edges = expected_incident_internal_edges(state, requested)
     records_by_road = {}
@@ -392,25 +392,10 @@ def parse_takeover_ownership(state, response, requested):
                 f"{previous_owner!r} to {connector_id!r}",
                 response=response,
             )
-    return road_connectors, connector_records
-
-
-def commit_takeover_ownership(state, road_ids, road_connectors, connector_records):
-    for road_id in road_ids:
-        road_id = str(road_id)
+    for road_id in requested:
         state.controlled_roads[road_id] = True
         state.road_connectors[road_id] = set(road_connectors.get(road_id, ()))
     state.connector_records.update(connector_records)
-    rebuild_controlled_physical_segments(state)
-
-
-def commit_release_ownership(state, road_id, released_ids, remaining_records):
-    """Apply connector ownership changes after a native release is validated."""
-    del state.controlled_roads[road_id]
-    state.road_connectors.pop(road_id, None)
-    state.connector_records.update(remaining_records)
-    for connector_id in released_ids:
-        state.connector_records.pop(connector_id, None)
     rebuild_controlled_physical_segments(state)
 
 
@@ -473,52 +458,32 @@ def vehicle_record_in_cosim_region(state, record):
     return logical_road is not None and str(logical_road) in state.controlled_roads
 
 
-def owned_connector_ids(state):
-    """Return opaque connector IDs currently referenced by road ownership."""
+def is_controlled_connector_id(state, segment_id):
+    """Whether this opaque connector is recorded and referenced by an owned road."""
+    if segment_id is None:
+        return False
     referenced = {
         str(connector_id)
         for connector_ids in state.road_connectors.values()
         for connector_id in connector_ids
     }
-    return referenced & set(map(str, state.connector_records))
+    return str(segment_id) in referenced & set(map(str, state.connector_records))
 
 
-def is_controlled_connector_id(state, segment_id):
-    if segment_id is None:
-        return False
-    return str(segment_id) in owned_connector_ids(state)
-
-
-def initialize_carla_authoritative_segment(
-    state, obj, vehicle_state=None, cosim_record=None
-):
-    """Seed continuity from admission metadata without parsing connector IDs."""
+def initialize_carla_authoritative_segment(state, obj, record):
+    """Seed continuity from the current admission record without parsing IDs."""
     if obj in state.authoritative_segments:
         return state.authoritative_segments[obj]
-
-    for record in (cosim_record, vehicle_state):
-        if not isinstance(record, dict):
-            continue
-        segment = record.get("segmentId")
-        if segment is None:
-            continue
-        segment = str(segment)
-        if segment in state.controlled_roads:
-            state.authoritative_segments[obj] = segment
-            return segment
+    if not isinstance(record, dict) or record.get("segmentId") is None:
+        return None
+    segment = str(record["segmentId"])
+    if segment not in state.controlled_roads:
         if is_controlled_internal_segment(state, segment):
-            connector_id = state.internal_edge_to_connector[segment]
-            state.authoritative_segments[obj] = connector_id
-            return connector_id
-        if is_controlled_connector_id(state, segment):
-            state.authoritative_segments[obj] = segment
-            return segment
-    return None
-
-
-def clear_carla_authoritative_segment(state, obj):
-    """Discard the native ownership observation for an external object key."""
-    state.authoritative_segments.pop(obj, None)
+            segment = state.internal_edge_to_connector[segment]
+        elif not is_controlled_connector_id(state, segment):
+            return None
+    state.authoritative_segments[obj] = segment
+    return segment
 
 
 def releasable_old_roads(state, old_roads, occupied_objects):
@@ -692,8 +657,8 @@ def parse_connector_collection(connectors, connector_ids, road_id, response, par
     return records
 
 
-def parse_release_ownership(state, key, response, *, allow_defer=False):
-    """Validate a road release, or return None for a retryable blocked release."""
+def apply_road_release(state, key, response, *, allow_defer=False):
+    """Validate and apply a road release; return False if native placement is blocked."""
     if allow_defer and isinstance(response, dict):
         records = response.get("data")
         if (
@@ -708,7 +673,7 @@ def parse_release_ownership(state, key, response, *, allow_defer=False):
             and records[0].get("retryable") is True
         ):
             # Keep the road owned and reconsider it on the next step.
-            return None
+            return False
     require_metsr_response(response, "releaseCoSimRoad", require_all=True)
     records = [
         record
@@ -803,7 +768,13 @@ def parse_release_ownership(state, key, response, *, allow_defer=False):
                 record=connector,
             )
 
-    return released_ids, remaining_records
+    del state.controlled_roads[key]
+    state.road_connectors.pop(key, None)
+    state.connector_records.update(remaining_records)
+    for connector_id in released_ids:
+        state.connector_records.pop(connector_id, None)
+    rebuild_controlled_physical_segments(state)
+    return True
 
 
 def metsr_properties(raw_data, parent_orientation):
@@ -891,10 +862,10 @@ def validate_completion_response(retirement, vehicle_id):
         )
 
 
-def native_boundary_states(client, state, controlled_private_ids, distance):
+def native_boundary_states(client, state, controlled_private_ids):
     """Query native exit occupancy, excluding vehicles already controlled here."""
     response = require_metsr_response(
-        client.query_boundary_vehicle(boundary_dist=distance),
+        client.query_boundary_vehicle(),
         "boundaryVehicle",
         require_all=True,
     )

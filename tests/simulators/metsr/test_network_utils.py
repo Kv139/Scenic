@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from scenic.simulators.metsr import network
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
+from scenic.simulators.metsr import network_utils as network
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
 
 
 def test_one_xml_load_serves_spawn_region_and_multiple_simulation_states(
@@ -82,7 +82,7 @@ def test_native_routing_import_does_not_require_cosim_package():
     code = f"""import sys
 sys.path = {sys.path!r}
 sys.modules['scenic.simulators.cosim'] = None
-import scenic.simulators.metsr.cosim_routing_utils
+import scenic.simulators.metsr.routing_utils
 assert not any(name.startswith('scenic.simulators.cosim.') for name in sys.modules)
 """
     result = subprocess.run([sys.executable, "-c", code], text=True, capture_output=True)
@@ -94,8 +94,8 @@ def test_native_metadata_and_state_import_without_carla_or_cosim():
 sys.path = {sys.path!r}
 sys.modules['carla'] = None
 sys.modules['scenic.simulators.cosim'] = None
-import scenic.simulators.metsr.network
-import scenic.simulators.metsr.cosim_utils
+import scenic.simulators.metsr.network_utils
+import scenic.simulators.metsr.bridge_utils
 assert not any(name.startswith('scenic.simulators.cosim.') for name in sys.modules)
 """
     result = subprocess.run([sys.executable, "-c", code], text=True, capture_output=True)

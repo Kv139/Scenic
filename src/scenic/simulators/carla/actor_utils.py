@@ -6,8 +6,8 @@ import warnings
 import carla
 
 from scenic.core.simulators import SimulationCreationError
+from scenic.simulators.carla import coordinate_utils as utils
 from scenic.simulators.carla.blueprints import oldBlueprintNames
-from scenic.simulators.carla.utils import utils
 
 
 def resolve_blueprint(blueprint_library, model):

@@ -5,19 +5,17 @@ import os
 import warnings
 
 import carla
+import numpy as np
 import pandas as pd
 import pygame
 
 from scenic.core.simulators import SimulationCreationError
 from scenic.core.vectors import Orientation, Vector
+from scenic.simulators.carla import actor_utils
 from scenic.simulators.carla.blueprints import busModels, carModels
-from scenic.simulators.carla.utils import actors as carla_actor_utils
-import scenic.simulators.carla.utils.utils as utils
-import scenic.simulators.carla.utils.visuals as visuals
-from scenic.simulators.metsr import (
-    cosim_routing_utils as routing_utils,
-    cosim_utils as metsr,
-)
+import scenic.simulators.carla.coordinate_utils as utils
+import scenic.simulators.carla.visualization_utils as visuals
+from scenic.simulators.metsr import bridge_utils, routing_utils
 
 from . import pcla_utils
 
@@ -41,7 +39,7 @@ def boundary_vehicle_blueprint(simulation, key, state, scenic_object):
     for model in models:
         try:
             if scenic_object is not None:
-                blueprint, _ = carla_actor_utils.resolve_blueprint(
+                blueprint, _ = actor_utils.resolve_blueprint(
                     simulation.blueprintLib, model
                 )
             else:
@@ -74,7 +72,7 @@ def boundary_vehicle_transform(simulation, state, scenic_object, actor=None):
         if not all(math.isfinite(value) for value in (x, y, z, bearing)):
             raise ValueError("non-finite pose")
     except (KeyError, TypeError, ValueError) as error:
-        raise metsr.METSRControlError(
+        raise bridge_utils.METSRControlError(
             "METS-R boundary vehicle has no valid current pose", record=state
         ) from error
     location = carla.Location(x, -y, z)
@@ -226,7 +224,7 @@ def destroy_carla_object_during_teardown(simulation, obj) -> None:
         controller = getattr(obj, "carlaController", None)
         if controller is not None:
             try:
-                carla_actor_utils.destroy_walker_controller(
+                actor_utils.destroy_walker_controller(
                     controller,
                     is_registered=lambda actor: carla_actor_is_registered(
                         simulation, actor
@@ -297,7 +295,7 @@ def check_client_synchronization(simulation, objs=None, expected=None):
         (1) Can choose to specify which objects should be updated with obj arguement
     """
     all_actors = simulation.objects if not objs else objs
-    all_veh_data = metsr.collect_metsr_vehicle_data(
+    all_veh_data = bridge_utils.collect_metsr_vehicle_data(
         simulation.metsr_client,
         {obj: simulation.getMetsrPrivateVehId(obj) for obj in simulation.objects},
     )
@@ -312,7 +310,7 @@ def check_client_synchronization(simulation, objs=None, expected=None):
             obj.position.y, expected_pos[1]
         ):
             print(
-                f"Obj: {obj.name} on road: {metsr.metsr_vehicle_road(veh_data)} is out of sync discrepancy is:"
+                f"Obj: {obj.name} on road: {bridge_utils.metsr_vehicle_road(veh_data)} is out of sync discrepancy is:"
             )
             print(
                 f'(METSR : SCENIC) : x: {veh_data["x"], obj.position.x} y: {veh_data["y"], obj.position.y} z {veh_data["y"], obj.position.y}'
@@ -321,7 +319,7 @@ def check_client_synchronization(simulation, objs=None, expected=None):
 
 def prepare_carla_spawn(simulation, obj, native_state=None):
     """Select a blueprint and convert the current admission pose."""
-    blueprint = carla_actor_utils.prepare_actor_blueprint(obj, simulation.blueprintLib)
+    blueprint = actor_utils.prepare_actor_blueprint(obj, simulation.blueprintLib)
     # Queue admission can change the native pose during this step, before
     # Scenic refreshes obj's dynamic properties. Use the same current record
     # which establishes ownership for position, heading, and initial velocity.
@@ -410,7 +408,31 @@ def client_sync_diagnostic_due(count, synchronized_any):
 
 def clear_carla_route_state(simulation, obj):
     """Forget native ownership and a CARLA route installed by co-simulation."""
-    metsr.clear_carla_authoritative_segment(simulation.metsr_state, obj)
+    simulation.metsr_state.authoritative_segments.pop(obj, None)
     plan = simulation._carla_destination_plans.pop(obj, None)
     if plan is not None and getattr(obj, "trajectory", None) is plan[1]:
         obj.trajectory = None
+
+
+def within_threshold_to(object, cars, threshold=None, verbose=False):
+    """Return whether an actor is within the threshold and the nearest other actor."""
+    is_close = False
+    object_pos = np.array(object.position)
+    obj_distances = {}
+    danger_veh = None
+    min_dist = math.inf
+    for car in cars:
+        if car != object:
+            dist = np.linalg.norm(np.array(car.position) - object_pos)
+            if dist < min_dist:
+                danger_veh = car
+                min_dist = dist
+            obj_distances[car.name] = dist
+    if danger_veh is not None:
+        is_close = threshold is None or min_dist <= threshold
+    if verbose:
+        if obj_distances:
+            print(f"Min Distance for {object} was: {min_dist}")
+        else:
+            print(f"No other CARLA actors were available near {object}")
+    return is_close, danger_veh

@@ -1,8 +1,9 @@
 """Connector placement geometry includes elevation and rejects missing curves."""
+
 import math
 import unittest
 
-from scenic.simulators.carla.utils import routing as carla_routing
+from scenic.simulators.carla import routing_utils as carla_routing
 
 NATIVE_TURN_POINTS = [
     (-173.67, 4.02, 0),

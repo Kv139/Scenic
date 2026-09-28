@@ -10,8 +10,8 @@ carla = pytest.importorskip("carla")
 
 from scenic.core.simulators import SimulationCreationError
 from scenic.core.vectors import Orientation
+from scenic.simulators.carla import actor_utils as actors
 from scenic.simulators.carla.simulator import CarlaSimulation
-from scenic.simulators.carla.utils import actors
 
 
 class Blueprint:

@@ -3,9 +3,9 @@
 import unittest
 
 from scenic.simulators.cosim.simulator import CosimSimulation
-from scenic.simulators.metsr import cosim_routing_utils as routing
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
-from scenic.simulators.metsr.network import NetworkMetadata
+from scenic.simulators.metsr import routing_utils as routing
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
+from scenic.simulators.metsr.network_utils import NetworkMetadata
 
 
 class SplitConnectorObservationTests(unittest.TestCase):

@@ -1,9 +1,10 @@
 """Native vehicle velocities must stay in global coordinates at CARLA handoff."""
+
 import math
 import unittest
 
 from scenic.core.vectors import Orientation
-from scenic.simulators.metsr import cosim_utils as native
+from scenic.simulators.metsr import bridge_utils as native
 
 
 class NativeVelocityTests(unittest.TestCase):

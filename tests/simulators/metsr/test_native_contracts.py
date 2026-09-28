@@ -7,15 +7,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from scenic.simulators.metsr.client import METSRClient
-from scenic.simulators.metsr.cosim_utils import (
+from scenic.simulators.metsr.bridge_utils import (
     METSRControlError,
     METSRCosimState,
     collect_metsr_vehicle_data,
-    commit_takeover_ownership,
     validate_queue_admissions,
 )
-from scenic.simulators.metsr.network import NetworkMetadata, mapped_lane_query
+from scenic.simulators.metsr.client import METSRClient
+from scenic.simulators.metsr.network_utils import NetworkMetadata, mapped_lane_query
 
 
 def client_for(operation):
@@ -146,7 +145,7 @@ def test_metadata_copies_nested_inputs_and_shares_derived_indexes():
         metadata.lane_indices["native_2"] = 3
     with pytest.raises(FrozenInstanceError):
         metadata.lane_mapping = {}
-    commit_takeover_ownership(first, ["native"], {"native": set()}, {})
+    first.controlled_roads["native"] = True
     first.admitted_vehicles[10] = {"roadId": "native"}
     assert second.controlled_roads == second.admitted_vehicles == {}
 

@@ -1,3 +1,4 @@
+from datetime import datetime
 import gzip
 import hashlib
 import json
@@ -11,11 +12,11 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+
 import networkx as nx
 from websockets.sync.client import connect
 
-from .util import (
+from scenic.simulators.metsr.server_utils import (
     VEHICLE_SENSOR_CV2X,
     VEHICLE_SENSOR_DSRC,
     VEHICLE_SENSOR_MOBILE_DEVICE,
@@ -37,13 +38,13 @@ from .util import (
     _trajectory_format_score,
     _trajectory_manifest_summary,
     prepare_sim_dirs,
-    register_metsr_client,
     read_run_config,
+    register_metsr_client,
     run_simulation_in_docker,
     run_visualization_server,
     stop_visualization_server,
-    unregister_metsr_client,
     str_list_mapper_gen,
+    unregister_metsr_client,
 )
 
 str_list_to_int_list = str_list_mapper_gen(int)
@@ -1943,7 +1944,7 @@ class METSRClient:
             msg["data"] = [
                 {
                     "vehicleId": vehicle_id,
-                    "isPrivate": bool(private_flag),
+                    "isPrivate": private_flag,
                 }
                 for vehicle_id, private_flag in zip(vehicle_ids, private_flags)
             ]
@@ -2166,47 +2167,44 @@ class METSRClient:
         assert res["messageType"] == "road", res["messageType"]
         return res
 
-    def query_connector_path(self, connector_id, connector_path_id=None):
+    def query_connector_path(self, connectorID, connectorPathID=None):
         """Query lane-to-lane paths for one or more opaque connector IDs.
 
-        Omitting connector_path_id returns every movement path belonging to
+        Omitting connectorPathID returns every movement path belonging to
         each connector. Supplying a zero-based connector-local path ID returns
         that path's source/target lanes, via-lane IDs, exact internal-edge IDs,
         signal metadata, and geometry parameters.
         """
-        connector_ids = _as_list(connector_id)
+        connector_ids = _as_list(connectorID)
         if not connector_ids:
-            raise ValueError("connector_id cannot be empty")
+            raise ValueError("connectorID cannot be empty")
         path_ids = _batch_field_values(
-            connector_path_id,
+            connectorPathID,
             len(connector_ids),
-            "connector_path_id",
-            batch_name="connector_id",
+            "connectorPathID",
+            batch_name="connectorID",
         )
 
         data = []
         for index, (connector, path_id) in enumerate(zip(connector_ids, path_ids)):
             if connector is None or not str(connector).strip():
-                raise ValueError(f"connector_id[{index}] cannot be empty")
+                raise ValueError(f"connectorID[{index}] cannot be empty")
             record = {"connectorId": str(connector)}
             if path_id is not None:
                 if isinstance(path_id, bool):
-                    raise ValueError(
-                        "connector_path_id must be a non-negative integer"
-                    )
+                    raise ValueError("connectorPathID must be a non-negative integer")
                 try:
                     numeric_path_id = float(path_id)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        "connector_path_id must be a non-negative integer"
+                        "connectorPathID must be a non-negative integer"
                     ) from exc
                 if (
-                        not math.isfinite(numeric_path_id)
-                        or numeric_path_id < 0
-                        or not numeric_path_id.is_integer()):
-                    raise ValueError(
-                        "connector_path_id must be a non-negative integer"
-                    )
+                    not math.isfinite(numeric_path_id)
+                    or numeric_path_id < 0
+                    or not numeric_path_id.is_integer()
+                ):
+                    raise ValueError("connectorPathID must be a non-negative integer")
                 record["connectorPathId"] = int(numeric_path_id)
             data.append(record)
 
@@ -2597,42 +2595,32 @@ class METSRClient:
     # Historical camel-case spelling retained for source compatibility.
     query_coSimVehicle = query_cosim_vehicle
 
-    def query_boundary_vehicle(self, boundary_dist=10.0):
-        """Query native vehicles blocking exits from controlled connectors.
+    def query_boundary_vehicle(self):
+        """Query native vehicles near exits of co-simulation connectors.
 
-        Sends ``boundaryVehicle`` (the server's ``queryBoundaryVeh`` handler).
-        Sends the top-level ``boundaryDist`` parameter in meters. METS-R selects
-        vehicles on native downstream roads whose distance from their current
-        lane's entry is strictly less than this threshold. The query does not
-        change vehicle control or reserve a connector.
+        Sends ``boundaryVehicle`` (the simulator's ``queryBoundaryVeh`` handler)
+        without input data. Each entry in ``data`` uses the same bridge schema
+        as :meth:`query_cosim_vehicle`: ``vehicleId``, ``isPrivate``,
+        ``coordinateTrail``, ``routeRoadIds``, and road/lane/control fields.
 
-        Records use the :meth:`query_cosim_vehicle` schema, with the actual
-        native road/lane and ``controlMode='native'``. Use ``vehicleId`` together
-        with ``isPrivate`` as the identity, and :meth:`query_vehicle` with
-        ``transform_coords=True`` for current positions and headings.
+        These vehicles are on native physical roads immediately downstream of
+        controlled connectors, strictly less than 1.2 vehicle lengths from
+        their current lane's entry. ``controlMode`` is ``native`` and
+        ``onConnector`` is false. Mirror them as obstacles in the external
+        simulator; they remain METS-R controlled.
+        Use :meth:`query_vehicle` with the returned IDs and private flags to
+        obtain current poses in the desired coordinate system.
 
-        Parameters
-        ----------
-        boundary_dist : float, optional
-            Finite, non-negative distance from the lane entry in meters.
-            Defaults to 10 meters; zero selects no vehicles.
+        Returns ``{'messageType': 'boundaryVehicle', 'data': [...]}``, with an
+        empty list when there are no qualifying vehicles.
         """
-        error = "boundary_dist must be a finite, non-negative distance in meters"
-        if isinstance(boundary_dist, bool):
-            raise ValueError(error)
-        try:
-            boundary_dist = float(boundary_dist)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(error) from exc
-        if not math.isfinite(boundary_dist) or boundary_dist < 0.0:
-            raise ValueError(error)
-        res = self.send_receive_msg(
-            {"messageType": "boundaryVehicle", "boundaryDist": boundary_dist},
-            ignore_heartbeats=True,
-        )
+        msg = {"messageType": "boundaryVehicle"}
+        res = self.send_receive_msg(msg, ignore_heartbeats=True)
         assert res["messageType"] == "boundaryVehicle", res["messageType"]
         return res
 
+
+    query_boundaryVehicle = query_boundary_vehicle
     queryBoundaryVeh = query_boundary_vehicle
 
     def query_cosim_roads(self):
@@ -4190,12 +4178,13 @@ class METSRClient:
         transform_coords=False,
         length=None,
         segment_id=None,
-        connector_path_id=None,
         road_id=None,
         destinationRoadID=None,
         destRoadID=None,
         segmentID=None,
         roadID=None,
+        *,
+        connector_path_id=None,
         connectorPathID=None,
     ):
         """Create private EVs directly at authoritative co-simulation poses.
@@ -4207,6 +4196,10 @@ class METSRClient:
         the protocol's equivalent legacy spelling. ``destination_road_id``
         must be a physical METS-R road with a destination zone. The server
         rejects overlaps instead of shifting the requested pose.
+
+        The positional arguments match METS-R_HPC. The keyword-only
+        ``connector_path_id``/``connectorPathID`` extension preserves Scenic's
+        exact connector-path selection during initialization.
 
         All arguments accept scalars or batches matching ``vehID``. The camel-
         case keyword aliases mirror the wire protocol. Public fleet vehicles
@@ -4295,8 +4288,15 @@ class METSRClient:
         laneIndex=None,
         connector_path_id=None,
         connectorPathID=None,
+        pose_only=False,
     ):
         """Apply an authoritative external pose to a co-simulation vehicle.
+
+        Set ``pose_only=True`` to publish an external pose without requiring
+        native road or connector membership. Each selected record requires
+        finite pose values and cannot include segment, lane, or path selectors.
+        A scalar boolean broadcasts across a batch; False adds no wire field.
+        The server reports ``externalPoseAuthoritative`` and ``shadowMatched``.
 
         Without ``segment_id``, METS-R map-matches only against co-simulation
         roads and connectors. An explicit segment is authoritative.
@@ -4347,11 +4347,33 @@ class METSRClient:
             segment_id=segment_id,
             lane_index=lane_index,
             connector_path_id=connector_path_id,
+            pose_only=pose_only,
         ):
             record = _pose_record(values)
             selected_segment = values["segment_id"]
             selected_lane = values["lane_index"]
             selected_connector_path = values["connector_path_id"]
+            pose_only_flag = values["pose_only"]
+            if not isinstance(pose_only_flag, bool):
+                raise ValueError("pose_only must be a boolean for each vehicle")
+            if pose_only_flag:
+                if any(
+                    value is not None
+                    for value in (selected_segment, selected_lane, selected_connector_path)
+                ):
+                    raise ValueError(
+                        "pose_only cannot be combined with segment, lane, or connector-path selectors"
+                    )
+                for field in ("x", "y", "z", "bearing", "speed"):
+                    value = record[field]
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        number = math.nan
+                    if isinstance(value, bool) or not math.isfinite(number):
+                        raise ValueError(f"pose_only {field} must be finite")
+                    record[field] = number
+                record["poseOnly"] = True
             if selected_lane is not None and selected_connector_path is not None:
                 raise ValueError("lane_index and connector_path_id are mutually exclusive")
             if (
@@ -4651,6 +4673,63 @@ class METSRClient:
         return res
 
     # control vehicle with specified acceleration
+    def cancel_cosim_vehicle(self, vehID, private_veh=False):
+        """Cancel external vehicle ownership and return the server reply unchanged.
+
+        Vehicle IDs and private-vehicle flags accept scalars or equal-length
+        batches. Visualization annotations are cleared only when a matching
+        reply explicitly confirms successful cancellation.
+        """
+        vehicle_ids = _as_list(vehID)
+        private_flags = _batch_field_values(private_veh, len(vehicle_ids), "private_veh")
+        if any(not isinstance(flag, bool) for flag in private_flags):
+            raise ValueError("private_veh must be a boolean for each vehicle")
+        msg = {
+            "messageType": "cancelCoSimVeh",
+            "data": [
+                {"vehicleId": vehicle_id, "isPrivate": private_flag}
+                for vehicle_id, private_flag in zip(vehicle_ids, private_flags)
+            ],
+        }
+        response = self.send_receive_msg(msg, ignore_heartbeats=True)
+        if (
+            not isinstance(response, dict)
+            or response.get("messageType") != "cancelCoSimVeh"
+            or response.get("status") not in ("ok", "partial")
+            or not isinstance(response.get("data"), (list, tuple))
+        ):
+            return response
+
+        requested_namespaces = {}
+        for vehicle_id, private_flag in zip(vehicle_ids, private_flags):
+            requested_namespaces.setdefault(str(vehicle_id), set()).add(private_flag)
+        cancelled_keys = set()
+        for record in response["data"]:
+            if (
+                not isinstance(record, dict)
+                or record.get("vehicleId") is None
+                or record.get("status") != "ok"
+                or record.get("cancelled") is not True
+                or record.get("controlMode") != "native"
+                or record.get("externalPoseAuthoritative") is not False
+            ):
+                continue
+            vehicle_id = str(record["vehicleId"])
+            namespaces = requested_namespaces.get(vehicle_id, set())
+            if "isPrivate" in record:
+                private_flag = record["isPrivate"]
+                if isinstance(private_flag, bool) and private_flag in namespaces:
+                    cancelled_keys.add((private_flag, vehicle_id))
+            elif len(namespaces) == 1:
+                # Older replies omit the namespace; only an unambiguous ID
+                # can safely identify the annotation to clear.
+                cancelled_keys.add((next(iter(namespaces)), vehicle_id))
+        if cancelled_keys:
+            with self.viz_stream_lock:
+                self._attack_vehicle_keys.difference_update(cancelled_keys)
+        return response
+
+
     def control_vehicle(self, vehID, acc, private_veh = False):
         msg = {
                 "messageType": "controlVeh",
@@ -5200,22 +5279,22 @@ class METSRClient:
     cancel_request = cancel_requests
     cancelRequests = cancel_requests
 
-    def reposition_taxi(self, vehID, zoneID):
-        """Reposition idle/cruising taxi(s) to destination zone(s).
+    def reposition_taxi(self, vehID, zoneID=None, roadID=None):
+        """Reposition idle/cruising taxis to destination zones or physical roads.
 
-        If the taxi was already traveling to reserved parking, the simulator can
-        release that reservation and report ``parkingReservationReleased`` in
-        the response record.
+        The server can release a prior parking reservation and reports
+        ``parkingReservationReleased`` in the response record.
         """
         msg = {"messageType": "repositionTaxi", "data": []}
-        if not isinstance(vehID, list):
-            vehID = [vehID]
-        if not isinstance(zoneID, list):
-            zoneID = [zoneID] * len(vehID)
-        assert len(vehID) == len(zoneID), "vehID and zoneID must have the same length"
-
-        for vehID, zoneID in zip(vehID, zoneID):
-            msg["data"].append({"vehicleId": vehID, "zoneId": zoneID})
+        for values in _vehicle_batch_records(vehID, zoneID=zoneID, roadID=roadID):
+            if values["zoneID"] is None and values["roadID"] is None:
+                raise ValueError("zoneID or roadID is required for reposition_taxi")
+            record = {"vehicleId": values["vehicleId"]}
+            if values["zoneID"] is not None:
+                record["zoneId"] = values["zoneID"]
+            if values["roadID"] is not None:
+                record["roadId"] = values["roadID"]
+            msg["data"].append(record)
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
         assert res["messageType"] == "repositionTaxi", res["messageType"]
         assert res["status"] in {"ok", "partial"}, res["status"]

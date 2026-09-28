@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from scenic.simulators.metsr.cosim_utils import METSRControlError, METSRCosimState
+from scenic.simulators.metsr.bridge_utils import METSRControlError, METSRCosimState
 from tests.simulators.cosim.helpers import make_simulation
 
 

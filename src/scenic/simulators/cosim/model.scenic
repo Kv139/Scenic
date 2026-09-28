@@ -1,13 +1,13 @@
 import pathlib
 from scenic.simulators.carla.model import Vehicle, is2DMode, network
-from scenic.simulators.metsr.network import load_network_metadata, mapped_driving_region
+from scenic.simulators.metsr.network_utils import load_network_metadata, mapped_driving_region
 
 import scenic.simulators.carla.blueprints as blueprints
 from scenic.simulators.carla.behaviors import *
 from scenic.simulators.utils.colors import Color
 
-from .utils.CoSimActions import *
-from .utils.scenarios import *
+from .actions import *
+from .scenarios import *
 
 from scenic.simulators.metsr.traffic_flows import *
 

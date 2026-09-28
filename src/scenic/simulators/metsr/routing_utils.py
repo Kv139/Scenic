@@ -10,9 +10,11 @@ import networkx as nx
 from scenic.core.object_types import Object
 from scenic.core.simulators import SimulationCreationError
 from scenic.domains.driving.roads import Road
-from scenic.simulators.carla.utils import routing as carla_routing, utils
-
-from . import cosim_utils, network
+from scenic.simulators.carla import (
+    coordinate_utils as utils,
+    routing_utils as carla_routing,
+)
+from scenic.simulators.metsr import bridge_utils, network_utils
 
 CARLA_OWNED_PROJECTION_TOLERANCE = 4.25
 
@@ -51,9 +53,9 @@ def identify_nearest_road(state, client, obj: Object, roads: list[str]) -> str |
     candidates = []
     unlocated_internal_segments = set()
     for road_lane in roads:
-        road, lane_index = network.mapped_lane_query(state, road_lane)
+        road, lane_index = network_utils.mapped_lane_query(state, road_lane)
         if lane_index is None:
-            if cosim_utils.is_controlled_internal_segment(state, road):
+            if bridge_utils.is_controlled_internal_segment(state, road):
                 unlocated_internal_segments.add(str(road))
         elif road in state.valid_roads or road in state.controlled_segments:
             candidates.append((road, lane_index))
@@ -252,7 +254,7 @@ def nearest_mapped_lane_projection(state, client, position, mapped_lanes, target
     candidates = (
         (road, lane_index)
         for road, lane_index in (
-            network.mapped_lane_query(state, lane) for lane in mapped_lanes
+            network_utils.mapped_lane_query(state, lane) for lane in mapped_lanes
         )
         if road == target_road and lane_index is not None
     )
@@ -275,10 +277,12 @@ def generate_carla_destination_trajectory(
         lanes = [
             lane
             for lane in simulation.metsr_state.metadata.lane_mapping.get(key, ())
-            if network.mapped_lane_query(simulation.metsr_state, lane)[1] is not None
+            if network_utils.mapped_lane_query(simulation.metsr_state, lane)[1]
+            is not None
         ]
         roads = {
-            network.mapped_lane_query(simulation.metsr_state, lane)[0] for lane in lanes
+            network_utils.mapped_lane_query(simulation.metsr_state, lane)[0]
+            for lane in lanes
         }
         if destination not in roads:
             return False
@@ -309,8 +313,8 @@ def generate_carla_destination_trajectory(
     target_lanes = sorted(
         lane
         for lane in simulation.metsr_state.metadata.carla_keys_by_lane
-        if network.mapped_lane_query(simulation.metsr_state, lane)[0] == destination
-        and network.mapped_lane_query(simulation.metsr_state, lane)[1] is not None
+        if network_utils.mapped_lane_query(simulation.metsr_state, lane)[0] == destination
+        and network_utils.mapped_lane_query(simulation.metsr_state, lane)[1] is not None
     )
     best_path, best_length = None, math.inf
     failures = []
@@ -375,7 +379,7 @@ def lane_anchor_waypoint(simulation, sumo_lane, final=False):
         simulation._carla_waypoints_by_key = carla_routing.index_carla_waypoints(
             simulation.map, simulation.grp
         )
-    road, lane_index = network.mapped_lane_query(simulation.metsr_state, sumo_lane)
+    road, lane_index = network_utils.mapped_lane_query(simulation.metsr_state, sumo_lane)
     if lane_index is None:
         return None
     centerline = query_mapped_centerline(
@@ -416,7 +420,7 @@ def degenerate_connector_spawn_orientation(simulation, state, position):
     """
     connector_id = state.get("connectorId")
     path_id = normalized_connector_path_id(state.get("connectorPathId"))
-    if path_id is None or not cosim_utils.is_controlled_connector_id(
+    if path_id is None or not bridge_utils.is_controlled_connector_id(
         simulation.metsr_state, connector_id
     ):
         return None
@@ -429,9 +433,11 @@ def degenerate_connector_spawn_orientation(simulation, state, position):
     connections = simulation.metsr_state.metadata.internal_lane_connections
     for via_lane in state.get("connectorPathViaLaneIds", ()):
         for source_lane, target_lane in connections.get(str(via_lane), ()):
-            if network.mapped_lane_query(simulation.metsr_state, source_lane)[0] == str(
-                source
-            ) and network.mapped_lane_query(simulation.metsr_state, target_lane)[
+            if network_utils.mapped_lane_query(simulation.metsr_state, source_lane)[
+                0
+            ] == str(source) and network_utils.mapped_lane_query(
+                simulation.metsr_state, target_lane
+            )[
                 0
             ] == str(
                 target
@@ -485,7 +491,7 @@ def native_handoff_target(simulation, obj, location):
     mapped_lanes = mapped_lanes_for_carla_waypoint(simulation.metsr_state, waypoint)
     candidates = []
     for mapped_lane in mapped_lanes:
-        road, index = network.mapped_lane_query(simulation.metsr_state, mapped_lane)
+        road, index = network_utils.mapped_lane_query(simulation.metsr_state, mapped_lane)
         if (
             road is not None
             and not str(road).startswith(":")
@@ -547,10 +553,12 @@ def classify_bubble_roads(state, bubble_roads, scenic_roads_by_id):
         dict.fromkeys(
             native_id
             for road in bubble_roads
-            for native_id in network.map_scenic_to_metsr_road(state, road)
+            for native_id in network_utils.map_scenic_to_metsr_road(state, road)
         )
     )
-    repaired = network.repair_mapping(state, road_ids, native_ids, scenic_roads_by_id)
+    repaired = network_utils.repair_mapping(
+        state, road_ids, native_ids, scenic_roads_by_id
+    )
     roads_by_id = {str(road.id): road for road in (*bubble_roads, *repaired)}
     active = frozenset(native_ids)
     return BubbleRoadSelection(
@@ -572,7 +580,7 @@ def vehicle_destination_road(obj, vehicle_state):
 
 def select_spawn_placement(simulation, obj, origin=None):
     """Map a Scenic spawn to a native road lane or connector movement."""
-    lane = simulation.network_helper._nearest_lane(obj)
+    lane = obj._lane
     if lane is None:
         raise SimulationCreationError(
             f"Unable to identify a Scenic origin lane for {obj}"
@@ -631,7 +639,7 @@ def select_spawn_placement(simulation, obj, origin=None):
 
     is_cosim = (
         segment in simulation.metsr_state.controlled_roads
-        or cosim_utils.is_controlled_connector_id(simulation.metsr_state, segment)
+        or bridge_utils.is_controlled_connector_id(simulation.metsr_state, segment)
     )
     # Native vehicles enter the origin road's pending queue, so their sampled
     # coordinates need not project onto that road. Co-simulation spawns do.

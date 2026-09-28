@@ -699,13 +699,10 @@ def test_visualization_discovers_cosim_only_vehicle():
     assert records[0]["_viz_private_veh"] is True
 
 
-@pytest.mark.parametrize("method", ["query_boundary_vehicle", "queryBoundaryVeh"])
-@pytest.mark.parametrize("kwargs,distance", [
-    ({}, 10.0),
-    ({"boundary_dist": 0}, 0.0),
-    ({"boundary_dist": 25.5}, 25.5),
-])
-def test_boundary_vehicle_query_uses_native_read_only_protocol(method, kwargs, distance):
+@pytest.mark.parametrize(
+    "method", ["query_boundary_vehicle", "query_boundaryVehicle", "queryBoundaryVeh"]
+)
+def test_boundary_vehicle_query_uses_native_read_only_protocol(method):
     response = ok_response("boundaryVehicle", [{
         "vehicleId": 17,
         "isPrivate": False,
@@ -716,18 +713,15 @@ def test_boundary_vehicle_query_uses_native_read_only_protocol(method, kwargs, d
     sent = []
     client = make_client(response, sent)
 
-    assert getattr(client, method)(**kwargs) is response
-    assert sent == [({"messageType": "boundaryVehicle", "boundaryDist": distance}, True)]
+    assert getattr(client, method)() is response
+    assert sent == [({"messageType": "boundaryVehicle"}, True)]
 
 
-@pytest.mark.parametrize("distance", [
-    -1, float("nan"), float("inf"), float("-inf"), None, True, "invalid",
-])
-def test_boundary_vehicle_query_rejects_invalid_distance_before_sending(distance):
+def test_boundary_vehicle_query_leaves_distance_selection_to_server():
     sent = []
     client = make_client(ok_response("boundaryVehicle"), sent)
 
-    with pytest.raises(ValueError, match="boundary_dist must be a finite, non-negative"):
-        client.query_boundary_vehicle(boundary_dist=distance)
+    with pytest.raises(TypeError, match="boundary_dist"):
+        client.query_boundary_vehicle(boundary_dist=15.0)
 
     assert sent == []

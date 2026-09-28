@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from scenic.simulators.metsr.util import modify_property_file
+from scenic.simulators.metsr.server_utils import modify_property_file
 
 
 def read_properties(path):

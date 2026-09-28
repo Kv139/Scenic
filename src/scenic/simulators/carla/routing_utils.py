@@ -4,7 +4,7 @@ import math
 
 import carla
 
-from . import utils
+from scenic.simulators.carla import coordinate_utils as utils
 
 
 def carla_waypoint_distance(location, waypoint):

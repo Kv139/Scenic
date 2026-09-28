@@ -7,7 +7,7 @@ import numpy as np
 from scipy import linalg
 
 from scenic.domains.driving.actions import *
-import scenic.simulators.carla.utils.utils as _utils
+import scenic.simulators.carla.coordinate_utils as _utils
 
 ################################################
 # Actions available to all carla.Actor objects #

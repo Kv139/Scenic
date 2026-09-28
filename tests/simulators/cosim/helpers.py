@@ -6,8 +6,8 @@ from unittest.mock import Mock
 
 from scenic.core.vectors import Orientation, Vector
 from scenic.simulators.cosim.simulator import CosimSimulation
-from scenic.simulators.metsr.cosim_utils import METSRCosimState
-from scenic.simulators.metsr.network import NetworkMetadata
+from scenic.simulators.metsr.bridge_utils import METSRCosimState
+from scenic.simulators.metsr.network_utils import NetworkMetadata
 
 
 class Vehicle(SimpleNamespace):
@@ -29,7 +29,7 @@ def make_simulation():
     simulation._carla_destination_plans = {}
     simulation._carla_spawn_property_seeds = {}
     simulation._pre_actor_teardown_callbacks = []
-    simulation.network_helper = SimpleNamespace(roads_by_id={})
+    simulation.bubble_topology = SimpleNamespace(roads_by_id={})
     simulation.tm = SimpleNamespace(set_path=Mock())
     simulation.carla_world = SimpleNamespace(
         get_actors=lambda: SimpleNamespace(filter=lambda pattern: []),

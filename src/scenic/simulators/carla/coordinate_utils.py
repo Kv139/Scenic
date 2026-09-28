@@ -83,3 +83,8 @@ def scenicToCarlaTrafficLightStatus(status):
 
 def carlaToScenicTrafficLightStatus(status):
     return str(status).lower()
+
+
+def carlaToCompassBearing(yaw):
+    """Convert CARLA yaw in degrees to clockwise compass bearing (north = 0)."""
+    return (yaw + 90.0) % 360.0
