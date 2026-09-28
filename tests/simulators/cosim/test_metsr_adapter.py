@@ -1,40 +1,36 @@
 from contextlib import redirect_stdout
+from dataclasses import replace
 from io import StringIO
 import math
-import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.cosim.simulator import (
-    carla,
-    CARLA_OWNED_PROJECTION_TOLERANCE,
-    COSIM_ADMISSION_SPAWN_MAX_TICKS,
-    ROAD_OBSERVATION_DIRECT_SUCCESSOR,
-    ROAD_OBSERVATION_ONE_SKIP,
-    ROAD_OBSERVATION_PREDECESSOR,
-    ROAD_OBSERVATION_SAME,
-    ROAD_OBSERVATION_UNSUPPORTED,
-    ROAD_OBSERVATION_UNKNOWN,
-    CosimSimulation,
-    METSRControlError,
-    _render_step_interval,
+from scenic.simulators.carla.utils import routing as carla_routing
+from scenic.simulators.cosim import (
+    cosim_routing_utils as bubble_routing,
+    cosim_utils as runtime,
 )
-from scenic.simulators.cosim.utils.network_helper import network_cache
+from scenic.simulators.cosim.cosim_utils import (
+    render_step_interval as _render_step_interval,
+)
+from scenic.simulators.cosim.simulator import carla
 from scenic.simulators.cosim.utils import utils as cosim_utils
-
-
-def metsr_response(message_type, data=(), status="ok", **fields):
-    """Build one current native METS-R response envelope for test doubles."""
-    response = {
-        "messageType": message_type,
-        "status": status,
-        "data": list(data),
-    }
-    response.update(fields)
-    return response
+from scenic.simulators.metsr import (
+    cosim_routing_utils as routing,
+    cosim_utils as native,
+    network as metsr_network,
+)
+from scenic.simulators.metsr.cosim_utils import (
+    COSIM_ADMISSION_SPAWN_MAX_TICKS,
+    METSRControlError,
+    METSRCosimState,
+)
+from scenic.simulators.metsr.network import NetworkMetadata
+from tests.simulators.cosim.helpers import Vehicle, make_simulation, metsr_response
 
 
 class NetworkMappingTests(unittest.TestCase):
@@ -44,20 +40,10 @@ class NetworkMappingTests(unittest.TestCase):
         self.assertEqual(_render_step_interval(0.1, 4), 4)
 
     def test_lane_suffix_removal_preserves_internal_road_id(self):
-        workspace = SimpleNamespace(
-            network=SimpleNamespace(
-                laneSections=[], allRoads=[], intersections=[]
-            )
+        state = METSRCosimState(
+            metadata=NetworkMetadata(lane_mapping={"1034_-1": [":1034_0_0"]})
         )
-        cache = network_cache(
-            workspace,
-            {"1034_-1": [":1034_0_0"]},
-            {":1034_0"},
-        )
-
-        self.assertEqual(
-            cache.scenic_to_metsr_map_roads["1034"], {":1034_0"}
-        )
+        self.assertEqual(state.metadata.roads_by_scenic["1034"], {":1034_0"})
 
     def test_metsr_lane_index_excludes_sumo_shoulders(self):
         network = """\
@@ -77,7 +63,7 @@ class NetworkMappingTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "map.net.xml"
             path.write_text(network, encoding="utf-8")
-            indices = cosim_utils.generate_metsr_lane_index_map(path)
+            indices = metsr_network.load_network_metadata(path).lane_indices
 
         self.assertEqual(indices["-29_2"], 0)
         self.assertEqual(indices["-29_6"], 4)
@@ -101,11 +87,9 @@ class NetworkMappingTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "map.net.xml"
             path.write_text(network, encoding="utf-8")
-            connections = cosim_utils.generate_metsr_lane_connection_map(path)
-            internal = cosim_utils.generate_metsr_internal_lane_connection_map(path)
+            internal = metsr_network.load_network_metadata(path).internal_lane_connections
 
-        self.assertEqual(connections, {("A", "B"): [("A_1", "B_2")]})
-        self.assertEqual(internal, {":J_0_0": [("A_1", "B_2")]})
+        self.assertEqual(internal, {":J_0_0": (("A_1", "B_2"),)})
 
     def test_internal_edge_connections_preserve_opaque_road_characters(self):
         network = """\
@@ -131,15 +115,11 @@ class NetworkMappingTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "map.net.xml"
             path.write_text(network, encoding="utf-8")
-            edges = cosim_utils.generate_metsr_internal_edge_connection_map(path)
+            edges = metsr_network.load_network_metadata(path).internal_edge_connections
 
         self.assertEqual(
             edges,
-            {
-                ":452_4": [
-                    ("src_under/%:road_0", "dst_under/%:road_0")
-                ]
-            },
+            {":452_4": (("src_under/%:road_0", "dst_under/%:road_0"),)},
         )
 
 
@@ -156,411 +136,23 @@ class AdapterStateTests(unittest.TestCase):
             transform=SimpleNamespace(location=location),
         )
 
-    def _route_stitch_fixture(self, divergent=False):
-        simulation = object.__new__(CosimSimulation)
-        waypoints = {
-            "A": self._route_waypoint(1, -1, 1.0, 0.0),
-            "B": self._route_waypoint(2, -1, 1.0, 10.0),
-            "C": self._route_waypoint(3, -1, 1.0, 20.0),
-            "X": self._route_waypoint(4, -1, 1.0, 5.0),
-        }
-        simulation.scenic_to_metsr_map = {
-            "1_-1": ["A_0"],
-            "2_-1": ["B_0"],
-            "3_-1": ["C_0"],
-            "4_-1": ["X_0"],
-        }
-        simulation.metsr_lane_indices = {
-            "A_0": 0,
-            "B_0": 0,
-            "C_0": 0,
-            "X_0": 0,
-        }
-        simulation.metsr_lane_connections = {
-            ("A", "B"): [("A_0", "B_0")],
-            ("B", "C"): [("B_0", "C_0")],
-        }
-        simulation._sumo_lane_to_carla_keys = {
-            "A_0": {"1_-1"},
-            "B_0": {"2_-1"},
-            "C_0": {"3_-1"},
-        }
-        simulation._carla_waypoints_by_key = {
-            "1_-1": [waypoints["A"]],
-            "2_-1": [waypoints["B"]],
-            "3_-1": [waypoints["C"]],
-        }
-        simulation.metsr_road_cache = {
-            ("A", 0): [(0.0, 0.0, 0.0), (9.0, 0.0, 0.0)],
-            ("B", 0): [(10.0, 0.0, 0.0), (19.0, 0.0, 0.0)],
-            ("C", 0): [(20.0, 0.0, 0.0), (29.0, 0.0, 0.0)],
-        }
-
-        def waypoint_at(location, **kwargs):
-            return min(
-                (waypoints["A"], waypoints["B"], waypoints["C"]),
-                key=lambda waypoint: abs(waypoint.transform.location.x - location.x),
-            )
-
-        calls = []
-
-        def trace_route(start, target):
-            calls.append((start.x, target.x))
-            if target.x == 10.0:
-                if divergent:
-                    return [
-                        (waypoints["A"], None),
-                        (waypoints["X"], None),
-                        (waypoints["B"], None),
-                    ]
-                return [(waypoints["A"], None), (waypoints["B"], None)]
-            return [(waypoints["B"], None), (waypoints["C"], None)]
-
-        simulation.map = SimpleNamespace(get_waypoint=waypoint_at)
-        simulation.grp = SimpleNamespace(trace_route=trace_route)
-        obj = SimpleNamespace(
-            name="route-car",
-            position=SimpleNamespace(x=0.0, y=0.0),
-            carlaActor=SimpleNamespace(
-                get_location=lambda: waypoints["A"].transform.location
-            ),
-        )
-        return simulation, obj, calls
-
-    def _route_matcher(self, connections=()):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_connections = {
-            connection: [("source_lane", "target_lane")]
-            for connection in connections
-        }
-        return simulation._route_candidate_sequence_matches
-
-    def test_route_candidate_matching_requires_every_macro_road(self):
-        matches = self._route_matcher()
-        self.assertTrue(
-            matches([{"A"}, {"A", "B"}, {"B"}, {"C"}], ["A", "B", "C"])
-        )
-        self.assertFalse(
-            matches([{"A"}, {"C"}], ["A", "B", "C"])
-        )
-
-    def test_route_candidate_matching_accepts_one_direct_predecessor_run(self):
-        matches = self._route_matcher({("4", "A")})
-
-        self.assertTrue(matches([{"4"}, {"4"}, {"A"}, {"B"}], ["A", "B"]))
-
-    def test_route_candidate_matching_rejects_unconnected_leading_road(self):
-        matches = self._route_matcher()
-
-        self.assertFalse(matches([{"4"}, {"A"}, {"B"}], ["A", "B"]))
-
-    def test_route_candidate_matching_rejects_intermediate_extra_road(self):
-        matches = self._route_matcher()
-
-        self.assertFalse(matches([{"A"}, {"X"}, {"B"}], ["A", "B"]))
-
-    def test_route_candidate_matching_rejects_trailing_extra_road(self):
-        matches = self._route_matcher()
-
-        self.assertFalse(matches([{"A"}, {"B"}, {"X"}], ["A", "B"]))
-
-    def test_route_candidate_matching_rejects_multiple_predecessor_runs(self):
-        matches = self._route_matcher({("3", "A"), ("4", "A")})
-
-        self.assertFalse(
-            matches([{"3"}, {"4"}, {"A"}, {"B"}], ["A", "B"])
-        )
-
-    def test_carla_trajectory_stitches_every_adjacent_macro_road(self):
-        simulation, obj, calls = self._route_stitch_fixture()
-
-        locations = simulation.generate_carla_trajectory(["A", "B", "C"], obj)
-
-        self.assertEqual([location.x for location in locations], [0.0, 10.0, 20.0])
-        self.assertEqual(calls, [(0.0, 10.0), (10.0, 20.0)])
-
-    def test_carla_trajectory_fails_closed_on_segment_divergence(self):
-        simulation, obj, _ = self._route_stitch_fixture(divergent=True)
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "diverged from the METS-R macro route"
-        ):
-            simulation.generate_carla_trajectory(["A", "B", "C"], obj)
-
-    def test_carla_trajectory_trims_one_confirmed_stale_prefix(self):
-        simulation, obj, calls = self._route_stitch_fixture()
-        start = SimpleNamespace(x=10.0, y=0.0, z=0.0)
-        obj.carlaActor.get_location = lambda: start
-
-        locations = simulation.generate_carla_trajectory(["A", "B", "C"], obj)
-
-        self.assertEqual([location.x for location in locations], [10.0, 20.0])
-        self.assertEqual(calls, [(10.0, 20.0)])
-
-    def test_carla_trajectory_rejects_unconfirmed_stale_prefix(self):
-        simulation, obj, _ = self._route_stitch_fixture()
-        start = SimpleNamespace(x=10.0, y=0.0, z=0.0)
-        obj.carlaActor.get_location = lambda: start
-        simulation.scenic_to_metsr_map["2_-1"] = ["B_9"]
-        simulation.metsr_lane_indices["B_9"] = 9
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "not direct arrivals"
-        ):
-            simulation.generate_carla_trajectory(["A", "B", "C"], obj)
-
-    def test_carla_trajectory_keeps_arrival_lane_separate_from_departure(self):
-        simulation, obj, _ = self._route_stitch_fixture()
-        simulation.metsr_lane_indices.update({"B_5": 2, "B_7": 3})
-        simulation._align_carla_route_start = lambda route, start: tuple(route)
-        calls = {"candidate": [], "stitch": []}
-
-        def candidates(route, start, required_initial_lane=None):
-            calls["candidate"].append(required_initial_lane)
-            # B_7 is the route-selected departure lane; B_5 is the
-            # independent authoritative pending-arrival lane.
-            return [["B_7", "C_0"]]
-
-        simulation._candidate_metsr_lane_chains = candidates
-        waypoint = self._route_waypoint(2, -1, 1.0, 10.0)
-
-        def stitch(route, start, chain, required_initial_lane=None):
-            calls["stitch"].append((tuple(chain), required_initial_lane))
-            return [(waypoint, None)]
-
-        simulation._stitch_carla_route = stitch
-
-        locations = simulation.generate_carla_trajectory(
-            ["B", "C"], obj, required_first_lane_id=2
-        )
-
-        self.assertEqual(calls["candidate"], ["B_5"])
-        self.assertEqual(calls["stitch"], [(('B_7', 'C_0'), "B_5")])
-        self.assertEqual([location.x for location in locations], [10.0])
-
-        with self.assertRaisesRegex(
-            SimulationCreationError,
-            "authoritative compact lane 4 of road B; found",
-        ):
-            simulation.generate_carla_trajectory(
-                ["B", "C"], obj, required_first_lane_id=4
-            )
-
-    def test_forward_lane_anchor_ignores_waypoints_behind_current_pose(self):
-        simulation = object.__new__(CosimSimulation)
-        current = self._route_waypoint(1, -1, 60.0, 60.0)
-        behind = self._route_waypoint(1, -2, 50.0, 50.0)
-        ahead = self._route_waypoint(1, -2, 85.0, 85.0)
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: current
-        )
-        simulation.scenic_to_metsr_map = {
-            "1_-1": ["A_0"],
-            "1_-2": ["A_1"],
-        }
-        simulation.metsr_lane_indices = {"A_0": 0, "A_1": 1}
-        simulation.metsr_lane_connections = {}
-        simulation._sumo_lane_to_carla_keys = {"A_1": {"1_-2"}}
-        simulation._carla_waypoints_by_key = {"1_-2": [behind, ahead]}
-        simulation.metsr_road_cache = {
-            ("A", 1): [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)]
-        }
-        simulation.grp = SimpleNamespace(
-            _sampling_resolution=2.0,
-            trace_route=lambda start, target: [(current, None), (ahead, None)],
-        )
-
-        anchor, _ = simulation._forward_lane_anchor_trace(
-            "A_1", current.transform.location, "A", 1
-        )
-
-        self.assertIs(anchor, ahead)
-
-    def test_forward_lane_anchor_retries_when_planner_overshoots_candidate(self):
-        simulation = object.__new__(CosimSimulation)
-        current = self._route_waypoint(1, -1, 0.0, 0.0)
-        near = self._route_waypoint(1, -2, 10.0, 10.0)
-        reachable = self._route_waypoint(1, -2, 32.0, 32.0)
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: current
-        )
-        simulation.scenic_to_metsr_map = {
-            "1_-1": ["A_0"],
-            "1_-2": ["A_3"],
-        }
-        simulation.metsr_lane_indices = {"A_0": 0, "A_3": 3}
-        simulation.metsr_lane_connections = {}
-        simulation._sumo_lane_to_carla_keys = {"A_3": {"1_-2"}}
-        simulation._carla_waypoints_by_key = {"1_-2": [near, reachable]}
-        simulation.metsr_road_cache = {
-            ("A", 3): [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)]
-        }
-        requested_targets = []
-
-        def trace_route(start, target):
-            requested_targets.append(target.x)
-            # A three-lane correction can overshoot a nearby requested anchor.
-            # Appending that anchor would make the installed path run backward.
-            return [(current, None), (reachable, None)]
-
-        simulation.grp = SimpleNamespace(
-            _sampling_resolution=2.0,
-            trace_route=trace_route,
-        )
-
-        anchor, trace = simulation._forward_lane_anchor_trace(
-            "A_3",
-            current.transform.location,
-            "A",
-            1,
-            prefer_early=True,
-        )
-
-        self.assertIs(anchor, reachable)
-        self.assertEqual(requested_targets, [10.0])
-        self.assertIs(trace[-1][0], reachable)
-        self.assertNotIn(near, [item[0] for item in trace])
-
-    def test_forward_lane_anchor_fails_when_road_is_too_short(self):
-        simulation = object.__new__(CosimSimulation)
-        current = self._route_waypoint(1, -1, 93.0, 93.0)
-        ahead = self._route_waypoint(1, -2, 98.0, 98.0)
-        simulation.metsr_lane_indices = {"A_1": 1}
-        simulation._sumo_lane_to_carla_keys = {"A_1": {"1_-2"}}
-        simulation._carla_waypoints_by_key = {"1_-2": [ahead]}
-        simulation.metsr_road_cache = {
-            ("A", 1): [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)]
-        }
-        simulation.grp = SimpleNamespace(_sampling_resolution=2.0)
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: None
-        )
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "Insufficient road remains"
-        ):
-            simulation._forward_lane_anchor_trace(
-                "A_1", current.transform.location, "A", 1
-            )
-
-    def test_stitch_anchors_a_different_first_road_departure_lane(self):
-        simulation = object.__new__(CosimSimulation)
-        current = self._route_waypoint(1, -1, 1.0, 0.0)
-        first_anchor = self._route_waypoint(1, -2, 7.0, 7.0)
-        second_anchor = self._route_waypoint(2, -2, 7.0, 17.0)
-        simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: current)
-        simulation.scenic_to_metsr_map = {"1_-1": ["A_0"]}
-        simulation.metsr_lane_indices = {
-            "A_0": 0,
-            "A_1": 1,
-            "B_1": 1,
-        }
-        calls = []
-
-        def trace(start, anchor, roads):
-            calls.append((start.x, anchor.transform.location.x, tuple(roads)))
-            return [(anchor, None)]
-
-        def forward_trace(lane, start, road, required_lane_changes):
-            self.assertEqual((lane, road, required_lane_changes), ("A_1", "A", 1))
-            return first_anchor, trace(start, first_anchor, (road,))
-
-        simulation._forward_lane_anchor_trace = forward_trace
-        simulation._lane_anchor_waypoint = lambda lane, final=False: {
-            "B_1": second_anchor,
-        }[lane]
-        simulation._trace_route_segment = trace
-        simulation._validate_carla_route_trace = lambda *args, **kwargs: None
-
-        result = simulation._stitch_carla_route(
-            ["A", "B"], current.transform.location, ["A_1", "B_1"]
-        )
-
-        self.assertEqual([item[0] for item in result], [first_anchor, second_anchor])
-        self.assertEqual(calls, [(0.0, 7.0, ("A",)), (7.0, 17.0, ("A", "B"))])
-
-    def test_committed_route_refresh_waits_for_both_clients(self):
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.carlaActor = object()
-        simulation = object.__new__(CosimSimulation)
-        simulation.pending_route_refreshes = {obj: "B"}
-        simulation.generate_carla_trajectory = lambda *args: self.fail(
-            "route generation must wait for road alignment"
-        )
-
-        refreshed = simulation._refresh_committed_carla_route(
-            obj,
-            {"segmentId": "B", "transitionPending": False},
-            "A",
-            ["B", "C"],
-        )
-
-        self.assertFalse(refreshed)
-        self.assertEqual(simulation.pending_route_refreshes[obj], "B")
-
-    def test_committed_route_refresh_installs_path_exactly_once(self):
-        class Vehicle:
-            pass
-
-        events = []
-        path = [object(), object()]
-        obj = Vehicle()
-        obj.carlaActor = object()
-        simulation = object.__new__(CosimSimulation)
-        simulation.pending_route_refreshes = {obj: "B"}
-        simulation.generate_carla_trajectory = lambda route, target: (
-            events.append(("route", route, target)) or path
-        )
-        simulation.tm = SimpleNamespace(
-            set_path=lambda actor, trajectory: events.append(
-                ("path", actor, trajectory)
-            ),
-            auto_lane_change=lambda actor, enabled: events.append(
-                ("lane_change", actor, enabled)
-            ),
-        )
-        state = {"segmentId": "B", "transitionPending": False}
-
-        first = simulation._refresh_committed_carla_route(
-            obj, state, "B", ["B", "C", "D"]
-        )
-        second = simulation._refresh_committed_carla_route(
-            obj, state, "B", ["B", "C", "D"]
-        )
-
-        self.assertTrue(first)
-        self.assertFalse(second)
-        self.assertIs(obj.trajectory, path)
-        self.assertNotIn(obj, simulation.pending_route_refreshes)
-        self.assertEqual(
-            events,
-            [
-                ("route", ["B", "C", "D"], obj),
-                ("path", obj.carlaActor, path),
-                ("lane_change", obj.carlaActor, False),
-            ],
-        )
-
     def test_remote_mapped_lane_distance_is_detected_before_teleport(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_road_cache = {
-            ("A", 0): [(0.0, 0.0), (10.0, 0.0)]
-        }
+        simulation = make_simulation()
+        simulation.metsr_state.road_cache = {("A", 0): [(0.0, 0.0), (10.0, 0.0)]}
 
-        distance = simulation._distance_to_mapped_road(
-            (100.0, 100.0), ["A_0"], "A"
+        distance = routing.distance_to_mapped_road(
+            simulation.metsr_state, simulation.metsr_client, (100.0, 100.0), ["A_0"], "A"
         )
 
         self.assertGreater(distance, 100.0)
 
     def test_projection_guard_translates_raw_sumo_lane_suffix(self):
         calls = []
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {"-29_6": 4}
-        simulation.metsr_road_cache = {}
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"-29_6": 4}
+        )
+        simulation.metsr_state.road_cache = {}
         simulation.metsr_client = SimpleNamespace(
             query_centerline=lambda road, lane_index, transform_coords: (
                 calls.append((road, lane_index, transform_coords))
@@ -571,40 +163,44 @@ class AdapterStateTests(unittest.TestCase):
             )
         )
 
-        distance = simulation._distance_to_mapped_road(
-            (5.0, 1.0), ["-29_6"], "-29"
+        distance = routing.distance_to_mapped_road(
+            simulation.metsr_state, simulation.metsr_client, (5.0, 1.0), ["-29_6"], "-29"
         )
 
         self.assertEqual(distance, 1.0)
         self.assertEqual(calls, [("-29", 4, True)])
 
     def test_nearest_mapped_lane_returns_exact_compact_index(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {"4_5": 3, "4_6": 4}
-        simulation.metsr_road_cache = {
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"4_5": 3, "4_6": 4}
+        )
+        simulation.metsr_state.road_cache = {
             ("4", 3): [(0.0, 3.5), (10.0, 3.5)],
             ("4", 4): [(0.0, 0.0), (10.0, 0.0)],
         }
 
-        lane_index, distance = simulation._nearest_mapped_lane(
-            (5.0, 0.5), ["4_5", "4_6"], "4"
+        lane_index, distance = routing.nearest_mapped_lane(
+            simulation.metsr_state,
+            simulation.metsr_client,
+            (5.0, 0.5),
+            ["4_5", "4_6"],
+            "4",
         )
 
         self.assertEqual(lane_index, 4)
         self.assertEqual(distance, 0.5)
 
-
     def test_internal_mapped_lane_uses_connector_path_centerline(self):
         calls = []
         connector_id = "cont/6/5"
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_internal_lane_connections = {
-            ":332_0_4": [("6_4", "5_4")]
-        }
-        simulation.metsr_internal_edge_to_connector = {
-            ":332_0": connector_id
-        }
-        simulation.metsr_connector_records = {
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            internal_lane_connections={":332_0_4": [("6_4", "5_4")]},
+        )
+        simulation.metsr_state.internal_edge_to_connector = {":332_0": connector_id}
+        simulation.metsr_state.connector_records = {
             connector_id: {
                 "connectorId": connector_id,
                 "sourceRoadId": "6",
@@ -621,8 +217,8 @@ class AdapterStateTests(unittest.TestCase):
                 ],
             }
         }
-        simulation.metsr_connector_path_cache = {}
-        simulation.metsr_connector_centerline_cache = {}
+        simulation.metsr_state.connector_path_cache = {}
+        simulation.metsr_state.connector_centerline_cache = {}
         centerlines = [[], [], [], [], [(0.0, 0.0), (10.0, 0.0)]]
         simulation.metsr_client = SimpleNamespace(
             query_centerline=lambda segment, lane_index, transform_coords: (
@@ -634,8 +230,8 @@ class AdapterStateTests(unittest.TestCase):
             )
         )
 
-        resolved = simulation._nearest_mapped_connector_path_projection(
-            (5.0, 1.0), [":332_0_4"]
+        resolved = routing.nearest_mapped_connector_path_projection(
+            simulation.metsr_state, simulation.metsr_client, (5.0, 1.0), [":332_0_4"]
         )
 
         self.assertEqual(resolved[:2], (connector_id, 4))
@@ -643,6 +239,7 @@ class AdapterStateTests(unittest.TestCase):
         self.assertEqual(resolved[4]["sourceRoadId"], "6")
         self.assertEqual(resolved[4]["targetRoadId"], "5")
         self.assertEqual(calls, [(connector_id, -1, True)])
+
     def test_connector_spawn_uses_connector_path_id_not_lane_index(self):
         connector_id = "cont/6/5"
         initialize_calls = []
@@ -669,20 +266,18 @@ class AdapterStateTests(unittest.TestCase):
             parentOrientation=ParentOrientation(),
         )
         origin_lane = SimpleNamespace(road=SimpleNamespace(id=333), id=5)
-        origin_waypoint = SimpleNamespace(
-            road_id=333, lane_id=5, lane_width=3.5
-        )
+        origin_waypoint = SimpleNamespace(road_id=333, lane_id=5, lane_width=3.5)
         destination_waypoint = SimpleNamespace(road_id=100, lane_id=1)
 
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: origin_lane,
-            scenic_to_metsr_map_lanes={
-                "333_5": [":332_0_4"],
-                "100_1": ["D_0"],
-            },
-            metsr_represented_roads={"5", "6", "D"},
+            _nearest_lane=lambda target: origin_lane
         )
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            lane_mapping={"333_5": [":332_0_4"], "100_1": ["D_0"]},
+        )
+        simulation.metsr_state.valid_roads = {"5", "6", "D"}
         simulation.map = SimpleNamespace(
             get_waypoint=lambda location, *args, **kwargs: (
                 destination_waypoint if location.x > 50 else origin_waypoint
@@ -691,17 +286,16 @@ class AdapterStateTests(unittest.TestCase):
         simulation.spawn_points = [
             SimpleNamespace(location=carla.Location(x=100.0, y=0.0, z=0.0))
         ]
-        simulation.metsr_lane_indices = {"D_0": 0}
-        simulation.metsr_road_cache = {
-            ("D", 0): [(90.0, 0.0), (110.0, 0.0)]
-        }
-        simulation.metsr_internal_lane_connections = {
-            ":332_0_4": [("6_4", "5_4")]
-        }
-        simulation.metsr_internal_edge_to_connector = {
-            ":332_0": connector_id
-        }
-        simulation.metsr_connector_records = {
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"D_0": 0}
+        )
+        simulation.metsr_state.road_cache = {("D", 0): [(90.0, 0.0), (110.0, 0.0)]}
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            internal_lane_connections={":332_0_4": [("6_4", "5_4")]},
+        )
+        simulation.metsr_state.internal_edge_to_connector = {":332_0": connector_id}
+        simulation.metsr_state.connector_records = {
             connector_id: {
                 "connectorId": connector_id,
                 "sourceRoadId": "6",
@@ -718,13 +312,13 @@ class AdapterStateTests(unittest.TestCase):
                 ],
             }
         }
-        simulation.metsr_connector_path_cache = {}
-        simulation.metsr_connector_centerline_cache = {
+        simulation.metsr_state.connector_path_cache = {}
+        simulation.metsr_state.connector_centerline_cache = {
             (connector_id, 4): [(0.0, 0.0), (10.0, 0.0)]
         }
-        simulation.carla_control_roads = {"5": True, "6": True}
-        simulation.carla_control_segments = {"5", "6", ":332_0"}
-        simulation.metsr_road_connectors = {
+        simulation.metsr_state.controlled_roads = {"5": True, "6": True}
+        simulation.metsr_state.controlled_segments = {"5", "6", ":332_0"}
+        simulation.metsr_state.road_connectors = {
             "5": {connector_id},
             "6": {connector_id},
         }
@@ -749,22 +343,26 @@ class AdapterStateTests(unittest.TestCase):
             ),
             initialize_cosim_vehicle=initialize,
             query_vehicle=lambda *args, **kwargs: metsr_response(
-                "vehicle", [{
-                    "x": 5.0, "y": 1.0,
-                    "segmentId": connector_id,
-                    "onConnector": True,
-                    "sourceRoadId": "6",
-                    "targetRoadId": "5",
-                    "destinationRoadId": "D",
-                }]
+                "vehicle",
+                [
+                    {
+                        "x": 5.0,
+                        "y": 1.0,
+                        "segmentId": connector_id,
+                        "onConnector": True,
+                        "sourceRoadId": "6",
+                        "targetRoadId": "5",
+                        "destinationRoadId": "D",
+                    }
+                ],
             ),
             update_vehicle_route=lambda vehicle_id, route, private_veh: (
                 route_calls.append((vehicle_id, route, private_veh))
                 # Native METS-R rejects a physical-road route while the
                 # vehicle still occupies cont/6/5 (the seed-37 failure).
-                or metsr_response("updateVehicleRoute", [
-                    {"vehicleId": vehicle_id, "status": "error"}
-                ])
+                or metsr_response(
+                    "updateVehicleRoute", [{"vehicleId": vehicle_id, "status": "error"}]
+                )
             ),
             generate_trip_between_roads=lambda **kwargs: (_ for _ in ()).throw(
                 AssertionError("a controlled connector must use co-sim placement")
@@ -793,38 +391,74 @@ class AdapterStateTests(unittest.TestCase):
 
         obj = SimpleNamespace(
             position=SimpleNamespace(x=5.0, y=1.0, z=0.0),
-            width=2.0, yaw=0.0, pitch=0.0, roll=0.0,
+            width=2.0,
+            yaw=0.0,
+            pitch=0.0,
+            roll=0.0,
             parentOrientation=ParentOrientation(),
         )
         calls = {"initialize": [], "route": []}
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: SimpleNamespace(
-                road=SimpleNamespace(id=1), id=1
-            ),
-            scenic_to_metsr_map_lanes={"1_1": ["A_0"], "2_1": ["D_0"]},
+            _nearest_lane=lambda target: SimpleNamespace(road=SimpleNamespace(id=1), id=1)
+        )
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_mapping={"1_1": ["A_0"], "2_1": ["D_0"]}
         )
         simulation._nearest_mapped_lane_projection = lambda *args: (0, 0.0, False)
+        helper_patch = patch.object(
+            routing,
+            "nearest_mapped_lane_projection",
+            lambda _simulation, *args, **kwargs: simulation._nearest_mapped_lane_projection(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation._source_projection_error_limit = lambda *args: 3.0
+        helper_patch = patch.object(
+            carla_routing,
+            "source_projection_error_limit",
+            lambda _simulation, *args, **kwargs: simulation._source_projection_error_limit(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.identify_nearest_road = lambda *args: "D"
+        helper_patch = patch.object(
+            routing,
+            "identify_nearest_road",
+            lambda _simulation, *args, **kwargs: simulation.identify_nearest_road(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.map = SimpleNamespace(
             get_waypoint=lambda *args: SimpleNamespace(road_id=2, lane_id=1)
         )
         simulation.spawn_points = [
             SimpleNamespace(location=carla.Location(x=100.0, y=0.0, z=0.0))
         ]
-        simulation.carla_control_roads = {"A": True}
+        simulation.metsr_state.controlled_roads = {"A": True}
         simulation.getMetsrPrivateVehId = lambda target: 7
         simulation.metsr_client = SimpleNamespace(
             query_route_between_roads=lambda source, target: metsr_response(
                 "routesBwRoads", [{"roadIds": [source, target]}]
             ),
             initialize_cosim_vehicle=lambda **kwargs: (
-                calls["initialize"].append(kwargs) or metsr_response(
-                    "initializeCoSimVeh", [{
-                        "vehicleId": 7, "status": "ok",
-                        "segmentId": "A", "laneIndex": 0,
-                    }]
+                calls["initialize"].append(kwargs)
+                or metsr_response(
+                    "initializeCoSimVeh",
+                    [
+                        {
+                            "vehicleId": 7,
+                            "status": "ok",
+                            "segmentId": "A",
+                            "laneIndex": 0,
+                        }
+                    ],
                 )
             ),
             query_vehicle=lambda *args, **kwargs: metsr_response(
@@ -832,9 +466,9 @@ class AdapterStateTests(unittest.TestCase):
             ),
             update_vehicle_route=lambda vehicle_id, route, private_veh: (
                 calls["route"].append((vehicle_id, route, private_veh))
-                or metsr_response("updateVehicleRoute", [
-                    {"vehicleId": vehicle_id, "status": "error"}
-                ])
+                or metsr_response(
+                    "updateVehicleRoute", [{"vehicleId": vehicle_id, "status": "error"}]
+                )
             ),
         )
         return simulation, obj, calls
@@ -851,11 +485,15 @@ class AdapterStateTests(unittest.TestCase):
 
     def test_spawn_initialization_rejection_is_still_propagated(self):
         response = metsr_response(
-            "initializeCoSimVeh", [{
-                "vehicleId": 7, "status": "error",
-                "errorCode": "INITIALIZATION_FAILED",
-                "message": "No route from the matched road to the destination",
-            }]
+            "initializeCoSimVeh",
+            [
+                {
+                    "vehicleId": 7,
+                    "status": "error",
+                    "errorCode": "INITIALIZATION_FAILED",
+                    "message": "No route from the matched road to the destination",
+                }
+            ],
         )
         simulation, obj, calls = self._controlled_road_spawn_fixture()
         simulation.metsr_client.initialize_cosim_vehicle = lambda **kwargs: response
@@ -882,15 +520,15 @@ class AdapterStateTests(unittest.TestCase):
         origin_waypoint = SimpleNamespace(road_id=333, lane_id=5)
         destination_waypoint = SimpleNamespace(road_id=100, lane_id=1)
 
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.network_helper = SimpleNamespace(
-            _nearest_lane=lambda target: origin_lane,
-            scenic_to_metsr_map_lanes={
-                "333_5": ["A_0"],
-                "100_1": ["D_0"],
-            },
-            metsr_represented_roads={"A", "D"},
+            _nearest_lane=lambda target: origin_lane
         )
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            lane_mapping={"333_5": ["A_0"], "100_1": ["D_0"]},
+        )
+        simulation.metsr_state.valid_roads = {"A", "D"}
         simulation.map = SimpleNamespace(
             get_waypoint=lambda location, *args, **kwargs: (
                 destination_waypoint if location.x > 50 else origin_waypoint
@@ -899,19 +537,23 @@ class AdapterStateTests(unittest.TestCase):
         simulation.spawn_points = [
             SimpleNamespace(location=carla.Location(x=100.0, y=0.0, z=0.0))
         ]
-        simulation.metsr_lane_indices = {"A_0": 0, "D_0": 0}
-        simulation.metsr_road_cache = {
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"A_0": 0, "D_0": 0}
+        )
+        simulation.metsr_state.road_cache = {
             ("A", 0): [(0.0, 0.0), (10.0, 0.0)],
             ("D", 0): [(90.0, 0.0), (110.0, 0.0)],
         }
-        simulation.metsr_internal_lane_connections = {}
-        simulation.metsr_internal_edge_to_connector = {}
-        simulation.metsr_connector_records = {}
-        simulation.metsr_connector_path_cache = {}
-        simulation.metsr_connector_centerline_cache = {}
-        simulation.metsr_road_connectors = {}
-        simulation.carla_control_roads = {}
-        simulation.carla_control_segments = set()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, internal_lane_connections={}
+        )
+        simulation.metsr_state.internal_edge_to_connector = {}
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.connector_path_cache = {}
+        simulation.metsr_state.connector_centerline_cache = {}
+        simulation.metsr_state.road_connectors = {}
+        simulation.metsr_state.controlled_roads = {}
+        simulation.metsr_state.controlled_segments = set()
 
         def forbidden(*args, **kwargs):
             raise AssertionError("native Scenic spawns must use only generateTripsByRoad")
@@ -937,9 +579,7 @@ class AdapterStateTests(unittest.TestCase):
             simulation.createObjectInMetsr(obj)
 
         self.assertEqual(obj.route, ["A", "D"])
-        self.assertEqual(
-            generated, [{"vehID": 7, "origin": "A", "destination": "D"}]
-        )
+        self.assertEqual(generated, [{"vehID": 7, "origin": "A", "destination": "D"}])
 
     def _town06_short_lane_spawn_fixture(self):
         simulation, obj, generated = self._native_road_spawn_fixture()
@@ -950,19 +590,28 @@ class AdapterStateTests(unittest.TestCase):
         simulation.network_helper._nearest_lane = lambda target: SimpleNamespace(
             road=SimpleNamespace(id=64), id=-3
         )
-        simulation.network_helper.scenic_to_metsr_map_lanes = {
-            "64_-3": ["-64_4"], "100_1": ["D_0"],
-        }
-        simulation.network_helper.metsr_represented_roads = {"-64", "D"}
-        simulation.metsr_lane_indices = {"-64_4": 2, "D_0": 0}
-        simulation.metsr_road_cache[("-64", 2)] = [
-            (-3.19, -360.49), (-3.24, -361.51), (-3.31, -362.58),
-            (-3.39, -363.64), (-3.47, -364.48),
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            lane_mapping={
+                "64_-3": ["-64_4"],
+                "100_1": ["D_0"],
+            },
+        )
+        simulation.metsr_state.valid_roads = {"-64", "D"}
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"-64_4": 2, "D_0": 0}
+        )
+        simulation.metsr_state.road_cache[("-64", 2)] = [
+            (-3.19, -360.49),
+            (-3.24, -361.51),
+            (-3.31, -362.58),
+            (-3.39, -363.64),
+            (-3.47, -364.48),
         ]
         simulation.map.get_waypoint = lambda location, *args, **kwargs: (
             SimpleNamespace(road_id=100, lane_id=1)
-            if location.x > 50 else
-            SimpleNamespace(road_id=64, lane_id=-3, lane_width=3.5)
+            if location.x > 50
+            else SimpleNamespace(road_id=64, lane_id=-3, lane_width=3.5)
         )
         return simulation, obj, generated
 
@@ -972,13 +621,11 @@ class AdapterStateTests(unittest.TestCase):
             simulation.createObjectInMetsr(obj)
 
         self.assertEqual(obj.route, ["-64", "D"])
-        self.assertEqual(
-            generated, [{"vehID": 7, "origin": "-64", "destination": "D"}]
-        )
+        self.assertEqual(generated, [{"vehID": 7, "origin": "-64", "destination": "D"}])
 
     def test_controlled_spawn_beyond_short_lane_endpoint_is_rejected(self):
         simulation, obj, generated = self._town06_short_lane_spawn_fixture()
-        simulation.carla_control_roads = {"-64": True}
+        simulation.metsr_state.controlled_roads = {"-64": True}
         with self.assertRaisesRegex(
             SimulationCreationError,
             r"13\.89 m from mapped METS-R segment -64; refusing a remote projection",
@@ -995,20 +642,20 @@ class AdapterStateTests(unittest.TestCase):
         obj.name = "queued-native"
         obj.spawn_guard = 0
         obj.carla_actor_flag = False
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.objects = [SimpleNamespace(name="ego"), obj]
         simulation.bubble_roads = []
         simulation.sim_ticks_per_carla = 1
         simulation.count = 4
         simulation.completed_route = {}
         simulation.pending_road_entries = {}
-        simulation.pv_id_map = {obj: 7}
-        simulation.admitted_queue_vehicles = {}
-        simulation.carla_control_roads = {}
-        simulation.carla_control_segments = set()
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
-        simulation.metsr_internal_edge_to_connector = {}
+        simulation.metsr_state.private_vehicle_ids = {obj: 7}
+        simulation.metsr_state.admitted_vehicles = {}
+        simulation.metsr_state.controlled_roads = {}
+        simulation.metsr_state.controlled_segments = set()
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.road_connectors = {}
+        simulation.metsr_state.internal_edge_to_connector = {}
         simulation.road_pop_density = {}
         simulation.carla_actors = []
         simulation.metsr_actors = [obj]
@@ -1020,7 +667,7 @@ class AdapterStateTests(unittest.TestCase):
             "destinationRoadId": "D",
         }
 
-        simulation.update_bubble_objects([], [], vehicle_data={obj: record})
+        simulation.update_bubble_objects(vehicle_data={obj: record})
 
         self.assertNotIn(obj, simulation.completed_route)
         self.assertEqual(simulation.carla_actors, [])
@@ -1029,12 +676,13 @@ class AdapterStateTests(unittest.TestCase):
     def test_polyline_projection_distinguishes_terminal_from_interior(self):
         polyline = [(0.0, 0.0), (0.0, 0.0), (10.0, 0.0)]
 
-        terminal_distance, terminal = (
-            CosimSimulation._point_to_polyline_projection((-4.0, 1.0), polyline)
+        terminal_distance, terminal = carla_routing.point_to_polyline_projection(
+            (-4.0, 1.0), polyline
         )
-        interior_distance, interior_terminal = (
-            CosimSimulation._point_to_polyline_projection((5.0, 4.0), polyline)
-        )
+        (
+            interior_distance,
+            interior_terminal,
+        ) = carla_routing.point_to_polyline_projection((5.0, 4.0), polyline)
 
         self.assertAlmostEqual(terminal_distance, math.sqrt(17.0))
         self.assertTrue(terminal)
@@ -1042,72 +690,72 @@ class AdapterStateTests(unittest.TestCase):
         self.assertFalse(interior_terminal)
 
     def test_terminal_allowance_requires_matching_carla_lane(self):
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         waypoint = SimpleNamespace(road_id=52, lane_id=-6, lane_width=3.5)
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: waypoint
-        )
-        obj = SimpleNamespace(
-            position=SimpleNamespace(x=-32.487, y=18.810, z=0.0)
-        )
+        simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: waypoint)
+        obj = SimpleNamespace(position=SimpleNamespace(x=-32.487, y=18.810, z=0.0))
 
         self.assertEqual(
-            simulation._source_projection_error_limit(
-                obj, "52_-6", 3.0, at_terminal=True
+            carla_routing.source_projection_error_limit(
+                simulation.map, obj.position, "52_-6", 3.0, at_terminal=True
             ),
             6.5,
         )
         self.assertEqual(
-            simulation._source_projection_error_limit(
-                obj, "52_-5", 3.0, at_terminal=True
+            carla_routing.source_projection_error_limit(
+                simulation.map, obj.position, "52_-5", 3.0, at_terminal=True
             ),
             3.0,
         )
         self.assertEqual(
-            simulation._source_projection_error_limit(
-                obj, "52_-6", 3.0, at_terminal=False
+            carla_routing.source_projection_error_limit(
+                simulation.map, obj.position, "52_-6", 3.0, at_terminal=False
             ),
             3.0,
         )
 
     def test_authoritative_lane_map_rejects_an_unknown_lane(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {}
-        simulation.network_helper = SimpleNamespace(
-            metsr_represented_roads={"-29"}
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={}
         )
+        simulation.metsr_state.valid_roads = ["-29"]
 
         self.assertEqual(
-            simulation._mapped_lane_query("-29_6"), ("-29", None)
+            metsr_network.mapped_lane_query(simulation.metsr_state, "-29_6"),
+            ("-29", None),
         )
 
     def test_road_only_mapping_preserves_underscores(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {}
-        simulation.network_helper = SimpleNamespace(
-            metsr_represented_roads={":1034_0"}
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={}
         )
+        simulation.metsr_state.valid_roads = [":1034_0"]
 
         self.assertEqual(
-            simulation._mapped_lane_query(":1034_0"), (":1034_0", -1)
+            metsr_network.mapped_lane_query(simulation.metsr_state, ":1034_0"),
+            (":1034_0", -1),
         )
 
     def test_malformed_centerline_response_fails_closed(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {"-29_6": 4}
-        simulation.metsr_road_cache = {}
+        simulation = make_simulation()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={"-29_6": 4}
+        )
+        simulation.metsr_state.road_cache = {}
         simulation.metsr_client = SimpleNamespace(
             query_centerline=lambda *args, **kwargs: metsr_response("centerLine")
         )
 
-        distance = simulation._distance_to_mapped_road(
-            (5.0, 1.0), ["-29_6"], "-29"
+        distance = routing.distance_to_mapped_road(
+            simulation.metsr_state, simulation.metsr_client, (5.0, 1.0), ["-29_6"], "-29"
         )
 
         self.assertTrue(math.isinf(distance))
 
     def test_client_sync_diagnostic_uses_200_step_cadence(self):
-        due = CosimSimulation._client_sync_diagnostic_due
+        due = runtime.client_sync_diagnostic_due
 
         self.assertTrue(due(0, True))
         self.assertFalse(due(1, True))
@@ -1115,63 +763,8 @@ class AdapterStateTests(unittest.TestCase):
         self.assertTrue(due(200, True))
         self.assertFalse(due(200, False))
 
-    def test_road_hint_does_not_infer_from_retired_transition_state(self):
-        simulation = object.__new__(CosimSimulation)
-        obj = SimpleNamespace(route=["A", "B", "C"])
-        state = {
-            "transitionPending": True,
-            "segmentId": "B",
-        }
-
-        self.assertIsNone(simulation._observed_road_hint(obj, state, "C"))
-        self.assertIsNone(simulation._observed_road_hint(obj, state, "A"))
-
-    def test_road_observation_classifier_including_current(self):
-        classify = CosimSimulation._classify_road_observation
-        route = ["A", "B", "C", "D"]
-
-        self.assertEqual(classify("B", None, route), ROAD_OBSERVATION_UNKNOWN)
-        self.assertEqual(classify("B", "B", route), ROAD_OBSERVATION_SAME)
-        self.assertEqual(
-            classify("B", "A", route), ROAD_OBSERVATION_PREDECESSOR
-        )
-        self.assertEqual(
-            classify("B", "C", route), ROAD_OBSERVATION_DIRECT_SUCCESSOR
-        )
-        self.assertEqual(classify("B", "D", route), ROAD_OBSERVATION_ONE_SKIP)
-        self.assertEqual(
-            classify("B", "X", route), ROAD_OBSERVATION_UNSUPPORTED
-        )
-
-    def test_road_observation_classifier_rejects_route_without_current(self):
-        classify = CosimSimulation._classify_road_observation
-
-        self.assertEqual(
-            classify("A", "B", ["B", "C"]),
-            ROAD_OBSERVATION_UNSUPPORTED,
-        )
-        self.assertEqual(
-            classify("A", "C", ["B", "C"]), ROAD_OBSERVATION_UNSUPPORTED
-        )
-
-    def test_pending_source_can_be_supplied_explicitly(self):
-        self.assertEqual(
-            CosimSimulation._classify_road_observation(
-                "B", "A", ["B", "C"], predecessor_road_id="A"
-            ),
-            ROAD_OBSERVATION_PREDECESSOR,
-        )
-
-    def test_forward_route_match_precedes_stale_predecessor_hint(self):
-        self.assertEqual(
-            CosimSimulation._classify_road_observation(
-                "A", "B", ["A", "B", "C"], predecessor_road_id="B"
-            ),
-            ROAD_OBSERVATION_DIRECT_SUCCESSOR,
-        )
-
-    @staticmethod
     def _sync_guard_fixture(
+        self,
         state,
         observed_road,
         live_route,
@@ -1192,13 +785,13 @@ class AdapterStateTests(unittest.TestCase):
             pass
 
         class Actor:
+            is_alive = True
+
             def __init__(self):
                 self.id = 99
                 self.type_id = "vehicle.test"
                 self.location = carla.Location(x=10.0, y=-2.0, z=0.0)
-                self.transform = carla.Transform(
-                    self.location, carla.Rotation(yaw=0.0)
-                )
+                self.transform = carla.Transform(self.location, carla.Rotation(yaw=0.0))
                 self.bounding_box = SimpleNamespace(
                     extent=SimpleNamespace(x=1.0, y=0.5, z=0.75)
                 )
@@ -1262,6 +855,7 @@ class AdapterStateTests(unittest.TestCase):
                 records = teleport_result.get("data", ())
             else:
                 record = dict(state)
+                record.setdefault("segmentType", "road")
                 segment_hint = kwargs.get("segment_id")
                 if isinstance(segment_hint, (list, tuple)):
                     segment_hint = segment_hint[0] if segment_hint else None
@@ -1297,16 +891,14 @@ class AdapterStateTests(unittest.TestCase):
         def generate_carla_trajectory(
             route, obj, required_first_lane_id=None, *, target_start=None
         ):
-            calls["generate"].append(
-                (list(route), obj, required_first_lane_id)
-            )
+            calls["generate"].append((list(route), obj, required_first_lane_id))
             calls["generate_start"].append(target_start)
             return trajectory
 
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.carla_actors = [obj]
         simulation.metsr_actors = []
-        simulation._carla_authoritative_segments = {}
+        simulation.metsr_state.authoritative_segments = {}
         simulation.pending_road_entries = (
             {obj: pending_entry} if pending_entry is not None else {}
         )
@@ -1320,25 +912,47 @@ class AdapterStateTests(unittest.TestCase):
             controlled_roads = set(object_route or live_route)
             if observed_road is not None:
                 controlled_roads.add(str(observed_road))
-        simulation.carla_control_roads = {
+        simulation.metsr_state.controlled_roads = {
             str(road_id): True for road_id in controlled_roads
         }
-        simulation.carla_control_segments = set(simulation.carla_control_roads)
-        simulation.metsr_internal_edge_to_connector = {}
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
+        simulation.metsr_state.controlled_segments = set(
+            simulation.metsr_state.controlled_roads
+        )
+        simulation.metsr_state.internal_edge_to_connector = {}
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.road_connectors = {}
         simulation.count = 1
-        simulation.metsr_lane_indices = dict(lane_indices or {})
-        simulation.metsr_lane_connections = dict(lane_connections or {})
-        simulation.metsr_road_cache = {}
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices=dict(lane_indices or {})
+        )
+        simulation.metsr_state.road_cache = {}
         simulation.carla_world = SimpleNamespace(get_actors=lambda: [obj.carlaActor])
         simulation._collect_metsr_vehicle_data = lambda objects: {obj: state}
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.getMetsrPrivateVehId = lambda target: 7
         simulation._mapped_carla_observation = lambda location: (
             ("B", 2)
             if abs(float(location.y) + 5.0) < 1e-6
             else (observed_road, observed_lane)
         )
+        simulation._native_handoff_target = lambda target, location: None
+        helper_patch = patch.object(
+            routing,
+            "native_handoff_target",
+            lambda _simulation, *args, **kwargs: simulation._native_handoff_target(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         if cosim_records is None:
             cosim_records = [
                 {"vehicleId": 7, "isPrivate": True, "routeRoadIds": list(live_route)}
@@ -1349,9 +963,7 @@ class AdapterStateTests(unittest.TestCase):
             "transitionPending": False,
         }
         simulation.metsr_client = SimpleNamespace(
-            query_cosim_vehicle=lambda: metsr_response(
-                "coSimVehicle", cosim_records
-            ),
+            query_cosim_vehicle=lambda: metsr_response("coSimVehicle", cosim_records),
             query_vehicle=lambda *args, **kwargs: metsr_response(
                 "vehicle", [dict(confirmation_record)]
             ),
@@ -1364,8 +976,10 @@ class AdapterStateTests(unittest.TestCase):
             carla.Location(x=10.0, y=-5.0, z=0.0),
             carla.Rotation(yaw=0.0),
         )
-        simulation._pending_lane_reconciliation_target = (
-            lambda target, road, lane: ("B_8", old_transform, target_transform)
+        simulation._pending_lane_reconciliation_target = lambda target, road, lane: (
+            "B_8",
+            old_transform,
+            target_transform,
         )
         simulation._assert_pending_lane_reconciliation_clear = (
             lambda actor, old, target: None
@@ -1377,7 +991,7 @@ class AdapterStateTests(unittest.TestCase):
             actor.location = transform.location
 
         simulation._apply_carla_transform_without_tick = apply_transform
-        simulation.metsr_trajectory_to_carla = lambda target: (_ for _ in ()).throw(
+        simulation._install_carla_destination_path = lambda target: (_ for _ in ()).throw(
             AssertionError("the constrained recovery path must not be overwritten")
         )
         simulation.tm = SimpleNamespace(
@@ -1387,6 +1001,15 @@ class AdapterStateTests(unittest.TestCase):
             ),
         )
         simulation.check_client_synchronization = lambda: None
+        helper_patch = patch.object(
+            runtime,
+            "check_client_synchronization",
+            lambda _simulation, *args, **kwargs: simulation.check_client_synchronization(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         return simulation, obj, calls
 
     def test_direct_successor_asserts_observed_road_and_lane(self):
@@ -1408,207 +1031,8 @@ class AdapterStateTests(unittest.TestCase):
         simulation.synchronize_clients()
 
         self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "B")
-        self.assertEqual(calls["teleport"][0][1]["lane_index"], 3)
-
-    def _legacy_same_road_route_preparation_reconciles_adjacent_departure_lane(self):
-        state = {
-            "segmentId": "-52",
-            "destinationRoadId": "20",
-            "transitionPending": False,
-            "laneIndex": 3,
-        }
-        route = ["-52", "-59", "69"]
-        recovery_path = [SimpleNamespace(name="departure-lane-4")]
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "-52",
-            route,
-            observed_lane=3,
-            lane_indices={
-                "-52_5": 3,
-                "-52_6": 4,
-                "-59_2": 0,
-                "69_2": 0,
-            },
-            lane_connections={
-                ("-52", "-59"): [("-52_6", "-59_2")],
-                ("-59", "69"): [("-59_2", "69_2")],
-            },
-            generated_trajectory=recovery_path,
-        )
-        simulation.carla_control_roads = {"-52": True}
-        simulation._candidate_metsr_lane_chains = (
-            lambda requested, start, required_initial_lane=None: [
-                ["-52_6", "-59_2", "69_2"]
-            ]
-        )
-        old_transform = obj.carlaActor.get_transform()
-        target_transform = carla.Transform(
-            carla.Location(x=10.0, y=-5.0, z=0.0),
-            carla.Rotation(yaw=0.0),
-        )
-        simulation._pending_lane_reconciliation_target = (
-            lambda target, road, lane: (
-                "-52_6", old_transform, target_transform
-            )
-        )
-        simulation._mapped_carla_observation = lambda location: (
-            ("-52", 4)
-            if abs(float(location.y) + 5.0) < 1e-6
-            else ("-52", 3)
-        )
-        simulation.metsr_client.teleport_cosim_vehicle = lambda *args, **kwargs: (
-            calls["teleport"].append((args, kwargs))
-            or metsr_response(
-                "teleportCoSimVeh",
-                [
-                    {
-                        "segmentId": "-52",
-                        "laneIndex": 4,
-                        "laneSynchronized": True,
-                        "transitionPending": False,
-                    }
-                ],
-            )
-        )
-        simulation.metsr_client.query_vehicle = lambda *args, **kwargs: metsr_response(
-            "vehicle",
-            [
-                {"segmentId": "-52", "laneIndex": 4, "transitionPending": False}
-            ],
-        )
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["generate"], [(route, obj, 4)])
-        self.assertEqual(calls["path"], [(obj.carlaActor, recovery_path)])
-        self.assertEqual(len(calls["transform"]), 1)
-        self.assertEqual(calls["teleport"], [])
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertEqual(
-            simulation.pending_road_entries[obj]["target"], "-52"
-        )
-        verification = simulation.same_road_departure_lane_verifications[obj]
-        self.assertEqual(
-            (verification["roadID"], verification["sourceLaneID"], verification["laneID"]),
-            ("-52", 3, 4),
-        )
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "-52")
-        self.assertEqual(calls["teleport"][0][1]["lane_index"], 4)
-        self.assertEqual(calls["teleport"][0][1]["speed"], 0.0)
-        self.assertNotIn(obj, simulation.road_entry_holds)
-        self.assertNotIn(obj, simulation.pending_road_entries)
-        self.assertNotIn(obj, simulation.same_road_departure_lane_verifications)
-
-    def _legacy_same_road_route_preparation_retries_occupied_swept_corridor(self):
-        state = {
-            "segmentId": "-52",
-            "destinationRoadId": "20",
-            "transitionPending": False,
-            "laneIndex": 3,
-        }
-        route = ["-52", "-59", "69"]
-        recovery_path = [SimpleNamespace(name="departure-lane-4")]
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "-52",
-            route,
-            observed_lane=3,
-            lane_indices={
-                "-52_5": 3,
-                "-52_6": 4,
-                "-59_2": 0,
-                "69_2": 0,
-            },
-            lane_connections={
-                ("-52", "-59"): [("-52_6", "-59_2")],
-                ("-59", "69"): [("-59_2", "69_2")],
-            },
-            generated_trajectory=recovery_path,
-        )
-        simulation.carla_control_roads = {"-52": True}
-        simulation._candidate_metsr_lane_chains = (
-            lambda requested, start, required_initial_lane=None: [
-                ["-52_6", "-59_2", "69_2"]
-            ]
-        )
-        old_transform = obj.carlaActor.get_transform()
-        target_transform = carla.Transform(
-            carla.Location(x=10.0, y=-5.0, z=0.0),
-            carla.Rotation(yaw=0.0),
-        )
-        simulation._pending_lane_reconciliation_target = (
-            lambda target, road, lane: (
-                "-52_6", old_transform, target_transform
-            )
-        )
-        simulation._mapped_carla_observation = lambda location: (
-            ("-52", 4)
-            if abs(float(location.y) + 5.0) < 1e-6
-            else ("-52", 3)
-        )
-        simulation.metsr_client.teleport_cosim_vehicle = lambda *args, **kwargs: (
-            calls["teleport"].append((args, kwargs))
-            or metsr_response(
-                "teleportCoSimVeh",
-                [
-                    {
-                        "segmentId": "-52",
-                        "laneIndex": 4,
-                        "laneSynchronized": True,
-                        "transitionPending": False,
-                    }
-                ],
-            )
-        )
-        simulation.metsr_client.query_vehicle = lambda *args, **kwargs: metsr_response(
-            "vehicle",
-            [
-                {"segmentId": "-52", "laneIndex": 4, "transitionPending": False}
-            ],
-        )
-        blocker = SimpleNamespace(
-            id=100,
-            type_id="vehicle.blocker",
-            bounding_box=SimpleNamespace(
-                extent=SimpleNamespace(x=1.0, y=0.5, z=0.75)
-            ),
-            get_location=lambda: carla.Location(x=10.0, y=-3.5, z=0.0),
-        )
-        actors = [obj.carlaActor, blocker]
-        simulation.carla_world = SimpleNamespace(get_actors=lambda: list(actors))
-        del simulation._assert_pending_lane_reconciliation_clear
-
-        simulation.synchronize_clients()
-
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertEqual(calls["generate"], [])
-        self.assertEqual(calls["path"], [])
-        self.assertEqual(calls["transform"], [])
-        self.assertNotIn(obj, simulation.pending_road_entries)
-        self.assertNotIn(obj, simulation.same_road_departure_lane_verifications)
-
-        actors.remove(blocker)
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["generate"], [(route, obj, 4)])
-        self.assertEqual(calls["path"], [(obj.carlaActor, recovery_path)])
-        self.assertEqual(len(calls["transform"]), 1)
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertEqual(simulation.pending_road_entries[obj]["target"], "-52")
-        self.assertIn(obj, simulation.same_road_departure_lane_verifications)
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertNotIn(obj, simulation.road_entry_holds)
-        self.assertNotIn(obj, simulation.pending_road_entries)
-        self.assertNotIn(obj, simulation.same_road_departure_lane_verifications)
+        self.assertNotIn("segment_id", calls["teleport"][0][1])
+        self.assertNotIn("lane_index", calls["teleport"][0][1])
 
     def test_predecessor_boundary_never_ordinary_teleports(self):
         state = {
@@ -1623,502 +1047,11 @@ class AdapterStateTests(unittest.TestCase):
             object_route=["P", "A", "B"],
         )
 
-        simulation.metsr_lane_connections = {("P", "A"): [("P_0", "A_0")]}
         simulation.synchronize_clients()
 
         self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "A")
-        self.assertIsNone(calls["teleport"][0][1]["lane_index"])
-
-    def _legacy_direct_successor_without_lane_topology_fails_closed(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, _, calls = self._sync_guard_fixture(
-            state, "B", ["A", "B", "C"], observed_lane=3
-        )
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "direct_successor_without_lane_topology"
-        ):
-            simulation.synchronize_clients()
-
-        self.assertEqual(calls["teleport"], [])
-
-    def _legacy_ego_waits_until_target_road_is_under_carla_control(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            lane_indices={"A_5": 1, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_7")]},
-        )
-        simulation.ego = obj
-        simulation.carla_control_roads = {}
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["teleport"], [])
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertEqual(simulation.pending_road_entries[obj]["target"], "B")
-
-        simulation.carla_control_roads["B"] = True
-        simulation.synchronize_clients()
-        self.assertEqual(len(calls["teleport"]), 2)
-
-    def _legacy_in_bubble_npc_waits_until_target_road_is_under_carla_control(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            lane_indices={"A_5": 1, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_7")]},
-        )
-        simulation.carla_control_roads = {}
-        simulation.active_bubble_metsr_roads = {"B"}
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["teleport"], [])
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertEqual(simulation.pending_road_entries[obj]["target"], "B")
-
-        simulation.carla_control_roads["B"] = True
-        simulation.synchronize_clients()
-        self.assertEqual(len(calls["teleport"]), 2)
-
-    def _legacy_outside_bubble_npc_can_hand_back_to_native_target(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            lane_indices={"A_5": 1, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_7")]},
-        )
-        simulation.carla_control_roads = {}
-        simulation.active_bubble_metsr_roads = {"C"}
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 2)
-        self.assertNotIn(obj, simulation.road_entry_holds)
-
-    def _legacy_retry_rejection_does_not_teleport_mismatched_target_pose(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        error = METSRControlError(
-            "blocked", record={"segmentId": "B", "retryable": True}
-        )
-        simulation, _, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=4,
-            pending_entry={"source": "A", "target": "B"},
-            transition_error=error,
-            lane_indices={"A_5": 1, "B_7": 4},
-            lane_connections={("A", "B"): [("A_5", "B_7")]},
-        )
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["teleport"][0][1]["lane_index"], 4)
-
-    def _legacy_direct_lane_mismatch_installs_constrained_pending_path(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        recovery_path = [SimpleNamespace(name="authoritative-lane-2")]
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            transition_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "transitionTargetRoadId": "B",
-                        "transitionPending": True,
-                    }
-                ]
-            },
-            teleport_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "transitionPending": False,
-                        "transitionCommitted": True,
-                    }
-                ]
-            },
-            lane_indices={"A_5": 1, "B_8": 2, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_8")]},
-            generated_trajectory=recovery_path,
-        )
-
-        simulation.synchronize_clients()
-
-        self.assertIsNone(calls["teleport"][0][1]["lane_index"])
-        self.assertEqual(calls["generate"], [(["B", "C"], obj, 2)])
-        self.assertEqual(calls["path"], [(obj.carlaActor, recovery_path)])
-        self.assertEqual(calls["lane_change"], [(obj.carlaActor, False)])
-        self.assertEqual(len(calls["transform"]), 1)
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(simulation.pending_route_refreshes, {})
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertIn(obj, simulation.pending_road_entries)
-        self.assertIn(obj, simulation.pending_lane_reconciliation_verifications)
-        self.assertIs(obj.trajectory, recovery_path)
-        self.assertEqual((calls["generate_start"][0].x, calls["generate_start"][0].y), (10.0, -5.0))
-
-        state.update(
-            {
-                "segmentId": "B",
-                "transitionPending": True,
-                "transitionTargetRoadId": "B",
-            }
-        )
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 2)
-        args, kwargs = calls["teleport"][1]
-        self.assertEqual(args[1:3], (10.0, 5.0))
-        self.assertEqual(kwargs["speed"], 0.0)
-        self.assertIsNone(kwargs["segment_id"])
-        self.assertIsNone(kwargs["lane_index"])
-        self.assertNotIn(obj, simulation.road_entry_holds)
-        self.assertNotIn(obj, simulation.pending_road_entries)
-        self.assertNotIn(obj, simulation.pending_lane_reconciliation_verifications)
-
-    def test_pending_lane_reconciliation_target_is_exact_parallel_lane(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {"B_8": 2}
-        simulation.metsr_road_cache = {}
-        simulation._sumo_lane_to_carla_keys = {"B_8": {"2_-2"}}
-        simulation.scenic_to_metsr_map = {"2_-2": ["B_8"]}
-        simulation._index_carla_waypoints = lambda: None
-        simulation._query_mapped_centerline = lambda road, lane: [
-            (0.0, 5.0, 0.0),
-            (20.0, 5.0, 0.0),
-        ]
-        actor = SimpleNamespace(
-            get_location=lambda: carla.Location(x=10.0, y=-2.0, z=0.0),
-            get_transform=lambda: carla.Transform(
-                carla.Location(x=10.0, y=-2.0, z=0.0),
-                carla.Rotation(yaw=0.0),
-            ),
-        )
-        obj = SimpleNamespace(carlaActor=actor)
-
-        def waypoint(*, x=10.0, y=-5.0, yaw=0.0, junction=False, mapped=True):
-            candidate = SimpleNamespace(
-                road_id=2,
-                lane_id=-2,
-                is_junction=junction,
-                transform=carla.Transform(
-                    carla.Location(x=x, y=y, z=0.0),
-                    carla.Rotation(yaw=yaw),
-                ),
-            )
-            simulation._carla_waypoints_by_key = {"2_-2": [candidate]}
-            simulation.scenic_to_metsr_map = {
-                "2_-2": ["B_8" if mapped else "B_9"]
-            }
-            simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: candidate)
-            return candidate
-
-        expected_waypoint = waypoint()
-        raw, old, target = simulation._pending_lane_reconciliation_target(
-            obj, "B", 2
-        )
-        self.assertEqual(raw, "B_8")
-        self.assertEqual((target.location.x, target.location.y), (10.0, -5.0))
-        self.assertEqual(target.rotation.yaw, expected_waypoint.transform.rotation.yaw)
-        self.assertEqual((old.location.x, old.location.y), (10.0, -2.0))
-
-        for label, candidate in (
-            ("junction", dict(junction=True)),
-            ("wrong raw mapping", dict(mapped=False)),
-            ("too far", dict(y=-18.0)),
-            ("wrong heading", dict(yaw=31.0)),
-            ("wrong progress", dict(x=14.0)),
-        ):
-            with self.subTest(label=label):
-                waypoint(**candidate)
-                with self.assertRaisesRegex(
-                    SimulationCreationError, "No safe parallel CARLA waypoint"
-                ):
-                    simulation._pending_lane_reconciliation_target(obj, "B", 2)
-
-    def test_pending_lane_reconciliation_rejects_swept_collision(self):
-        simulation = object.__new__(CosimSimulation)
-        actor = SimpleNamespace(
-            id=1,
-            type_id="vehicle.ego",
-            bounding_box=SimpleNamespace(
-                extent=SimpleNamespace(x=1.0, y=0.5, z=0.75)
-            ),
-        )
-        blocker = SimpleNamespace(
-            id=2,
-            type_id="walker.pedestrian.0001",
-            bounding_box=SimpleNamespace(
-                extent=SimpleNamespace(x=0.25, y=0.25, z=0.9)
-            ),
-            get_location=lambda: carla.Location(x=0.0, y=1.5, z=0.0),
-        )
-        simulation.carla_world = SimpleNamespace(
-            get_actors=lambda: [actor, blocker]
-        )
-        old = carla.Transform(carla.Location(x=0.0, y=0.0, z=0.0))
-        target = carla.Transform(carla.Location(x=0.0, y=3.0, z=0.0))
-
-        with self.assertRaisesRegex(SimulationCreationError, "occupied swept corridor"):
-            simulation._assert_pending_lane_reconciliation_clear(
-                actor, old, target
-            )
-
-    def _legacy_pending_lane_reconciliation_requires_immediate_commit(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            transition_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "transitionPending": True,
-                    }
-                ]
-            },
-            teleport_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "transitionPending": True,
-                        "transitionCommitted": False,
-                    }
-                ]
-            },
-            lane_indices={"A_5": 1, "B_8": 2, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_8")]},
-        )
-
-        simulation.synchronize_clients()
-        state.update(
-            {
-                "segmentId": "B",
-                "transitionPending": True,
-                "transitionTargetRoadId": "B",
-            }
-        )
-        with self.assertRaisesRegex(
-            SimulationCreationError, "did not commit the verified lane reconciliation"
-        ):
-            simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["transform"]), 1)
-        self.assertEqual(len(calls["teleport"]), 2)
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertNotEqual(calls["teleport"][1][1].get("lane_index"), 2)
-
-    def _legacy_direct_lane_mismatch_rejects_nonpending_entry(self):
-        state = {
-            "segmentId": "A",
-            "destinationRoadId": "Z",
-            "transitionPending": False,
-            "laneIndex": 1,
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["A", "B", "C"],
-            observed_lane=3,
-            transition_result={
-                "data": [{"segmentId": "B", "laneIndex": 2, "transitionPending": False}]
-            },
-            lane_indices={"A_5": 1, "B_8": 2, "B_7": 3},
-            lane_connections={("A", "B"): [("A_5", "B_8")]},
-        )
-
-        with self.assertRaisesRegex(
-            SimulationCreationError,
-            "lane_mismatch_entry_committed_without_recovery",
-        ):
-            simulation.synchronize_clients()
-
-        self.assertIsNone(calls["teleport"][0][1]["lane_index"])
-        self.assertEqual(calls["generate"], [])
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertIn(obj, simulation.road_entry_holds)
-
-    def _legacy_pending_skipped_target_reconciles_route_compatible_successor_lane(self):
-        state = {
-            "segmentId": "B",
-            "destinationRoadId": "Z",
-            "transitionPending": True,
-            "transitionTargetRoadId": "B",
-            "transitionTargetLaneIndex": 0,
-        }
-        recovery_path = [SimpleNamespace(name="successor-lane-0")]
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "C",
-            ["B", "C", "D"],
-            observed_lane=2,
-            object_route=["A", "B", "C", "D"],
-            lane_indices={
-                "B_2": 0,
-                "C_2": 0,
-                "C_3": 1,
-                "C_4": 2,
-                "D_2": 0,
-            },
-            lane_connections={
-                ("B", "C"): [
-                    ("B_2", "C_2"),
-                    ("B_2", "C_3"),
-                    ("B_2", "C_4"),
-                ],
-                ("C", "D"): [("C_2", "D_2")],
-            },
-            generated_trajectory=recovery_path,
-        )
-        old_transform = obj.carlaActor.get_transform()
-        target_transform = carla.Transform(
-            carla.Location(x=10.0, y=-5.0, z=0.0),
-            carla.Rotation(yaw=0.0),
-        )
-        simulation._pending_lane_reconciliation_target = (
-            lambda target, road, lane: ("C_2", old_transform, target_transform)
-        )
-        simulation._mapped_carla_observation = lambda location: (
-            ("C", 0)
-            if abs(float(location.y) + 5.0) < 1e-6
-            else ("C", 2)
-        )
-
-        def teleport(*args, **kwargs):
-            calls["teleport"].append((args, kwargs))
-            if len(calls["teleport"]) == 1:
-                return metsr_response(
-                    "teleportCoSimVeh",
-                    [
-                        {
-                            "segmentId": "B",
-                            "laneIndex": 0,
-                            "transitionPending": True,
-                            "transitionCommitted": False,
-                        }
-                    ],
-                )
-            return metsr_response(
-                "teleportCoSimVeh",
-                [
-                    {
-                        "transitionPending": False,
-                        "transitionCommitted": True,
-                    }
-                ],
-            )
-
-        simulation.metsr_client.teleport_cosim_vehicle = teleport
-        simulation.metsr_client.query_vehicle = lambda *args, **kwargs: metsr_response(
-            "vehicle",
-            [
-                {"segmentId": "B", "laneIndex": 0, "transitionPending": False}
-            ],
-        )
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls["generate"][0][:3], (["C", "D"], obj, 0))
-        self.assertEqual(len(calls["transform"]), 1)
-        verification = simulation.pending_lane_reconciliation_verifications[obj]
-        self.assertEqual(
-            (
-                verification["pendingRoadID"],
-                verification["pendingLaneID"],
-                verification["roadID"],
-                verification["laneID"],
-                verification["observedRoadID"],
-            ),
-            ("B", 0, "C", 0, "C"),
-        )
-        self.assertIn(obj, simulation.road_entry_holds)
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 2)
-        self.assertEqual(calls["teleport"][1][1]["segment_id"], "C")
-        self.assertIsNone(calls["teleport"][1][1]["lane_index"])
-        self.assertNotIn(obj, simulation.pending_lane_reconciliation_verifications)
-        self.assertEqual(
-            (
-                simulation.pending_road_entries[obj]["source"],
-                simulation.pending_road_entries[obj]["target"],
-            ),
-            ("B", "C"),
-        )
-        self.assertIn(obj, simulation.road_entry_holds)
-
-        # The skipped-target commit leaves METS-R on B. A third fresh query
-        # must perform B->C before releasing the safety hold.
-        state.update({"segmentId": "B", "laneIndex": 0, "transitionPending": False})
-        simulation.carla_control_roads["C"] = True
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 4)
-        self.assertEqual(calls["teleport"][2][1]["segment_id"], "C")
-        self.assertEqual(calls["teleport"][2][1]["lane_index"], 0)
-        self.assertEqual(calls["teleport"][3][1]["segment_id"], "C")
-        self.assertEqual(calls["teleport"][3][1]["lane_index"], 0)
-        self.assertNotIn(obj, simulation.pending_road_entries)
-        self.assertNotIn(obj, simulation.road_entry_holds)
+        self.assertNotIn("segment_id", calls["teleport"][0][1])
+        self.assertNotIn("lane_index", calls["teleport"][0][1])
 
     def test_pending_successor_hint_remaining_pending_is_acknowledged(self):
         state = {
@@ -2135,81 +1068,11 @@ class AdapterStateTests(unittest.TestCase):
             teleport_result={"data": [dict(state)]},
         )
 
-        simulation.metsr_lane_connections = {("B", "C"): [("B_0", "C_2")]}
         simulation.synchronize_clients()
 
         self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "C")
+        self.assertNotIn("segment_id", calls["teleport"][0][1])
         self.assertEqual(calls["transform"], [])
-
-    def test_predecessor_boundary_flicker_is_not_forward(self):
-        self.assertFalse(
-            CosimSimulation._is_forward_road_observation(
-                "-47", "4", ["4", "-47", "-48", "-49"]
-            )
-        )
-
-    def test_immediate_successor_observation_is_forward(self):
-        self.assertTrue(
-            CosimSimulation._is_forward_road_observation(
-                "-47", "-48", ["-47", "-48", "-49"]
-            )
-        )
-
-    def test_skipped_forward_observation_is_forward(self):
-        self.assertTrue(
-            CosimSimulation._is_forward_road_observation(
-                "-47", "-49", ["-47", "-48", "-49"]
-            )
-        )
-
-    def test_multi_edge_skip_is_not_forward(self):
-        self.assertFalse(
-            CosimSimulation._is_forward_road_observation(
-                "A", "D", ["A", "B", "C", "D"]
-            )
-        )
-
-    def test_unrelated_road_observation_is_not_forward(self):
-        self.assertFalse(
-            CosimSimulation._is_forward_road_observation(
-                "-47", "27", ["-47", "-48", "-49"]
-            )
-        )
-
-    def test_current_carla_waypoint_overrides_stale_scenic_lane(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.metsr_lane_indices = {"-48_4": 2, "-48_3": 1}
-        simulation.metsr_road_cache = {
-            ("-48", 2): [(0.0, 0.0), (10.0, 0.0)],
-            ("-48", 1): [(0.0, 3.5), (10.0, 3.5)],
-        }
-        current_waypoint = SimpleNamespace(
-            road_id=48,
-            lane_id=-6,
-            transform=carla.Transform(
-                carla.Location(x=5.0, y=-3.5, z=0.0), carla.Rotation()
-            ),
-        )
-        stale_lane = SimpleNamespace(
-            road=SimpleNamespace(id=48), id=-5
-        )
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: current_waypoint
-        )
-        simulation.network_helper = SimpleNamespace(
-            scenic_to_metsr_map_lanes={
-                "48_-5": ["-48_4"],
-                "48_-6": ["-48_3"],
-            },
-            metsr_represented_roads={"-48"},
-            _nearest_lane=lambda obj: stale_lane,
-        )
-        location = SimpleNamespace(x=5.0, y=-3.5, z=0.0)
-
-        road_id, lane_id = simulation._mapped_carla_observation(location)
-
-        self.assertEqual((road_id, lane_id), ("-48", 1))
 
     def test_queue_service_ignores_old_roads_and_unmanaged_vehicles(self):
         class ManagedObject:
@@ -2217,11 +1080,11 @@ class AdapterStateTests(unittest.TestCase):
 
         managed = ManagedObject()
         admitted = []
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"A": True, "OLD": True}
-        simulation.active_bubble_metsr_roads = {"A"}
-        simulation.pv_id_map = {managed: 11}
-        simulation.admitted_queue_vehicles = {}
+        simulation = make_simulation()
+        simulation.metsr_state.controlled_roads = {"A": True, "OLD": True}
+        simulation.metsr_state.active_bubble_roads = {"A"}
+        simulation.metsr_state.private_vehicle_ids = {managed: 11}
+        simulation.metsr_state.admitted_vehicles = {}
         simulation.count = 7
 
         def admit(requests):
@@ -2273,7 +1136,7 @@ class AdapterStateTests(unittest.TestCase):
                             }
                         ],
                     },
-                ]
+                ],
             },
             enter_road_from_queue=admit,
         )
@@ -2292,7 +1155,7 @@ class AdapterStateTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            simulation.admitted_queue_vehicles,
+            simulation.metsr_state.admitted_vehicles,
             {11: {"roadId": "A", "admittedAt": 7}},
         )
 
@@ -2303,11 +1166,11 @@ class AdapterStateTests(unittest.TestCase):
         first = ManagedObject()
         second = ManagedObject()
         requests_seen = []
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"A": True}
-        simulation.active_bubble_metsr_roads = {"A"}
-        simulation.pv_id_map = {first: 11, second: 12}
-        simulation.admitted_queue_vehicles = {}
+        simulation = make_simulation()
+        simulation.metsr_state.controlled_roads = {"A": True}
+        simulation.metsr_state.active_bubble_roads = {"A"}
+        simulation.metsr_state.private_vehicle_ids = {first: 11, second: 12}
+        simulation.metsr_state.admitted_vehicles = {}
         simulation.count = 9
 
         def admit(requests):
@@ -2367,7 +1230,7 @@ class AdapterStateTests(unittest.TestCase):
             [11, 12],
         )
         self.assertEqual(
-            simulation.admitted_queue_vehicles,
+            simulation.metsr_state.admitted_vehicles,
             {
                 11: {"roadId": "A", "admittedAt": 9},
                 12: {"roadId": "A", "admittedAt": 9},
@@ -2380,11 +1243,11 @@ class AdapterStateTests(unittest.TestCase):
 
         managed = ManagedObject()
         managed.carla_actor_flag = False
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"A": True}
-        simulation.active_bubble_metsr_roads = {"A"}
-        simulation.pv_id_map = {managed: 11}
-        simulation.admitted_queue_vehicles = {}
+        simulation = make_simulation()
+        simulation.metsr_state.controlled_roads = {"A": True}
+        simulation.metsr_state.active_bubble_roads = {"A"}
+        simulation.metsr_state.private_vehicle_ids = {managed: 11}
+        simulation.metsr_state.admitted_vehicles = {}
         simulation.count = 0
         admitted = []
         simulation.metsr_client = SimpleNamespace(
@@ -2418,40 +1281,44 @@ class AdapterStateTests(unittest.TestCase):
 
         managed = ManagedObject()
         managed.carla_actor_flag = False
-        simulation = object.__new__(CosimSimulation)
-        simulation.pv_id_map = {managed: 11}
-        simulation.admitted_queue_vehicles = {
-            11: {"roadId": "A", "admittedAt": 2}
-        }
+        simulation = make_simulation()
+        simulation.metsr_state.private_vehicle_ids = {managed: 11}
+        simulation.metsr_state.admitted_vehicles = {11: {"roadId": "A", "admittedAt": 2}}
         simulation.count = 2 + COSIM_ADMISSION_SPAWN_MAX_TICKS
 
-        with self.assertRaisesRegex(
-            SimulationCreationError, "did not spawn it within"
-        ):
-            simulation._check_queue_admission_spawn_deadlines()
+        with self.assertRaisesRegex(SimulationCreationError, "did not spawn it within"):
+            native.check_queue_admission_spawn_deadlines(
+                simulation.metsr_state, simulation.count, set()
+            )
 
     def _connector_control_fixture(self, represented_roads, edge_connections=None):
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {}
-        simulation.carla_control_segments = set()
-        simulation.metsr_internal_edge_to_connector = {}
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
-        simulation.metsr_internal_edge_connections = dict(edge_connections or {})
-        simulation.metsr_internal_lane_connections = {}
+        simulation = make_simulation()
+        simulation.metsr_state.controlled_roads = {}
+        simulation.metsr_state.controlled_segments = set()
+        simulation.metsr_state.internal_edge_to_connector = {}
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.road_connectors = {}
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            internal_edge_connections=dict(edge_connections or {}),
+        )
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, internal_lane_connections={}
+        )
         lane_ids = {
             str(lane)
-            for pairs in simulation.metsr_internal_edge_connections.values()
+            for pairs in simulation.metsr_state.metadata.internal_edge_connections.values()
             for pair in pairs
             for lane in pair
         }
-        simulation.metsr_lane_indices = {
-            lane: index
-            for index, lane in enumerate(sorted(lane_ids))
-        }
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata,
+            lane_indices={lane: index for index, lane in enumerate(sorted(lane_ids))},
+        )
         simulation.network_helper = SimpleNamespace(
             metsr_represented_roads=set(map(str, represented_roads))
         )
+        simulation.metsr_state.valid_roads = list(map(str, represented_roads))
         return simulation
 
     @staticmethod
@@ -2494,9 +1361,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation.metsr_client = SimpleNamespace(
             set_cosim_road=lambda roads: (
                 calls.append(list(roads))
-                or self._takeover_response(
-                    "-37", connector_id, [":1146_3"], "-36"
-                )
+                or self._takeover_response("-37", connector_id, [":1146_3"], "-36")
             )
         )
 
@@ -2504,17 +1369,15 @@ class AdapterStateTests(unittest.TestCase):
 
         self.assertEqual(calls, [["-37"]])
         self.assertEqual(
-            simulation.metsr_internal_edge_to_connector,
+            simulation.metsr_state.internal_edge_to_connector,
             {":1146_3": connector_id},
         )
-        self.assertEqual(simulation.carla_control_segments, {"-37", ":1146_3"})
-        self.assertNotIn(connector_id, simulation.carla_control_segments)
+        self.assertEqual(simulation.metsr_state.controlled_segments, {"-37", ":1146_3"})
+        self.assertNotIn(connector_id, simulation.metsr_state.controlled_segments)
 
     def test_freeze_accepts_outbound_connector_touching_controlled_source(self):
         connector_id = "cont/A/B"
-        simulation = self._connector_control_fixture(
-            {"A"}, {":A_B": [("A_0", "B_0")]}
-        )
+        simulation = self._connector_control_fixture({"A"}, {":A_B": [("A_0", "B_0")]})
         simulation.metsr_client = SimpleNamespace(
             set_cosim_road=lambda roads: self._takeover_response(
                 "A",
@@ -2527,11 +1390,9 @@ class AdapterStateTests(unittest.TestCase):
 
         simulation.freeze_roads(["A"])
 
+        self.assertEqual(simulation.metsr_state.road_connectors, {"A": {connector_id}})
         self.assertEqual(
-            simulation.metsr_road_connectors, {"A": {connector_id}}
-        )
-        self.assertEqual(
-            simulation.metsr_internal_edge_to_connector,
+            simulation.metsr_state.internal_edge_to_connector,
             {":A_B": connector_id},
         )
 
@@ -2552,11 +1413,11 @@ class AdapterStateTests(unittest.TestCase):
         simulation.freeze_roads(["-14_2"])
 
         self.assertEqual(
-            simulation.carla_control_segments,
+            simulation.metsr_state.controlled_segments,
             {"-14_2", ":452_4", ":452_14"},
         )
         self.assertEqual(
-            simulation.metsr_internal_edge_to_connector,
+            simulation.metsr_state.internal_edge_to_connector,
             {":452_4": connector_id, ":452_14": connector_id},
         )
 
@@ -2582,242 +1443,10 @@ class AdapterStateTests(unittest.TestCase):
                 simulation.freeze_roads([target_road])
 
                 self.assertEqual(
-                    simulation.metsr_internal_edge_to_connector[edge_id],
+                    simulation.metsr_state.internal_edge_to_connector[edge_id],
                     connector_id,
                 )
-                self.assertNotIn(connector_id, simulation.carla_control_segments)
-
-    def test_exact_1146_physical_observation_is_accepted_without_lane_claim(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: SimpleNamespace(
-                road_id=1146,
-                lane_id=-3,
-                transform=carla.Transform(
-                    carla.Location(x=181.81, y=136.67, z=0.0),
-                    carla.Rotation(),
-                ),
-            )
-        )
-        simulation.network_helper = SimpleNamespace(
-            scenic_to_metsr_map_lanes={"1146_-3": [":1146_3_5"]},
-            metsr_represented_roads={"-36", "-37"},
-        )
-        simulation.metsr_lane_indices = {}
-        simulation.carla_control_roads = {"-37": True}
-        simulation.carla_control_segments = {"-37", ":1146_3"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":1146_3": "cont/-36/-37"
-        }
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
-
-        observed = simulation._mapped_carla_observation(
-            SimpleNamespace(x=181.81, y=136.67, z=0.0)
-        )
-
-        self.assertEqual(observed, (":1146_3", None))
-        self.assertEqual(
-            simulation._classify_physical_road_observation(
-                "-37", observed[0], ["-37", "next"]
-            ),
-            ROAD_OBSERVATION_UNKNOWN,
-        )
-
-    @staticmethod
-    def _unmapped_21_to_20_connector_fixture(
-        *, junction=True, projection_distance=0.0, mapped_road=None
-    ):
-        connector_id = "cont/21/20"
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "ego"
-        obj.route = ["20", "destination"]
-        obj.pcla = object()
-
-        waypoint = SimpleNamespace(
-            road_id=900,
-            lane_id=-1,
-            is_junction=junction,
-            transform=carla.Transform(
-                carla.Location(x=0.0, y=0.0, z=0.0), carla.Rotation()
-            ),
-        )
-        location = carla.Location(
-            x=projection_distance,
-            y=0.0,
-            z=0.0,
-        )
-        mappings = (
-            {}
-            if mapped_road is None
-            else {"900_-1": [f"{mapped_road}_0"]}
-        )
-
-        simulation = object.__new__(CosimSimulation)
-        simulation.ego = obj
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: waypoint
-        )
-        simulation.scenic_to_metsr_map = mappings
-        simulation.network_helper = SimpleNamespace(
-            scenic_to_metsr_map_lanes=mappings,
-            metsr_represented_roads={"20", "unrelated"},
-        )
-        simulation.metsr_lane_indices = {"20_0": 0, "unrelated_0": 0}
-        # Keep road 20 geometrically close so the rejection tests prove that
-        # invalid waypoint evidence is not rescued by centerline fallback.
-        simulation.metsr_road_cache = {
-            ("20", 0): [(-10.0, 0.0), (10.0, 0.0)],
-            ("unrelated", 0): [(-10.0, 0.0), (10.0, 0.0)],
-        }
-        simulation.carla_control_roads = {"20": True}
-        simulation.carla_control_segments = {"20", ":junction_internal"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":junction_internal": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "21",
-                "targetRoadId": "20",
-                "internalEdgeIds": [":junction_internal"],
-            }
-        }
-        simulation.metsr_road_connectors = {"20": {connector_id}}
-        simulation._carla_authoritative_segments = {obj: connector_id}
-        return simulation, obj, location, connector_id
-
-    def test_unmapped_owned_junction_preserves_21_to_20_connector(self):
-        simulation, obj, location, connector_id = (
-            self._unmapped_21_to_20_connector_fixture(
-                projection_distance=CARLA_OWNED_PROJECTION_TOLERANCE
-            )
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        resolved = simulation._resolve_carla_owned_observation(
-            obj,
-            location,
-            raw_road,
-            raw_lane,
-            {},
-            {},
-            vehicle_id=1,
-        )
-
-        self.assertEqual((raw_road, raw_lane), (None, None))
-        self.assertEqual(resolved, (connector_id, None, "20"))
-        self.assertEqual(
-            simulation._carla_authoritative_segments[obj], connector_id
-        )
-
-    def test_mapped_target_observation_switches_connector_to_road_20(self):
-        simulation, obj, location, _ = (
-            self._unmapped_21_to_20_connector_fixture(mapped_road="20")
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        resolved = simulation._resolve_carla_owned_observation(
-            obj,
-            location,
-            raw_road,
-            raw_lane,
-            {},
-            {},
-            vehicle_id=1,
-        )
-
-        self.assertEqual((raw_road, raw_lane), ("20", 0))
-        self.assertEqual(resolved, ("20", 0, "20"))
-        self.assertEqual(simulation._carla_authoritative_segments[obj], "20")
-
-    def test_unmapped_nonjunction_gap_does_not_preserve_connector(self):
-        simulation, obj, location, _ = (
-            self._unmapped_21_to_20_connector_fixture(junction=False)
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        with self.assertRaisesRegex(
-            SimulationCreationError, "outside its METS-R ownership domain"
-        ):
-            simulation._resolve_carla_owned_observation(
-                obj,
-                location,
-                raw_road,
-                raw_lane,
-                {},
-                {},
-                vehicle_id=1,
-            )
-
-    def test_unmapped_junction_beyond_projection_tolerance_fails(self):
-        simulation, obj, location, _ = (
-            self._unmapped_21_to_20_connector_fixture(
-                projection_distance=CARLA_OWNED_PROJECTION_TOLERANCE + 0.001
-            )
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        with self.assertRaisesRegex(
-            SimulationCreationError, "projection error=4.251 m"
-        ):
-            simulation._resolve_carla_owned_observation(
-                obj,
-                location,
-                raw_road,
-                raw_lane,
-                {},
-                {},
-                vehicle_id=1,
-            )
-
-    def test_pose_without_carla_driving_waypoint_fails(self):
-        simulation, obj, location, _ = (
-            self._unmapped_21_to_20_connector_fixture()
-        )
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: None
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        with self.assertRaisesRegex(
-            SimulationCreationError, "projection error=unavailable"
-        ):
-            simulation._resolve_carla_owned_observation(
-                obj,
-                location,
-                raw_road,
-                raw_lane,
-                {},
-                {},
-                vehicle_id=1,
-            )
-
-    def test_explicit_unrelated_road_does_not_preserve_connector(self):
-        simulation, obj, location, _ = (
-            self._unmapped_21_to_20_connector_fixture(
-                mapped_road="unrelated"
-            )
-        )
-
-        raw_road, raw_lane = simulation._mapped_carla_observation(location)
-        self.assertEqual((raw_road, raw_lane), ("unrelated", 0))
-        with self.assertRaisesRegex(
-            SimulationCreationError, "raw CARLA road/lane=unrelated/0"
-        ):
-            simulation._resolve_carla_owned_observation(
-                obj,
-                location,
-                raw_road,
-                raw_lane,
-                {},
-                {},
-                vehicle_id=1,
-            )
+                self.assertNotIn(connector_id, simulation.metsr_state.controlled_segments)
 
     def _town06_merging_connector_fixture(self):
         class Ego:
@@ -2830,288 +1459,72 @@ class AdapterStateTests(unittest.TestCase):
         location = carla.Location(x=666.48364, y=136.82701, z=0.0)
         previous = "cont/6/5"
         other = "cont/-38/5"
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         waypoint = SimpleNamespace(
-            road_id=334, lane_id=4, is_junction=True,
+            road_id=334,
+            lane_id=4,
+            is_junction=True,
             transform=carla.Transform(
                 carla.Location(x=location.x + 1.292, y=location.y, z=0.0),
                 carla.Rotation(),
             ),
         )
         simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: waypoint)
-        simulation.network_helper = SimpleNamespace(
-            scenic_to_metsr_map_lanes={"334_4": [":332_8_2"]},
-            metsr_represented_roads={"6", "5", "-38"},
+        simulation.network_helper = SimpleNamespace()
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_mapping={"334_4": [":332_8_2"]}
         )
-        simulation.carla_control_roads = {"6": True, "5": True, "-38": True}
-        simulation.carla_control_segments = {"6", "5", "-38", ":332_0", ":332_8"}
-        simulation.metsr_internal_edge_to_connector = {":332_0": previous, ":332_8": other}
-        simulation.metsr_connector_records = {
+        simulation.metsr_state.valid_roads = {"6", "5", "-38"}
+        simulation.metsr_state.controlled_roads = {"6": True, "5": True, "-38": True}
+        simulation.metsr_state.controlled_segments = {
+            "6",
+            "5",
+            "-38",
+            ":332_0",
+            ":332_8",
+        }
+        simulation.metsr_state.internal_edge_to_connector = {
+            ":332_0": previous,
+            ":332_8": other,
+        }
+        simulation.metsr_state.connector_records = {
             previous: {
-                "connectorId": previous, "sourceRoadId": "6", "targetRoadId": "5",
-                "intersectionId": 14, "internalEdgeIds": [":332_0"],
+                "connectorId": previous,
+                "sourceRoadId": "6",
+                "targetRoadId": "5",
+                "intersectionId": 14,
+                "internalEdgeIds": [":332_0"],
                 "paths": [{"connectorPathId": 2, "viaLaneIds": [":332_0_4"]}],
             },
             other: {
-                "connectorId": other, "sourceRoadId": "-38", "targetRoadId": "5",
-                "intersectionId": 14, "internalEdgeIds": [":332_8"],
+                "connectorId": other,
+                "sourceRoadId": "-38",
+                "targetRoadId": "5",
+                "intersectionId": 14,
+                "internalEdgeIds": [":332_8"],
                 "paths": [{"connectorPathId": 2, "viaLaneIds": [":332_8_2"]}],
             },
         }
-        simulation.metsr_road_connectors = {"5": {previous, other}}
-        simulation.metsr_connector_centerline_cache = {
+        simulation.metsr_state.road_connectors = {"5": {previous, other}}
+        simulation.metsr_state.connector_centerline_cache = {
             (previous, 2): [(664.8, -168.58, 0.0), (665.32, -120.35, 0.0)]
         }
-        simulation._carla_authoritative_segments = {obj: previous}
+        simulation.metsr_state.authoritative_segments = {obj: previous}
         state = {"segmentId": previous, "connectorId": previous, "connectorPathId": 2}
         return simulation, obj, location, waypoint, state
 
-    def test_merging_332_8_observation_preserves_occupied_6_to_5_connector(self):
-        simulation, obj, location, _, state = self._town06_merging_connector_fixture()
-        resolved = simulation._resolve_carla_owned_observation(
-            obj, location, ":332_8", None, state, state, vehicle_id=0
-        )
-        self.assertEqual(resolved, ("cont/6/5", None, "5"))
-        self.assertEqual(simulation._carla_authoritative_segments[obj], "cont/6/5")
-        self.assertEqual(
-            simulation._connector_path_id_for_pose(resolved[0], location, state), 2
-        )
-
-    def test_connector_merge_continuity_requires_geometry_and_matching_exit(self):
-        for invalid_evidence in (
-            "far_from_occupied_path", "far_from_waypoint", "nonjunction",
-            "different_exit", "different_intersection", "missing_geometry",
-        ):
-            with self.subTest(invalid_evidence=invalid_evidence):
-                simulation, obj, location, waypoint, state = self._town06_merging_connector_fixture()
-                if invalid_evidence == "far_from_occupied_path":
-                    simulation.metsr_connector_centerline_cache[("cont/6/5", 2)] = [
-                        (650.0, -168.58), (650.0, -120.35)
-                    ]
-                elif invalid_evidence == "far_from_waypoint":
-                    waypoint.transform.location = carla.Location(
-                        x=location.x + CARLA_OWNED_PROJECTION_TOLERANCE + 0.1,
-                        y=location.y, z=location.z,
-                    )
-                elif invalid_evidence == "nonjunction":
-                    waypoint.is_junction = False
-                elif invalid_evidence == "different_exit":
-                    simulation.metsr_connector_records["cont/-38/5"]["targetRoadId"] = "4"
-                elif invalid_evidence == "different_intersection":
-                    simulation.metsr_connector_records["cont/-38/5"]["intersectionId"] = 15
-                else:
-                    simulation.metsr_connector_centerline_cache[("cont/6/5", 2)] = []
-                with self.assertRaises(SimulationCreationError):
-                    simulation._resolve_carla_owned_observation(
-                        obj, location, ":332_8", None, state, state, vehicle_id=0
-                    )
-
-    def test_connector_merge_still_accepts_observed_downstream_road(self):
-        simulation, obj, location, _, state = self._town06_merging_connector_fixture()
-        resolved = simulation._resolve_carla_owned_observation(
-            obj, location, "5", 2, state, state, vehicle_id=0
-        )
-        self.assertEqual(resolved, ("5", 2, "5"))
-
-    def _town06_fork_connector_fixture(self, y=149.12698):
-        simulation, obj, _, waypoint, _ = self._town06_merging_connector_fixture()
-        # Last seed-36 pose and occupied path from the native server.
-        location = carla.Location(x=-224.19861, y=y, z=0.0)
-        waypoint.transform.location = carla.Location(
-            x=location.x + 2.767, y=location.y, z=0.0
-        )
-        previous, observed = "cont/21/20", "cont/21/-7"
-        obj.route = ["21", "20", "-67"]
-        simulation.carla_control_roads = {"21": True, "20": True, "-7": True}
-        simulation.carla_control_segments = {"21", "20", "-7", ":396_0", ":396_6"}
-        simulation.metsr_internal_edge_to_connector = {":396_0": previous, ":396_6": observed}
-        simulation.network_helper.scenic_to_metsr_map_lanes = {"334_4": [":396_6_0"]}
-        simulation.metsr_connector_records = {
-            previous: {
-                "connectorId": previous, "sourceRoadId": "21", "targetRoadId": "20",
-                "intersectionId": 16, "internalEdgeIds": [":396_0"],
-                "paths": [{"connectorPathId": 3, "viaLaneIds": [":396_0_5"]}],
-            },
-            observed: {
-                "connectorId": observed, "sourceRoadId": "21", "targetRoadId": "-7",
-                "intersectionId": 16, "internalEdgeIds": [":396_6"],
-                "paths": [{"connectorPathId": 0, "viaLaneIds": [":396_6_0"]}],
-            },
-        }
-        simulation.metsr_road_connectors = {"21": {previous, observed}}
-        simulation.metsr_connector_centerline_cache = {
-            (previous, 3): [(-205.88, -145.66), (-239.44, -145.58)],
-            (observed, 0): [
-                (-205.89, -149.16), (-215.26, -149.45), (-221.69, -150.85),
-                (-227.50, -154.06), (-234.99, -159.78),
-            ],
-        }
-        simulation._carla_authoritative_segments = {obj: previous}
-        state = {"segmentId": previous, "connectorId": previous, "connectorPathId": 3}
-        return simulation, obj, location, state
-
-    def test_fork_396_6_observation_preserves_occupied_path_while_ambiguous(self):
-        simulation, obj, location, state = self._town06_fork_connector_fixture()
-        resolved = simulation._resolve_carla_owned_observation(
-            obj, location, ":396_6", None, state, state, vehicle_id=0
-        )
-        self.assertEqual(resolved, ("cont/21/20", None, "20"))
-
-    def test_fork_accepts_carla_chosen_turn_when_paths_diverge(self):
-        simulation, obj, location, state = self._town06_fork_connector_fixture(y=151.5)
-        resolved = simulation._resolve_carla_owned_observation(
-            obj, location, ":396_6", None, state, state, vehicle_id=0
-        )
-        self.assertEqual(resolved, ("cont/21/-7", None, "-7"))
-        self.assertEqual(simulation._carla_authoritative_segments[obj], "cont/21/-7")
-        self.assertEqual(obj.route, ["21", "20", "-67"])
-        self.assertEqual(
-            simulation._connector_path_id_for_pose(resolved[0], location, state), 0
-        )
-        downstream = simulation._resolve_carla_owned_observation(
-            obj, location, "-7", 0, state, state, vehicle_id=0
-        )
-        self.assertEqual(downstream, ("-7", 0, "-7"))
-
-    def test_fork_rejects_pose_outside_both_connector_paths(self):
-        simulation, obj, location, state = self._town06_fork_connector_fixture(y=165)
-        with self.assertRaises(SimulationCreationError):
-            simulation._resolve_carla_owned_observation(
-                obj, location, ":396_6", None, state, state, vehicle_id=0
-            )
-
-    def test_exact_1146_is_sent_as_canonical_connector_not_logical_route(self):
-        calls = []
-
-        class Vehicle:
-            pass
-
-        actor = SimpleNamespace(
-            get_transform=lambda: carla.Transform(
-                carla.Location(), carla.Rotation(yaw=10.0)
-            ),
-            get_velocity=lambda: SimpleNamespace(x=2.0, y=0.0, z=0.0),
-        )
-        obj = Vehicle()
-        obj.name = "car_4"
-        obj.route = ["-37", "destination"]
-        obj.carlaActor = actor
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"-37": True}
-        simulation.carla_control_segments = {"-37", ":1146_3"}
-        connector_id = "cont/-36/-37"
-        simulation.metsr_internal_edge_to_connector = {
-            ":1146_3": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "-36",
-                "targetRoadId": "-37",
-                "internalEdgeIds": [":1146_3"],
-            }
-        }
-        simulation.metsr_road_connectors = {"-37": {connector_id}}
-        simulation.road_entry_holds = {}
-        simulation.road_entry_hold_diagnostics = {}
-        simulation.pending_road_entries = {}
-        simulation.pending_route_refreshes = {}
-        simulation.pending_lane_reconciliation_verifications = {}
-        simulation.same_road_departure_lane_verifications = {}
-        simulation._pending_pcla_pose_resets = set()
-        simulation.destination_route_cache = {}
-
-        def teleport(*args, **kwargs):
-            calls.append((args, kwargs))
-            return {
-                "messageType": "teleportCoSimVeh",
-                "status": "ok",
-                "data": [{"vehicleId": 5, "status": "ok"}],
-            }
-
-        simulation.metsr_client = SimpleNamespace(
-            teleport_cosim_vehicle=teleport,
-            query_route_between_roads=lambda *args: (_ for _ in ()).throw(
-                AssertionError("an internal physical edge is not a logical route road")
-            ),
-            update_vehicle_route=lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("an internal physical edge must not replace the route")
-            ),
-        )
-
-        simulation._synchronize_pcla_ego_shadow(
-            obj,
-            5,
-            {
-                "segmentId": "-37",
-                "destinationRoadId": "destination",
-                "transitionPending": False,
-            },
-            {"routeRoadIds": ["-37", "destination"]},
-            carla.Location(x=181.81, y=136.67, z=0.0),
-            connector_id,
-            None,
-            "-37",
-        )
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1]["segment_id"], connector_id)
-        self.assertIsNone(calls[0][1]["lane_index"])
-        self.assertEqual(obj.route, ["-37", "destination"])
-
-    def test_exact_car_4_source_boundary_uses_canonical_connector(self):
-        simulation = object.__new__(CosimSimulation)
-        connector_id = "cont/-36/-37"
-        simulation.carla_control_roads = {"-37": True}
-        simulation.carla_control_segments = {"-37", ":1146_3"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":1146_3": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "-36",
-                "targetRoadId": "-37",
-                "internalEdgeIds": [":1146_3"],
-            }
-        }
-        simulation.metsr_road_connectors = {"-37": {connector_id}}
-        record = {
-            "vehicleId": 5,
-            "segmentId": connector_id,
-            "segmentType": "connector",
-            "connectorId": connector_id,
-            "internalEdgeIds": [":1146_3"],
-            "sourceRoadId": "-36",
-            "targetRoadId": "-37",
-            "transitionSourceRoadId": "-36",
-            "transitionTargetRoadId": "-37",
-            "transitionPending": True,
-        }
-
-        hint = simulation._canonical_connector_hint(record, "-36")
-
-        self.assertEqual(hint, connector_id)
-        self.assertEqual(
-            simulation._observed_road_hint(
-                SimpleNamespace(route=["-37", "destination"]), record, "-36"
-            ),
-            connector_id,
-        )
-
-    @staticmethod
-    def _car_4_authority_fixture(raw_observations, teleport_response=None):
+    def _car_4_authority_fixture(self, raw_observations, teleport_response=None):
         connector_id = "cont/-36/-37"
 
         class Vehicle:
             pass
 
         class Actor:
+            is_alive = True
+
             def __init__(self):
                 self.location = carla.Location(x=181.81, y=136.67, z=0.0)
-                self.transform = carla.Transform(
-                    self.location, carla.Rotation(yaw=7.0)
-                )
+                self.transform = carla.Transform(self.location, carla.Rotation(yaw=7.0))
                 self.transform_calls = []
 
             def get_location(self):
@@ -3161,16 +1574,14 @@ class AdapterStateTests(unittest.TestCase):
             "routeRoadIds": ["-37", "destination"],
             "destinationRoadId": "destination",
         }
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.carla_actors = [obj]
         simulation.metsr_actors = []
-        simulation._carla_authoritative_segments = {}
-        simulation.carla_control_roads = {"-37": True}
-        simulation.carla_control_segments = {"-37", ":1146_3"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":1146_3": connector_id
-        }
-        simulation.metsr_connector_records = {
+        simulation.metsr_state.authoritative_segments = {}
+        simulation.metsr_state.controlled_roads = {"-37": True}
+        simulation.metsr_state.controlled_segments = {"-37", ":1146_3"}
+        simulation.metsr_state.internal_edge_to_connector = {":1146_3": connector_id}
+        simulation.metsr_state.connector_records = {
             connector_id: {
                 "connectorId": connector_id,
                 "sourceRoadId": "-36",
@@ -3178,9 +1589,11 @@ class AdapterStateTests(unittest.TestCase):
                 "internalEdgeIds": [":1146_3"],
             }
         }
-        simulation.metsr_road_connectors = {"-37": {connector_id}}
-        simulation.metsr_lane_indices = {}
-        simulation.metsr_road_cache = {}
+        simulation.metsr_state.road_connectors = {"-37": {connector_id}}
+        simulation.metsr_state.metadata = replace(
+            simulation.metsr_state.metadata, lane_indices={}
+        )
+        simulation.metsr_state.road_cache = {}
         simulation.pending_road_entries = {}
         simulation.pending_route_refreshes = {}
         simulation.pending_lane_reconciliation_verifications = {}
@@ -3190,9 +1603,16 @@ class AdapterStateTests(unittest.TestCase):
         simulation.completed_route = {}
         simulation.count = 36
         simulation.ego = None
-        simulation._collect_metsr_vehicle_data = lambda objects: {
-            obj: vehicle_state
-        }
+        simulation._collect_metsr_vehicle_data = lambda objects: {obj: vehicle_state}
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.getMetsrPrivateVehId = lambda target: 5
 
         observations = list(raw_observations)
@@ -3226,9 +1646,7 @@ class AdapterStateTests(unittest.TestCase):
             )
 
         simulation.metsr_client = SimpleNamespace(
-            query_cosim_vehicle=lambda: metsr_response(
-                "coSimVehicle", [cosim_record]
-            ),
+            query_cosim_vehicle=lambda: metsr_response("coSimVehicle", [cosim_record]),
             teleport_cosim_vehicle=teleport,
         )
         simulation.tm = SimpleNamespace(
@@ -3239,35 +1657,22 @@ class AdapterStateTests(unittest.TestCase):
                 AssertionError("a shadow response must not alter CARLA lane control")
             ),
         )
-        simulation._apply_carla_transform_without_tick = (
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("a shadow response must not transform CARLA")
-            )
-        )
+        simulation._apply_carla_transform_without_tick = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(AssertionError("a shadow response must not transform CARLA"))
         simulation.check_client_synchronization = lambda: None
+        helper_patch = patch.object(
+            runtime,
+            "check_client_synchronization",
+            lambda _simulation, *args, **kwargs: simulation.check_client_synchronization(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         return simulation, obj, calls
 
-    def test_car_4_source_boundary_pending_ack_keeps_carla_authoritative(self):
-        connector_id = "cont/-36/-37"
-        simulation, obj, calls = self._car_4_authority_fixture([("-36", 4)])
-        original_transform = obj.carlaActor.get_transform()
-        original_route = list(obj.route)
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1]["segment_id"], connector_id)
-        self.assertIsNone(calls[0][1]["lane_index"])
-        self.assertIs(obj.carlaActor.get_transform(), original_transform)
-        self.assertEqual(obj.carlaActor.transform_calls, [])
-        self.assertEqual(obj.route, original_route)
-        self.assertIn(obj, simulation.carla_actors)
-        self.assertEqual(
-            simulation._carla_authoritative_segments[obj], connector_id
-        )
-
-    def test_carla_authoritative_segment_does_not_flicker_back_to_source(self):
-        connector_id = "cont/-36/-37"
+    def test_pose_publication_does_not_depend_on_flickering_source_membership(self):
         simulation, obj, calls = self._car_4_authority_fixture(
             [("-36", 4), ("-37", 3), ("-36", 4)]
         )
@@ -3276,42 +1681,11 @@ class AdapterStateTests(unittest.TestCase):
         simulation.synchronize_clients()
         simulation.synchronize_clients()
 
-        self.assertEqual(
-            [call[1]["segment_id"] for call in calls],
-            [connector_id, "-37", "-37"],
-        )
-        self.assertEqual(calls[0][1]["lane_index"], None)
-        self.assertEqual(calls[1][1]["lane_index"], 3)
-        self.assertEqual(calls[2][1]["lane_index"], None)
-        self.assertEqual(simulation._carla_authoritative_segments[obj], "-37")
-
-    def test_internal_edge_publishes_canonical_connector_without_route_change(self):
-        connector_id = "cont/-36/-37"
-        simulation, obj, calls = self._car_4_authority_fixture(
-            [(":1146_3", 9)]
-        )
-        original_route = list(obj.route)
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(calls[0][1]["segment_id"], connector_id)
-        self.assertIsNone(calls[0][1]["lane_index"])
-        self.assertEqual(calls[0][1]["connector_path_id"], 0)
-        self.assertEqual(obj.route, original_route)
-
-    def test_unrelated_outside_road_fails_before_shadow_teleport(self):
-        simulation, obj, calls = self._car_4_authority_fixture(
-            [("unrelated/outside", 2)]
-        )
-
-        with self.assertRaisesRegex(
-            SimulationCreationError,
-            "outside its METS-R ownership domain.*allowed segments",
-        ):
-            simulation.synchronize_clients()
-
-        self.assertEqual(calls, [])
-        self.assertEqual(obj.carlaActor.transform_calls, [])
+        self.assertTrue(all("pose_only" not in call[1] for call in calls))
+        self.assertNotIn("lane_index", calls[0][1])
+        self.assertNotIn("lane_index", calls[1][1])
+        self.assertNotIn("lane_index", calls[2][1])
+        self.assertTrue(all("segment_id" not in call[1] for call in calls))
 
     def test_partial_shadow_acknowledgement_still_raises_control_error(self):
         response = metsr_response(
@@ -3352,235 +1726,9 @@ class AdapterStateTests(unittest.TestCase):
         ) as raised:
             simulation.synchronize_clients()
 
-        self.assertEqual(
-            raised.exception.record["errorCode"], "INVALID_CONNECTOR_PATH"
-        )
+        self.assertEqual(raised.exception.record["errorCode"], "INVALID_CONNECTOR_PATH")
         self.assertEqual(len(calls), 1)
         self.assertEqual(obj.carlaActor.transform_calls, [])
-
-
-    def test_outbound_handoff_accepts_carla_choice_outside_metsr_route(self):
-        connector_id = "opaque-A-to-B"
-        state = {
-            "segmentId": "A",
-            "laneIndex": 1,
-            "destinationRoadId": "C",
-        }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state,
-            "B",
-            ["OTHER", "C"],
-            observed_lane=2,
-            controlled_roads={"A"},
-            transition_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "controlMode": "native",
-                        "releasedFromCoSim": True,
-                    }
-                ]
-            },
-        )
-        simulation.carla_control_segments = {"A", ":A_B_0"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":A_B_0": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "A",
-                "targetRoadId": "B",
-                "internalEdgeIds": [":A_B_0"],
-            }
-        }
-        simulation.metsr_road_connectors = {"A": {connector_id}}
-
-        simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "B")
-        self.assertEqual(calls["teleport"][0][1]["lane_index"], 2)
-        self.assertNotIn(obj, simulation.carla_actors)
-        self.assertIn(obj, simulation.metsr_actors)
-        self.assertNotIn(obj, simulation._carla_authoritative_segments)
-        self.assertEqual(simulation.pending_road_entries, {})
-
-    def test_outbound_handoff_requires_explicit_native_release_ack(self):
-        connector_id = "opaque-A-to-B"
-        simulation, obj, calls = self._sync_guard_fixture(
-            {
-                "segmentId": "A",
-                "laneIndex": 1,
-                "destinationRoadId": "C",
-            },
-            "B",
-            ["A", "B", "C"],
-            observed_lane=2,
-            controlled_roads={"A"},
-            transition_result={
-                "data": [
-                    {
-                        "segmentId": "B",
-                        "laneIndex": 2,
-                        "controlMode": "cosim",
-                        "releasedFromCoSim": False,
-                    }
-                ]
-            },
-        )
-        simulation.carla_control_segments = {"A", ":A_B_0"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":A_B_0": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "A",
-                "targetRoadId": "B",
-                "internalEdgeIds": [":A_B_0"],
-            }
-        }
-        simulation.metsr_road_connectors = {"A": {connector_id}}
-
-        with self.assertRaisesRegex(METSRControlError, "direct native handoff"):
-            simulation.synchronize_clients()
-
-        self.assertEqual(len(calls["teleport"]), 1)
-        self.assertIn(obj, simulation.carla_actors)
-        self.assertNotIn(obj, simulation.metsr_actors)
-
-    def test_pcla_source_boundary_uses_canonical_connector(self):
-        calls = []
-        connector_id = "cont/-36/-37"
-        actor = SimpleNamespace(
-            get_transform=lambda: carla.Transform(
-                carla.Location(), carla.Rotation(yaw=10.0)
-            ),
-            get_velocity=lambda: SimpleNamespace(x=2.0, y=0.0, z=0.0),
-        )
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "ego"
-        obj.route = ["-37", "destination"]
-        obj.carlaActor = actor
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"-37": True}
-        simulation.carla_control_segments = {"-37", ":1146_3"}
-        simulation.metsr_internal_edge_to_connector = {
-            ":1146_3": connector_id
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "-36",
-                "targetRoadId": "-37",
-                "internalEdgeIds": [":1146_3"],
-            }
-        }
-        simulation.metsr_road_connectors = {"-37": {connector_id}}
-        simulation.road_entry_holds = {}
-        simulation.road_entry_hold_diagnostics = {}
-        simulation.pending_road_entries = {}
-        simulation.pending_route_refreshes = {}
-        simulation.pending_lane_reconciliation_verifications = {}
-        simulation.same_road_departure_lane_verifications = {}
-        simulation._pending_pcla_pose_resets = set()
-        simulation.destination_route_cache = {}
-        record = {
-            "vehicleId": 5,
-            "segmentId": connector_id,
-            "segmentType": "connector",
-            "connectorId": connector_id,
-            "internalEdgeIds": [":1146_3"],
-            "sourceRoadId": "-36",
-            "targetRoadId": "-37",
-            "transitionSourceRoadId": "-36",
-            "transitionTargetRoadId": "-37",
-            "transitionPending": True,
-            "destinationRoadId": "destination",
-        }
-        vehicle_state = {
-            "segmentId": "-37",
-            "transitionPending": False,
-            "destinationRoadId": "destination",
-        }
-
-        def teleport(*args, **kwargs):
-            calls.append((args, kwargs))
-            return {
-                "messageType": "teleportCoSimVeh",
-                "status": "ok",
-                "data": [{"vehicleId": 5, "status": "ok"}],
-            }
-
-        simulation.metsr_client = SimpleNamespace(
-            teleport_cosim_vehicle=teleport,
-            query_route_between_roads=lambda *args: (_ for _ in ()).throw(
-                AssertionError("a pending connector must not rebuild the route")
-            ),
-            update_vehicle_route=lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("a pending connector must preserve the route")
-            ),
-        )
-
-        simulation._synchronize_pcla_ego_shadow(
-            obj,
-            5,
-            vehicle_state,
-            record,
-            carla.Location(x=181.81, y=136.67, z=0.0),
-            connector_id,
-            None,
-            "-37",
-        )
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1]["segment_id"], connector_id)
-        self.assertIsNone(calls[0][1]["lane_index"])
-
-    def test_multi_edge_connector_always_uses_canonical_connector_id(self):
-        simulation = object.__new__(CosimSimulation)
-        connector_id = "cont/58/-14"
-        internal_edges = [":452_4_0", ":452_14_0"]
-        simulation.carla_control_roads = {"-14": True}
-        simulation.carla_control_segments = {"-14", *internal_edges}
-        simulation.metsr_internal_edge_to_connector = {
-            edge_id: connector_id for edge_id in internal_edges
-        }
-        simulation.metsr_connector_records = {
-            connector_id: {
-                "connectorId": connector_id,
-                "sourceRoadId": "58",
-                "targetRoadId": "-14",
-                "internalEdgeIds": internal_edges,
-            }
-        }
-        simulation.metsr_road_connectors = {"-14": {connector_id}}
-        record = {
-            "segmentId": connector_id,
-            "segmentType": "connector",
-            "connectorId": connector_id,
-            "internalEdgeIds": internal_edges,
-            "sourceRoadId": "58",
-            "targetRoadId": "-14",
-            "transitionPending": True,
-        }
-
-        self.assertEqual(
-            simulation._canonical_connector_hint(record, "58"),
-            connector_id,
-        )
-        self.assertEqual(
-            simulation._canonical_connector_hint(record, ":452_14_0"),
-            connector_id,
-        )
-        self.assertIsNone(
-            simulation._canonical_connector_hint(record, "unrelated")
-        )
 
     def test_freeze_roads_partial_failure_raises_without_retry_or_rollback(self):
         attempts = []
@@ -3623,8 +1771,8 @@ class AdapterStateTests(unittest.TestCase):
         with self.assertRaisesRegex(METSRControlError, "FREEZE_BLOCKED"):
             simulation.freeze_roads(["A", "B", "A"])
 
-        self.assertEqual(simulation.carla_control_roads, {})
-        self.assertEqual(simulation.carla_control_segments, set())
+        self.assertEqual(simulation.metsr_state.controlled_roads, {})
+        self.assertEqual(simulation.metsr_state.controlled_segments, set())
         self.assertEqual(attempts, [["A", "B"]])
         self.assertEqual(rollbacks, [])
 
@@ -3633,9 +1781,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation = self._connector_control_fixture(
             {"-37"}, {":1146_3": [("-36_6", "-37_5")]}
         )
-        response = self._takeover_response(
-            "-37", "cont/-36/-37", [], "-36"
-        )
+        response = self._takeover_response("-37", "cont/-36/-37", [], "-36")
         simulation.metsr_client = SimpleNamespace(
             set_cosim_road=lambda roads: response,
             release_cosim_road=lambda roads: (
@@ -3652,26 +1798,24 @@ class AdapterStateTests(unittest.TestCase):
             simulation.freeze_roads(["-37"])
 
         self.assertEqual(rollbacks, [])
-        self.assertEqual(simulation.carla_control_roads, {})
+        self.assertEqual(simulation.metsr_state.controlled_roads, {})
 
     def test_freeze_roads_propagates_nonretryable_failure(self):
         simulation = self._connector_control_fixture({"A"})
 
         def reject(roads):
-            raise METSRControlError(
-                "permanent failure", record={"retryable": False}
-            )
+            raise METSRControlError("permanent failure", record={"retryable": False})
 
         simulation.metsr_client = SimpleNamespace(set_cosim_road=reject)
 
         with self.assertRaises(METSRControlError):
             simulation.freeze_roads(["A"])
 
-        self.assertEqual(simulation.carla_control_roads, {})
+        self.assertEqual(simulation.metsr_state.controlled_roads, {})
 
     def test_release_preserves_connector_owned_by_other_endpoint(self):
         simulation = self._connector_control_fixture({"A", "B"})
-        simulation.carla_control_roads = {"A": True, "B": True}
+        simulation.metsr_state.controlled_roads = {"A": True, "B": True}
         connector_id = "cont/A/B"
         connector = {
             "connectorId": connector_id,
@@ -3680,10 +1824,10 @@ class AdapterStateTests(unittest.TestCase):
             "internalEdgeIds": [":1146_3"],
             "controlMode": "COSIM",
         }
-        simulation.carla_control_segments = {"A", "B", ":1146_3"}
-        simulation.metsr_internal_edge_to_connector = {":1146_3": connector_id}
-        simulation.metsr_connector_records = {connector_id: connector}
-        simulation.metsr_road_connectors = {
+        simulation.metsr_state.controlled_segments = {"A", "B", ":1146_3"}
+        simulation.metsr_state.internal_edge_to_connector = {":1146_3": connector_id}
+        simulation.metsr_state.connector_records = {connector_id: connector}
+        simulation.metsr_state.road_connectors = {
             "A": {connector_id},
             "B": {connector_id},
         }
@@ -3715,31 +1859,29 @@ class AdapterStateTests(unittest.TestCase):
                 "data": [record],
             }
 
-        simulation.metsr_client = SimpleNamespace(
-            release_cosim_road=release
-        )
+        simulation.metsr_client = SimpleNamespace(release_cosim_road=release)
 
         simulation.release_roads(["A"])
 
         self.assertEqual(released, ["A"])
-        self.assertEqual(simulation.carla_control_roads, {"B": True})
+        self.assertEqual(simulation.metsr_state.controlled_roads, {"B": True})
         self.assertEqual(
-            simulation.metsr_internal_edge_to_connector,
+            simulation.metsr_state.internal_edge_to_connector,
             {":1146_3": connector_id},
         )
-        self.assertIn(":1146_3", simulation.carla_control_segments)
+        self.assertIn(":1146_3", simulation.metsr_state.controlled_segments)
 
         simulation.release_roads(["B"])
 
         self.assertEqual(released, ["A", "B"])
-        self.assertEqual(simulation.carla_control_roads, {})
-        self.assertEqual(simulation.metsr_internal_edge_to_connector, {})
-        self.assertEqual(simulation.carla_control_segments, set())
+        self.assertEqual(simulation.metsr_state.controlled_roads, {})
+        self.assertEqual(simulation.metsr_state.internal_edge_to_connector, {})
+        self.assertEqual(simulation.metsr_state.controlled_segments, set())
 
     def test_release_failure_is_fatal_and_keeps_local_ownership(self):
         simulation = self._connector_control_fixture({"A"})
-        simulation.carla_control_roads = {"A": True}
-        simulation.carla_control_segments = {"A"}
+        simulation.metsr_state.controlled_roads = {"A": True}
+        simulation.metsr_state.controlled_segments = {"A"}
         simulation.metsr_client = SimpleNamespace(
             release_cosim_road=lambda road: {
                 "messageType": "releaseCoSimRoad",
@@ -3755,13 +1897,11 @@ class AdapterStateTests(unittest.TestCase):
             }
         )
 
-        with self.assertRaisesRegex(
-            METSRControlError, "UNEXPECTED_RELEASE_FAILURE"
-        ):
+        with self.assertRaisesRegex(METSRControlError, "UNEXPECTED_RELEASE_FAILURE"):
             simulation.release_roads(["A"])
 
-        self.assertEqual(simulation.carla_control_roads, {"A": True})
-        self.assertEqual(simulation.carla_control_segments, {"A"})
+        self.assertEqual(simulation.metsr_state.controlled_roads, {"A": True})
+        self.assertEqual(simulation.metsr_state.controlled_segments, {"A"})
 
     def test_exact_car_4_connector_record_promotes_by_target_road(self):
         class Vehicle:
@@ -3771,16 +1911,16 @@ class AdapterStateTests(unittest.TestCase):
         car_4.name = "car_4"
         car_4.spawn_guard = 0
         car_4.carla_actor_flag = False
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.objects = [SimpleNamespace(name="ego"), car_4]
         simulation.bubble_roads = []
         simulation.sim_ticks_per_carla = 1
         simulation.count = 37
         simulation.completed_route = {}
         simulation.pending_road_entries = {}
-        simulation.pv_id_map = {}
-        simulation.admitted_queue_vehicles = {}
-        simulation.carla_control_roads = {"-37": True}
+        simulation.metsr_state.private_vehicle_ids = {}
+        simulation.metsr_state.admitted_vehicles = {}
+        simulation.metsr_state.controlled_roads = {"-37": True}
         simulation.road_pop_density = {"-37": 0}
         simulation.carla_actors = []
         simulation.metsr_actors = [car_4]
@@ -3798,14 +1938,25 @@ class AdapterStateTests(unittest.TestCase):
             "y": -136.67,
         }
         simulation._collect_metsr_vehicle_data = lambda objects: {car_4: record}
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         promoted = []
-        simulation.createObjectInCarla = lambda obj, update_velocity=True: (
-            promoted.append((obj, update_velocity)) or True
+        simulation.createObjectInCarla = (
+            lambda obj, update_velocity=True, native_state=None: (
+                promoted.append((obj, update_velocity, native_state)) or True
+            )
         )
 
-        simulation.update_bubble_objects([], [])
+        simulation.update_bubble_objects()
 
-        self.assertEqual(promoted, [(car_4, True)])
+        self.assertEqual(promoted, [(car_4, True, record)])
         self.assertEqual(simulation.carla_actors, [car_4])
         self.assertEqual(simulation.metsr_actors, [])
 
@@ -3817,18 +1968,18 @@ class AdapterStateTests(unittest.TestCase):
         vehicle.name = "outbound"
         vehicle.spawn_guard = 0
         vehicle.carla_actor_flag = False
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.objects = [SimpleNamespace(name="ego"), vehicle]
         simulation.bubble_roads = []
         simulation.sim_ticks_per_carla = 1
         simulation.count = 4
         simulation.completed_route = {}
         simulation.pending_road_entries = {}
-        simulation.pv_id_map = {}
-        simulation.admitted_queue_vehicles = {}
-        simulation.carla_control_roads = {"A": True}
-        simulation.carla_control_segments = {"A", ":A_B_0"}
-        simulation.metsr_connector_records = {
+        simulation.metsr_state.private_vehicle_ids = {}
+        simulation.metsr_state.admitted_vehicles = {}
+        simulation.metsr_state.controlled_roads = {"A": True}
+        simulation.metsr_state.controlled_segments = {"A", ":A_B_0"}
+        simulation.metsr_state.connector_records = {
             "cont/A/B": {
                 "connectorId": "cont/A/B",
                 "sourceRoadId": "A",
@@ -3836,8 +1987,8 @@ class AdapterStateTests(unittest.TestCase):
                 "internalEdgeIds": [":A_B_0"],
             }
         }
-        simulation.metsr_road_connectors = {"A": {"cont/A/B"}}
-        simulation.metsr_internal_edge_to_connector = {":A_B_0": "cont/A/B"}
+        simulation.metsr_state.road_connectors = {"A": {"cont/A/B"}}
+        simulation.metsr_state.internal_edge_to_connector = {":A_B_0": "cont/A/B"}
         simulation.road_pop_density = {"B": 0}
         simulation.carla_actors = []
         simulation.metsr_actors = [vehicle]
@@ -3855,14 +2006,25 @@ class AdapterStateTests(unittest.TestCase):
             "y": 6.0,
         }
         simulation._collect_metsr_vehicle_data = lambda objects: {vehicle: record}
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         promoted = []
-        simulation.createObjectInCarla = lambda obj, update_velocity=True: (
-            promoted.append(obj) or True
+        simulation.createObjectInCarla = (
+            lambda obj, update_velocity=True, native_state=None: (
+                promoted.append((obj, native_state)) or True
+            )
         )
 
-        simulation.update_bubble_objects([], [])
+        simulation.update_bubble_objects()
 
-        self.assertEqual(promoted, [vehicle])
+        self.assertEqual(promoted, [(vehicle, record)])
         self.assertEqual(simulation.carla_actors, [vehicle])
         self.assertEqual(simulation.metsr_actors, [])
 
@@ -3875,17 +2037,18 @@ class AdapterStateTests(unittest.TestCase):
         obj.position = (0.0, 0.0)
         obj.spawn_guard = 0
         obj.carla_actor_flag = True
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
+        simulation.carla_actors = [obj]
         simulation.objects = [SimpleNamespace(name="ego"), obj]
         simulation.bubble_roads = []
         simulation.sim_ticks_per_carla = 1
         simulation.count = 8
         simulation.completed_route = {}
         simulation.pending_road_entries = {}
-        simulation.carla_control_roads = {"A": True}
+        simulation.metsr_state.controlled_roads = {"A": True}
         simulation.road_pop_density = {"N": 0}
-        simulation.pv_id_map = {}
-        simulation.admitted_queue_vehicles = {}
+        simulation.metsr_state.private_vehicle_ids = {}
+        simulation.metsr_state.admitted_vehicles = {}
         simulation._collect_metsr_vehicle_data = lambda objects: {
             obj: {
                 "segmentId": "N",
@@ -3894,35 +2057,66 @@ class AdapterStateTests(unittest.TestCase):
                 "y": 2.0,
             }
         }
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         demoted = []
         simulation.remove_bubble_object = lambda target: demoted.append(target)
 
-        simulation.update_bubble_objects([], [], allow_demotion=False)
+        simulation.update_bubble_objects()
         self.assertEqual(demoted, [])
 
-        simulation.update_bubble_objects(
-            [],
-            [],
-            allow_promotion=False,
-            advance_spawn_guards=False,
-            count_density=False,
-        )
+        simulation._remove_completed_carla_objects()
         self.assertEqual(demoted, [])
 
     def test_step_synchronizes_before_releasing_old_roads(self):
-        simulation = object.__new__(CosimSimulation)
-        simulation.valid_metsr_roads = []
+        simulation = make_simulation()
+        simulation.metsr_state.valid_roads = []
         simulation.ego = SimpleNamespace(x=0.0, y=0.0, bubble=None)
         simulation.bubble_size = 25.0
         simulation._get_bubble_roads = lambda region: []
-        simulation.classify_bubble_roads = lambda roads: (["new"], ["old"])
+        helper_patch = patch.object(
+            bubble_routing,
+            "get_bubble_roads",
+            lambda _simulation, *args, **kwargs: simulation._get_bubble_roads(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        simulation._select_bubble_roads = lambda roads: routing.BubbleRoadSelection(
+            tuple(roads), frozenset(["new"]), ("new",), ("old",)
+        )
         events = []
         simulation.freeze_roads = lambda roads: events.append(("freeze", list(roads)))
-        simulation.release_roads = lambda roads: events.append(("release", list(roads)))
-        simulation._synchronize_boundary_vehicles = lambda: events.append(("boundary", None))
-        simulation._service_metsr_entering_queues = lambda: events.append(("queues", None))
+        simulation.release_roads = lambda roads, **kwargs: events.append(
+            ("release", list(roads))
+        )
+        simulation._synchronize_boundary_vehicles = lambda: events.append(
+            ("boundary", None)
+        )
+        simulation._service_metsr_entering_queues = lambda: events.append(
+            ("queues", None)
+        )
         simulation.get_bubble_intersections = lambda **kwargs: []
-        simulation.update_bubble_objects = lambda *args, **kwargs: events.append(("bubble", None))
+        helper_patch = patch.object(
+            bubble_routing,
+            "get_bubble_intersections",
+            lambda _simulation, *args, **kwargs: simulation.get_bubble_intersections(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        simulation.update_bubble_objects = lambda *args, **kwargs: events.append(
+            ("bubble", None)
+        )
         simulation.tick_carla = lambda: events.append(("carla", None))
         simulation.synchronize_clients = lambda **kwargs: events.append(("sync", None))
         simulation._report_road_entry_holds = lambda: None
@@ -3931,13 +2125,22 @@ class AdapterStateTests(unittest.TestCase):
         simulation._collect_metsr_vehicle_data = (
             lambda objects: vehicle_queries.append(tuple(objects)) or {}
         )
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.metsr_actors = []
         simulation.carla_actors = []
         simulation.render = False
         simulation.bubble_sizes = []
         simulation.objects = [simulation.ego]
         simulation.frozen_vehicles = set()
-        simulation.bubble_spawn_queue = []
+        simulation.bubble_spawn_queue = set()
         simulation.total_active_vehicles = []
         simulation.completed_route = {}
         simulation.count = 1
@@ -3948,45 +2151,59 @@ class AdapterStateTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("freeze", ["new"]), ("boundary", None), ("queues", None),
-                ("bubble", None), ("carla", None), ("sync", None),
-                ("bubble", None), ("release", ["old"]),
+                ("freeze", ["new"]),
+                ("boundary", None),
+                ("queues", None),
+                ("bubble", None),
+                ("carla", None),
+                ("sync", None),
+                ("release", ["old"]),
             ],
         )
         self.assertEqual(len(vehicle_queries), 2)
 
-    def test_old_road_is_retained_until_carla_actor_advances(self):
+    def test_old_road_release_waits_for_last_acknowledged_occupant(self):
         class Vehicle:
             pass
 
         obj = Vehicle()
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.carla_actors = [obj]
-        simulation.carla_control_roads = {"old": True, "new": True}
-        simulation.carla_control_segments = {"old", "new"}
-        simulation.metsr_internal_edge_to_connector = {}
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
+        simulation.metsr_state.controlled_roads = {"old": True, "new": True}
+        simulation.metsr_state.controlled_segments = {"old", "new"}
+        simulation.metsr_state.internal_edge_to_connector = {}
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.road_connectors = {}
         simulation.pending_road_entries = {}
-        simulation._carla_authoritative_segments = {obj: "old"}
+        simulation.metsr_state.authoritative_segments = {obj: "old"}
 
-        self.assertEqual(simulation._releasable_old_roads(["old"]), [])
+        self.assertEqual(
+            native.releasable_old_roads(
+                simulation.metsr_state, ["old"], simulation.carla_actors
+            ),
+            [],
+        )
 
-        simulation._carla_authoritative_segments[obj] = "new"
-        self.assertEqual(simulation._releasable_old_roads(["old"]), ["old"])
+        simulation.metsr_state.authoritative_segments[obj] = "new"
+        self.assertEqual(
+            native.releasable_old_roads(
+                simulation.metsr_state, ["old"], simulation.carla_actors
+            ),
+            ["old"],
+        )
 
-    def test_connector_occupancy_retains_both_controlled_endpoints(self):
+    def test_occupied_connector_keeps_its_endpoint_roads_controlled(self):
         class Vehicle:
             pass
 
         obj = Vehicle()
         connector_id = "opaque/A/B"
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.carla_actors = [obj]
-        simulation.carla_control_roads = {"A": True, "B": True, "old": True}
-        simulation.carla_control_segments = {"A", "B", "old", ":A_B_0"}
-        simulation.metsr_internal_edge_to_connector = {":A_B_0": connector_id}
-        simulation.metsr_connector_records = {
+        simulation.metsr_state.controlled_roads = {"A": True, "B": True, "old": True}
+        simulation.metsr_state.controlled_segments = {"A", "B", "old", ":A_B_0"}
+        simulation.metsr_state.internal_edge_to_connector = {":A_B_0": connector_id}
+        simulation.metsr_state.connector_records = {
             connector_id: {
                 "connectorId": connector_id,
                 "sourceRoadId": "A",
@@ -3994,42 +2211,58 @@ class AdapterStateTests(unittest.TestCase):
                 "internalEdgeIds": [":A_B_0"],
             }
         }
-        simulation.metsr_road_connectors = {
+        simulation.metsr_state.road_connectors = {
             "A": {connector_id},
             "B": {connector_id},
         }
         simulation.pending_road_entries = {}
-        simulation._carla_authoritative_segments = {obj: connector_id}
+        simulation.metsr_state.authoritative_segments = {obj: connector_id}
 
         self.assertEqual(
-            simulation._releasable_old_roads(["A", "B", "old"]),
+            native.releasable_old_roads(
+                simulation.metsr_state, ["A", "B", "old"], simulation.carla_actors
+            ),
             ["old"],
         )
 
-    def test_unresolved_carla_actor_blocks_old_road_release(self):
+    def test_unacknowledged_carla_actor_defers_road_release(self):
         obj = object()
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.carla_actors = [obj]
-        simulation.carla_control_roads = {"A": True, "B": True}
-        simulation.carla_control_segments = {"A", "B"}
-        simulation.metsr_internal_edge_to_connector = {}
-        simulation.metsr_connector_records = {}
-        simulation.metsr_road_connectors = {}
+        simulation.metsr_state.controlled_roads = {"A": True, "B": True}
+        simulation.metsr_state.controlled_segments = {"A", "B"}
+        simulation.metsr_state.internal_edge_to_connector = {}
+        simulation.metsr_state.connector_records = {}
+        simulation.metsr_state.road_connectors = {}
         simulation.pending_road_entries = {}
-        simulation._carla_authoritative_segments = {}
+        simulation.metsr_state.authoritative_segments = {}
 
-        self.assertEqual(simulation._releasable_old_roads(["A", "B"]), [])
+        self.assertEqual(
+            native.releasable_old_roads(
+                simulation.metsr_state, ["A", "B"], simulation.carla_actors
+            ),
+            [],
+        )
 
     def test_spawn_ego_calls_takeover_once(self):
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.bubble_size = 25.0
         simulation._get_bubble_roads = lambda: []
-        simulation.classify_bubble_roads = lambda roads: (["A", "B"], [])
+        helper_patch = patch.object(
+            bubble_routing,
+            "get_bubble_roads",
+            lambda _simulation, *args, **kwargs: simulation._get_bubble_roads(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        simulation._select_bubble_roads = lambda roads: routing.BubbleRoadSelection(
+            tuple(roads), frozenset(["A", "B"]), ("A", "B"), ()
+        )
         events = []
 
-        simulation.freeze_roads = lambda roads: events.append(
-            ("freeze", set(roads))
-        )
+        simulation.freeze_roads = lambda roads: events.append(("freeze", set(roads)))
         simulation.metsr_client = SimpleNamespace(
             tick=lambda: events.append(("tick", None))
         )
@@ -4037,7 +2270,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation.createObjectInCarla = (
             lambda obj: events.append(("carla", None)) or True
         )
-        obj = SimpleNamespace(position=SimpleNamespace(x=1.0, y=2.0))
+        obj = Vehicle(position=SimpleNamespace(x=1.0, y=2.0))
 
         simulation.spawn_ego(obj)
 
@@ -4053,10 +2286,21 @@ class AdapterStateTests(unittest.TestCase):
         )
 
     def test_spawn_ego_immediate_freeze_keeps_one_initial_tick(self):
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.bubble_size = 25.0
         simulation._get_bubble_roads = lambda: []
-        simulation.classify_bubble_roads = lambda roads: (["A"], [])
+        helper_patch = patch.object(
+            bubble_routing,
+            "get_bubble_roads",
+            lambda _simulation, *args, **kwargs: simulation._get_bubble_roads(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        simulation._select_bubble_roads = lambda roads: routing.BubbleRoadSelection(
+            tuple(roads), frozenset(["A"]), ("A",), ()
+        )
         events = []
         simulation.freeze_roads = (
             lambda roads: events.append(("freeze", set(roads))) or set()
@@ -4068,7 +2312,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation.createObjectInCarla = (
             lambda obj: events.append(("carla", None)) or True
         )
-        obj = SimpleNamespace(position=SimpleNamespace(x=1.0, y=2.0))
+        obj = Vehicle(position=SimpleNamespace(x=1.0, y=2.0))
 
         simulation.spawn_ego(obj)
 
@@ -4084,13 +2328,25 @@ class AdapterStateTests(unittest.TestCase):
         )
 
     def test_spawn_ego_propagates_takeover_failure_without_retry(self):
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.bubble_size = 25.0
         simulation._get_bubble_roads = lambda: []
-        simulation.classify_bubble_roads = lambda roads: (["A"], [])
+        helper_patch = patch.object(
+            bubble_routing,
+            "get_bubble_roads",
+            lambda _simulation, *args, **kwargs: simulation._get_bubble_roads(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        simulation._select_bubble_roads = lambda roads: routing.BubbleRoadSelection(
+            tuple(roads), frozenset(["A"]), ("A",), ()
+        )
         freeze_calls = []
         ticks = []
         created = []
+
         def reject(roads):
             freeze_calls.append(set(roads))
             raise METSRControlError("takeover failed")
@@ -4099,7 +2355,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation.metsr_client = SimpleNamespace(tick=lambda: ticks.append(True))
         simulation.createObjectInMetsr = lambda obj: created.append("metsr")
         simulation.createObjectInCarla = lambda obj: created.append("carla") or True
-        obj = SimpleNamespace(position=SimpleNamespace(x=1.0, y=2.0))
+        obj = Vehicle(position=SimpleNamespace(x=1.0, y=2.0))
 
         with self.assertRaisesRegex(METSRControlError, "takeover failed"):
             simulation.spawn_ego(obj)
@@ -4112,11 +2368,13 @@ class AdapterStateTests(unittest.TestCase):
         events = []
 
         class Actor:
+            is_alive = True
+
             def set_autopilot(self, enabled, port):
                 events.append(("autopilot", enabled, port))
 
         actor = Actor()
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.tm = SimpleNamespace(
             get_port=lambda: 8123,
             auto_lane_change=lambda target, enabled: events.append(
@@ -4139,210 +2397,6 @@ class AdapterStateTests(unittest.TestCase):
         self.assertTrue(obj.active_autopilot)
         self.assertTrue(obj.autopilot_action)
 
-    def test_road_entry_hold_preserves_tm_registration_and_custom_path(self):
-        events = []
-        refreshed_path = [object(), object()]
-
-        class Actor:
-            def set_target_velocity(self, velocity):
-                events.append(("target_velocity", velocity))
-
-            def enable_constant_velocity(self, velocity):
-                events.append(("constant_velocity", True, velocity))
-
-            def disable_constant_velocity(self):
-                events.append(("constant_velocity", False))
-
-            def apply_control(self, control):
-                events.append(("control", control))
-
-            def set_autopilot(self, enabled, port):
-                events.append(("autopilot", enabled, port))
-
-        class Vehicle:
-            pass
-
-        actor = Actor()
-        obj = Vehicle()
-        obj.carlaActor = actor
-        obj.active_autopilot = True
-        simulation = object.__new__(CosimSimulation)
-        simulation.road_entry_holds = {}
-        simulation.tm = SimpleNamespace(
-            get_port=lambda: 8123,
-            auto_lane_change=lambda target, enabled: events.append(
-                ("lane_change", target, enabled)
-            ),
-            set_path=lambda target, path: events.append(
-                ("path", target, path)
-            ),
-        )
-        simulation.metsr_trajectory_to_carla = lambda target: (
-            events.append(("route", target)) or refreshed_path
-        )
-
-        simulation._hold_for_road_entry(obj)
-        simulation._release_road_entry_hold(obj)
-
-        self.assertFalse(any(event[0] == "autopilot" for event in events))
-        self.assertEqual(
-            [event[0] for event in events],
-            [
-                "target_velocity",
-                "control",
-                "constant_velocity",
-                "route",
-                "path",
-                "lane_change",
-                "constant_velocity",
-                "control",
-            ],
-        )
-        self.assertEqual(events[4], ("path", actor, refreshed_path))
-        self.assertIs(obj.trajectory, refreshed_path)
-        self.assertNotIn(obj, simulation.road_entry_holds)
-
-    def test_road_entry_hold_release_uses_validated_live_route_tail(self):
-        events = []
-        refreshed_path = [object()]
-
-        class Actor:
-            def disable_constant_velocity(self):
-                events.append("constant_velocity_off")
-
-            def apply_control(self, control):
-                events.append("brake_clear")
-
-        class HashableNamespace(SimpleNamespace):
-            __hash__ = object.__hash__
-
-        obj = HashableNamespace(
-            carlaActor=Actor(),
-            active_autopilot=True,
-            # This immutable route is intentionally stale.
-            route=["OLD", "A", "B", "C"],
-        )
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 8
-        simulation.road_entry_holds = {obj: True}
-        simulation.road_entry_hold_diagnostics = {}
-        simulation.metsr_trajectory_to_carla = lambda target: (_ for _ in ()).throw(
-            AssertionError("release must not query/fall back to the stale route")
-        )
-
-        def generate(route, target):
-            events.append(("generate", list(route), target))
-            return refreshed_path
-
-        simulation.generate_carla_trajectory = generate
-        simulation.tm = SimpleNamespace(
-            set_path=lambda actor, path: events.append(("path", actor, path)),
-            auto_lane_change=lambda actor, enabled: events.append(
-                ("lane_change", actor, enabled)
-            ),
-        )
-
-        simulation._release_road_entry_hold(
-            obj, remaining_route=("B", "C")
-        )
-
-        self.assertEqual(events[0], ("generate", ["B", "C"], obj))
-        self.assertEqual(events[1], ("path", obj.carlaActor, refreshed_path))
-        self.assertEqual(events[2], ("lane_change", obj.carlaActor, False))
-        self.assertEqual(events[3:], ["constant_velocity_off", "brake_clear"])
-        self.assertIs(obj.trajectory, refreshed_path)
-        self.assertNotIn(obj, simulation.road_entry_holds)
-
-    def test_road_entry_hold_diagnostics_report_start_wait_and_release(self):
-        class Actor:
-            def set_target_velocity(self, velocity):
-                pass
-
-            def enable_constant_velocity(self, velocity):
-                pass
-
-            def disable_constant_velocity(self):
-                pass
-
-            def apply_control(self, control):
-                pass
-
-        class Vehicle:
-            name = "car_77"
-
-        obj = Vehicle()
-        obj.carlaActor = Actor()
-        obj.active_autopilot = False
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 12
-        simulation.road_entry_holds = {}
-        simulation.road_entry_hold_diagnostics = {}
-
-        output = StringIO()
-        with redirect_stdout(output):
-            simulation._hold_for_road_entry(
-                obj, source="-50", target="-51", reason="ENTRY_BLOCKED"
-            )
-            simulation.count = 112
-            simulation._hold_for_road_entry(
-                obj, source="-50", target="-51",
-                reason="TARGET_LANE_RESERVED"
-            )
-            simulation._report_road_entry_holds()
-            simulation._report_road_entry_holds()
-            simulation.count = 212
-            simulation._hold_for_road_entry(
-                obj, source=None, target=None, reason=None
-            )
-            simulation._report_road_entry_holds()
-            simulation.count = 237
-            simulation._release_road_entry_hold(obj)
-
-        lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 4)
-        self.assertIn(
-            "hold started: car_77 at step 12; edge -50->-51; "
-            "reason=ENTRY_BLOCKED; retries=0",
-            lines[0],
-        )
-        self.assertIn(
-            "hold waiting: car_77 at step 112; held_ticks=100; retries=1",
-            lines[1],
-        )
-        self.assertIn(
-            "hold waiting: car_77 at step 212; held_ticks=200; retries=2",
-            lines[2],
-        )
-        self.assertIn("reason=TARGET_LANE_RESERVED", lines[2])
-        self.assertIn(
-            "hold released: car_77 at step 237; held_ticks=225; retries=2",
-            lines[3],
-        )
-        self.assertNotIn(obj, simulation.road_entry_holds)
-        self.assertNotIn(obj, simulation.road_entry_hold_diagnostics)
-
-    def test_removing_object_clears_road_entry_hold_diagnostics(self):
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.autopilot_action = False
-        obj.active_autopilot = False
-        obj.carla_actor_flag = True
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_actors = [obj]
-        simulation.metsr_actors = []
-        simulation.pending_road_entries = {obj: {"target": "B"}}
-        simulation.road_entry_holds = {obj: True}
-        simulation.road_entry_hold_diagnostics = {obj: {"start_step": 3}}
-        simulation.pending_route_refreshes = {obj: "B"}
-        simulation._carla_authoritative_segments = {obj: "A"}
-
-        simulation.remove_bubble_object(obj, destroy=False)
-
-        self.assertNotIn(obj, simulation.road_entry_hold_diagnostics)
-        self.assertNotIn(obj, simulation._carla_authoritative_segments)
-
     def test_failed_carla_spawn_clears_authoritative_segment(self):
         class Vehicle:
             pass
@@ -4360,8 +2414,8 @@ class AdapterStateTests(unittest.TestCase):
         obj.orientation = object()
         obj.snapToGround = False
         obj.color = None
-        simulation = object.__new__(CosimSimulation)
-        simulation._carla_authoritative_segments = {obj: "A"}
+        simulation = make_simulation()
+        simulation.metsr_state.authoritative_segments = {obj: "A"}
         simulation.bubble_spawn_queue = {obj}
         simulation.blueprintLib = SimpleNamespace(find=lambda name: Blueprint())
         simulation.carla_world = SimpleNamespace(
@@ -4369,93 +2423,74 @@ class AdapterStateTests(unittest.TestCase):
         )
 
         with patch(
-            "scenic.simulators.cosim.simulator.utils.scenicToCarlaLocation",
+            "scenic.simulators.cosim.cosim_utils.utils.scenicToCarlaLocation",
             return_value=carla.Location(x=1.0, y=2.0, z=0.0),
         ), patch(
-            "scenic.simulators.cosim.simulator.utils.scenicToCarlaRotation",
+            "scenic.simulators.cosim.cosim_utils.utils.scenicToCarlaRotation",
             return_value=carla.Rotation(),
         ):
             self.assertFalse(simulation.createObjectInCarla(obj))
 
-        self.assertNotIn(obj, simulation._carla_authoritative_segments)
-
-    def test_road_entry_hold_route_failure_keeps_actor_stopped(self):
-        events = []
-
-        class Actor:
-            def disable_constant_velocity(self):
-                events.append("released")
-
-            def apply_control(self, control):
-                events.append("control")
-
-        class Vehicle:
-            pass
-
-        actor = Actor()
-        obj = Vehicle()
-        obj.carlaActor = actor
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 17
-        simulation.road_entry_holds = {obj: True}
-        simulation.road_entry_hold_diagnostics = {
-            obj: {
-                "start_step": 10,
-                "retries": 2,
-                "source": "A",
-                "target": "B",
-                "latest_reason": "ENTRY_BLOCKED",
-                "next_report_step": 110,
-            }
-        }
-        simulation.tm = SimpleNamespace(
-            set_path=lambda target, path: events.append("path"),
-            auto_lane_change=lambda target, enabled: events.append(
-                "lane_change"
-            ),
-        )
-
-        def fail_route(target):
-            raise SimulationCreationError("route refresh failed")
-
-        simulation.metsr_trajectory_to_carla = fail_route
-
-        with self.assertRaisesRegex(SimulationCreationError, "route refresh failed"):
-            simulation._release_road_entry_hold(obj)
-
-        self.assertEqual(events, [])
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertIn(obj, simulation.road_entry_hold_diagnostics)
+        self.assertNotIn(obj, simulation.metsr_state.authoritative_segments)
 
     def test_default_trajectory_queries_private_vehicle_destination(self):
         class Vehicle:
             route = ["STALE"]
+            carlaActor = object()
 
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         obj = Vehicle()
         calls = []
         simulation.getMetsrPrivateVehId = lambda target: 87
 
-        def query_vehicle(vehicle_id, **kwargs):
-            calls.append((vehicle_id, kwargs))
-            return metsr_response("vehicle", [{
-                "vehicleId": 87, "segmentId": "A", "destinationRoadId": "N",
-            }])
+        def query_vehicle(vehicle_id, private_veh, transform_coords):
+            calls.append(
+                (
+                    vehicle_id,
+                    {"private_veh": private_veh, "transform_coords": transform_coords},
+                )
+            )
+            return metsr_response(
+                "vehicle",
+                [
+                    {
+                        "vehicleId": 87,
+                        "segmentId": "A",
+                        "destinationRoadId": "N",
+                    }
+                ],
+            )
 
         simulation.metsr_client = SimpleNamespace(query_vehicle=query_vehicle)
         path = [object()]
         simulation.generate_carla_destination_trajectory = (
-            lambda destination, target: calls.append((destination, target)) or path
+            lambda destination, target, *, target_start=None: calls.append(
+                (destination, target)
+            )
+            or path
         )
-        self.assertIs(simulation.metsr_trajectory_to_carla(obj), path)
-        self.assertEqual(calls, [
-            (87, {"private_veh": True, "transform_coords": True}), ("N", obj),
-        ])
+        helper_patch = patch.object(
+            routing,
+            "generate_carla_destination_trajectory",
+            lambda _simulation, *args, **kwargs: simulation.generate_carla_destination_trajectory(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        self.assertIs(simulation._install_carla_destination_path(obj), path)
+        self.assertEqual(
+            calls,
+            [
+                ([87], {"private_veh": True, "transform_coords": True}),
+                ("N", obj),
+            ],
+        )
         self.assertEqual(simulation._carla_destination_plans[obj], ("N", path))
 
     def test_default_trajectory_requires_queried_destination(self):
-        simulation = object.__new__(CosimSimulation)
-        obj = SimpleNamespace(route=["STALE", "Z"])
+        simulation = make_simulation()
+        obj = Vehicle(route=["STALE", "Z"])
         simulation.getMetsrPrivateVehId = lambda target: 87
         simulation.metsr_client = SimpleNamespace(
             query_vehicle=lambda *args, **kwargs: metsr_response(
@@ -4463,100 +2498,51 @@ class AdapterStateTests(unittest.TestCase):
             ),
         )
         with self.assertRaisesRegex(SimulationCreationError, "omitted destinationRoadId"):
-            simulation.metsr_trajectory_to_carla(obj)
+            simulation._install_carla_destination_path(obj)
 
     def test_default_trajectory_ignores_remaining_route_and_pending_fields(self):
         class Vehicle:
             route = ["STALE", "WRONG"]
+            carlaActor = object()
 
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         obj = Vehicle()
         simulation.getMetsrPrivateVehId = lambda target: 87
         simulation.metsr_client = SimpleNamespace(
-            query_vehicle=lambda *args, **kwargs: metsr_response("vehicle", [{
-                "vehicleId": 87, "destinationRoadId": "N",
-                "routeRoadIds": ["T"], "transitionPending": True,
-                "transitionTargetRoadId": "WRONG", "transitionTargetLaneIndex": 0,
-            }]),
+            query_vehicle=lambda *args, **kwargs: metsr_response(
+                "vehicle",
+                [
+                    {
+                        "vehicleId": 87,
+                        "destinationRoadId": "N",
+                        "routeRoadIds": ["T"],
+                        "transitionPending": True,
+                        "transitionTargetRoadId": "WRONG",
+                        "transitionTargetLaneIndex": 0,
+                    }
+                ],
+            ),
         )
         calls = []
         expected = [object()]
         simulation.generate_carla_destination_trajectory = (
-            lambda destination, target: calls.append((destination, target)) or expected
+            lambda destination, target, *, target_start=None: calls.append(
+                (destination, target)
+            )
+            or expected
         )
-        self.assertIs(simulation.metsr_trajectory_to_carla(obj), expected)
+        helper_patch = patch.object(
+            routing,
+            "generate_carla_destination_trajectory",
+            lambda _simulation, *args, **kwargs: simulation.generate_carla_destination_trajectory(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
+        self.assertIs(simulation._install_carla_destination_path(obj), expected)
         self.assertEqual(calls, [("N", obj)])
 
-    def _predecessor_anchor_fixture(self, terminal_lane="T_0"):
-        simulation = object.__new__(CosimSimulation)
-        source = self._route_waypoint(1, -1, 9.0, 0.0)
-        target = self._route_waypoint(2, -1, 0.1, 1.0)
-        alternate = self._route_waypoint(2, -2, 0.1, 1.0)
-        terminal = target if terminal_lane == "T_0" else alternate
-        simulation.map = SimpleNamespace(get_waypoint=lambda *args, **kwargs: source)
-        simulation.grp = SimpleNamespace(
-            _sampling_resolution=2.0,
-            trace_route=lambda start, end: [(terminal, None)],
-        )
-        simulation.scenic_to_metsr_map = {
-            "1_-1": ["P_0"],
-            "2_-1": ["T_0"],
-            "2_-2": ["T_1"],
-        }
-        simulation.metsr_lane_indices = {"P_0": 0, "T_0": 0, "T_1": 1}
-        simulation.metsr_lane_connections = {
-            ("P", "T"): [("P_0", "T_0")]
-        }
-        simulation._index_carla_waypoints = lambda: None
-        simulation._lane_anchor_waypoint = lambda lane: target
-        simulation._validate_carla_route_trace = lambda *args, **kwargs: None
-        simulation.metsr_road_cache = {
-            ("T", 0): [(1.0, 0.0, 0.0), (1.85, 0.0, 0.0)]
-        }
-        return simulation, source, target
-
-    def test_internal_connector_uses_exact_target_lane_anchor(self):
-        simulation, source, target = self._predecessor_anchor_fixture()
-        internal = self._route_waypoint(680, -4, 0.0, 0.0)
-        internal.is_junction = True
-        simulation.map = SimpleNamespace(
-            get_waypoint=lambda *args, **kwargs: internal
-        )
-        simulation.scenic_to_metsr_map = {
-            "680_-4": [":J_5_1"],
-            "2_-1": ["T_0"],
-            "2_-2": ["T_1"],
-        }
-        simulation.metsr_internal_lane_connections = {
-            ":J_5_1": [("P_0", "T_0")]
-        }
-
-        anchor, trace = simulation._forward_lane_anchor_trace(
-            "T_0", internal.transform.location, "T", 1
-        )
-
-        self.assertIs(anchor, target)
-        self.assertIs(trace[-1][0], target)
-
-    def test_short_target_uses_exact_predecessor_lane_anchor(self):
-        simulation, source, target = self._predecessor_anchor_fixture()
-
-        anchor, trace = simulation._forward_lane_anchor_trace(
-            "T_0", source.transform.location, "T", 1
-        )
-
-        self.assertIs(anchor, target)
-        self.assertIs(trace[-1][0], target)
-
-    def test_predecessor_anchor_rejects_alternate_terminal_lane(self):
-        simulation, source, _ = self._predecessor_anchor_fixture("T_1")
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "did not reach exact SUMO target lane T_0"
-        ):
-            simulation._forward_lane_anchor_trace(
-                "T_0", source.transform.location, "T", 1
-            )
     def test_synchronization_publishes_without_live_private_record(self):
         state = {
             "segmentId": "A",
@@ -4571,7 +2557,7 @@ class AdapterStateTests(unittest.TestCase):
         simulation.synchronize_clients()
 
         self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "A")
+        self.assertNotIn("segment_id", calls["teleport"][0][1])
 
     def test_synchronization_rejects_duplicate_live_private_records(self):
         state = {
@@ -4620,349 +2606,24 @@ class AdapterStateTests(unittest.TestCase):
             "destinationRoadId": "Z",
             "transitionPending": False,
         }
-        simulation, obj, calls = self._sync_guard_fixture(
-            state, "Z", ["Z"]
-        )
+        simulation, obj, calls = self._sync_guard_fixture(state, "Z", ["Z"])
+        retirements = []
+
+        def reach_dest(vehicle_id, *, private_veh):
+            retirements.append((vehicle_id, private_veh))
+            return {
+                "messageType": "reachDest",
+                "status": "ok",
+                "data": [{"status": "ok"}],
+            }
+
+        simulation.metsr_client.reach_dest = reach_dest
 
         simulation.synchronize_clients()
 
         self.assertTrue(simulation.completed_route[obj])
         self.assertEqual(len(calls["teleport"]), 1)
-
-    def test_hold_control_failure_is_not_recorded_as_safe(self):
-        class Actor:
-            def set_target_velocity(self, velocity):
-                pass
-
-            def apply_control(self, control):
-                pass
-
-            def enable_constant_velocity(self, velocity):
-                raise RuntimeError("CARLA refused constant velocity")
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "unsafe-hold"
-        obj.carlaActor = Actor()
-        obj.active_autopilot = True
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 8
-        simulation.road_entry_holds = {}
-        simulation.road_entry_hold_diagnostics = {}
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "Unable to place.*safety hold"
-        ):
-            simulation._hold_for_road_entry(obj, "A", "B", "ENTRY_BLOCKED")
-
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertIn(obj, simulation.road_entry_hold_diagnostics)
-
-    def test_release_control_failure_keeps_hold_and_diagnostic(self):
-        class Actor:
-            def disable_constant_velocity(self):
-                raise RuntimeError("CARLA refused release")
-
-            def apply_control(self, control):
-                self.fail("brake must not be cleared after disable failure")
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "unsafe-release"
-        obj.carlaActor = Actor()
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 12
-        simulation.road_entry_holds = {obj: False}
-        simulation.road_entry_hold_diagnostics = {
-            obj: {
-                "start_step": 10,
-                "retries": 1,
-                "source": "A",
-                "target": "B",
-                "latest_reason": "ENTRY_BLOCKED",
-                "next_report_step": 110,
-            }
-        }
-
-        with self.assertRaisesRegex(
-            SimulationCreationError, "Unable to physically release"
-        ):
-            simulation._release_road_entry_hold(obj)
-
-        self.assertIn(obj, simulation.road_entry_holds)
-        self.assertIn(obj, simulation.road_entry_hold_diagnostics)
-
-    def test_carla_tick_reasserts_hold_before_every_physics_step(self):
-        events = []
-
-        class Actor:
-            def __init__(self):
-                self.control = carla.VehicleControl(
-                    manual_gear_shift=True, gear=1
-                )
-
-            def get_control(self):
-                return self.control
-
-            def set_target_velocity(self, velocity):
-                events.append(("velocity", velocity.x, velocity.y, velocity.z))
-
-            def set_target_angular_velocity(self, velocity):
-                events.append(("angular", velocity.x, velocity.y, velocity.z))
-
-            def apply_control(self, control):
-                self.control = control
-                events.append(
-                    (
-                        "control",
-                        control.throttle,
-                        control.steer,
-                        control.brake,
-                        control.hand_brake,
-                        control.reverse,
-                        control.manual_gear_shift,
-                        control.gear,
-                    )
-                )
-
-            def enable_constant_velocity(self, velocity):
-                events.append(("constant", velocity.x, velocity.y, velocity.z))
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.carlaActor = Actor()
-        simulation = object.__new__(CosimSimulation)
-        simulation.road_entry_holds = {obj: False}
-        simulation.sim_ticks_per_carla = 2
-        simulation.carla_world = SimpleNamespace(
-            tick=lambda: events.append(("tick",))
-        )
-
-        simulation.tick_carla()
-
-        hold = [
-            ("velocity", 0.0, 0.0, 0.0),
-            ("angular", 0.0, 0.0, 0.0),
-            ("control", 0.0, 0.0, 1.0, True, False, True, 1),
-            ("constant", 0.0, 0.0, 0.0),
-        ]
-        self.assertEqual(events, hold + [("tick",)] + hold + [("tick",)])
-
-    def test_hold_and_release_notify_pcla_of_controls_applied_to_carla(self):
-        notified_controls = []
-
-        class Actor:
-            def __init__(self):
-                self.control = carla.VehicleControl(
-                    reverse=False,
-                    manual_gear_shift=True,
-                    gear=1,
-                )
-
-            def get_control(self):
-                return self.control
-
-            def set_target_velocity(self, velocity):
-                pass
-
-            def set_target_angular_velocity(self, velocity):
-                pass
-
-            def apply_control(self, control):
-                self.control = control
-
-            def enable_constant_velocity(self, velocity):
-                pass
-
-            def disable_constant_velocity(self):
-                pass
-
-        class PCLA:
-            def notify_control_applied(self, control):
-                notified_controls.append(control)
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "ego"
-        obj.carlaActor = Actor()
-        obj.active_autopilot = False
-        obj.pcla = PCLA()
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 14
-        simulation.road_entry_holds = {}
-        simulation.road_entry_hold_diagnostics = {}
-
-        with redirect_stdout(StringIO()):
-            simulation._hold_for_road_entry(obj, "-29", "27", "PREPARATION")
-            simulation._release_road_entry_hold(obj)
-
-        self.assertEqual(len(notified_controls), 2)
-        hold_control, release_control = notified_controls
-        self.assertEqual(
-            (
-                hold_control.throttle,
-                hold_control.steer,
-                hold_control.brake,
-                hold_control.hand_brake,
-                hold_control.manual_gear_shift,
-                hold_control.gear,
-            ),
-            (0.0, 0.0, 1.0, True, True, 1),
-        )
-        self.assertEqual(
-            (
-                release_control.throttle,
-                release_control.brake,
-                release_control.hand_brake,
-                release_control.manual_gear_shift,
-                release_control.gear,
-            ),
-            (0.0, 0.0, False, True, 1),
-        )
-
-    def test_pose_reset_is_deferred_until_verified_hold_release(self):
-        pose_resets = []
-
-        class Actor:
-            def __init__(self):
-                self.control = carla.VehicleControl(
-                    manual_gear_shift=True, gear=1
-                )
-
-            def get_control(self):
-                return self.control
-
-            def apply_control(self, control):
-                self.control = control
-
-            def disable_constant_velocity(self):
-                pass
-
-        class PCLA:
-            def notify_pose_changed(self):
-                pose_resets.append("fresh-frame-reset")
-
-        class Vehicle:
-            pass
-
-        obj = Vehicle()
-        obj.name = "ego"
-        obj.carlaActor = Actor()
-        obj.pcla = PCLA()
-        simulation = object.__new__(CosimSimulation)
-        simulation.count = 30
-        simulation.road_entry_holds = {obj: False}
-        simulation.road_entry_hold_diagnostics = {}
-        simulation._pending_pcla_pose_resets = set()
-
-        simulation._defer_pcla_pose_reset(obj)
-
-        self.assertEqual(pose_resets, [])
-        self.assertIn(obj, simulation._pending_pcla_pose_resets)
-
-        with redirect_stdout(StringIO()):
-            simulation._release_road_entry_hold(obj)
-
-        self.assertEqual(pose_resets, ["fresh-frame-reset"])
-        self.assertNotIn(obj, simulation._pending_pcla_pose_resets)
-
-    def test_pose_change_resets_legacy_pcla_localization_state(self):
-        agent = SimpleNamespace(
-            filter_initialized=True,
-            state_log=["old-filter-state"],
-        )
-        obj = SimpleNamespace(pcla=SimpleNamespace(agent_instance=agent))
-
-        CosimSimulation._notify_pcla_pose_changed(obj)
-
-        self.assertFalse(agent.filter_initialized)
-        self.assertEqual(agent.state_log, [])
-
-    def test_held_pcla_action_is_discarded_until_fresh_action_after_release(self):
-        events = []
-
-        class Actor:
-            def __init__(self, name):
-                self.name = name
-
-            def apply_control(self, control):
-                events.append(("applied", self.name, control))
-
-        class Vehicle:
-            pass
-
-        class ControlAction:
-            def __init__(self, name):
-                self.name = name
-
-            def applyTo(self, obj, simulation):
-                events.append(("action", self.name))
-                obj._control = self.name
-
-        held = Vehicle()
-        held.carlaActor = Actor("held")
-        held.carla_actor_flag = True
-        held.autopilot_action = False
-        held.active_autopilot = False
-        held._control = "stale-control"
-
-        free = Vehicle()
-        free.carlaActor = Actor("free")
-        free.carla_actor_flag = True
-        free.autopilot_action = False
-        free.active_autopilot = False
-        free._control = None
-        free.pcla = SimpleNamespace(
-            notify_control_applied=lambda control: events.append(
-                ("notified", "free", control)
-            )
-        )
-
-        simulation = object.__new__(CosimSimulation)
-        simulation.agents = [held, free]
-        simulation.road_entry_holds = {held: False}
-
-        simulation.executeActions(
-            {
-                held: (ControlAction("held-during-hold"),),
-                free: (ControlAction("free-control"),),
-            }
-        )
-
-        self.assertEqual(
-            events,
-            [
-                ("action", "free-control"),
-                ("applied", "free", "free-control"),
-                ("notified", "free", "free-control"),
-            ],
-        )
-        self.assertIsNone(held._control)
-
-        simulation.road_entry_holds.clear()
-        simulation.executeActions(
-            {
-                held: (ControlAction("held-after-release"),),
-                free: (),
-            }
-        )
-
-        self.assertEqual(
-            events[-2:],
-            [
-                ("action", "held-after-release"),
-                ("applied", "held", "held-after-release"),
-            ],
-        )
-        self.assertNotIn("held-during-hold", [event[-1] for event in events])
+        self.assertEqual(retirements, [(7, True)])
 
     def test_ordinary_carla_updates_use_one_batched_teleport(self):
         class Vehicle:
@@ -4971,8 +2632,8 @@ class AdapterStateTests(unittest.TestCase):
         first = Vehicle()
         second = Vehicle()
         calls = []
-        simulation = object.__new__(CosimSimulation)
-        simulation.carla_control_roads = {"A": True, "B": True}
+        simulation = make_simulation()
+        simulation.metsr_state.controlled_roads = {"A": True, "B": True}
         simulation.completed_route = {}
         simulation.count = 4
 
@@ -4986,9 +2647,7 @@ class AdapterStateTests(unittest.TestCase):
                 ],
             )
 
-        simulation.metsr_client = SimpleNamespace(
-            teleport_cosim_vehicle=teleport
-        )
+        simulation.metsr_client = SimpleNamespace(teleport_cosim_vehicle=teleport)
         updates = [
             {
                 "object": first,
@@ -5029,19 +2688,19 @@ class AdapterStateTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
         self.assertEqual(args, ([11, 12], [1.0, 4.0], [2.0, 5.0]))
-        self.assertEqual(kwargs["segment_id"], ["A", "B"])
-        self.assertEqual(kwargs["lane_index"], [1, 2])
+        self.assertNotIn("segment_id", kwargs)
+        self.assertNotIn("lane_index", kwargs)
         self.assertEqual(kwargs["speed"], [3.0, 6.0])
 
     def test_pcla_ego_same_road_sync_only_updates_metsr_shadow(self):
         teleport_calls = []
 
         class Actor:
+            is_alive = True
+
             def __init__(self):
                 self.location = carla.Location(x=10.0, y=-2.0, z=0.5)
-                self.transform = carla.Transform(
-                    self.location, carla.Rotation(yaw=15.0)
-                )
+                self.transform = carla.Transform(self.location, carla.Rotation(yaw=15.0))
 
             def get_location(self):
                 return self.location
@@ -5078,11 +2737,11 @@ class AdapterStateTests(unittest.TestCase):
             # Deliberately omit routeRoadIds: the PCLA path does not need it.
             "destinationRoadId": "Z",
         }
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.ego = obj
         simulation.carla_actors = [obj]
-        simulation.carla_control_roads = {"-29": True}
-        simulation.carla_control_segments = {"-29"}
+        simulation.metsr_state.controlled_roads = {"-29": True}
+        simulation.metsr_state.controlled_segments = {"-29"}
         simulation.pending_road_entries = {}
         simulation.pending_route_refreshes = {}
         simulation.pending_lane_reconciliation_verifications = {}
@@ -5091,12 +2750,28 @@ class AdapterStateTests(unittest.TestCase):
         simulation.road_entry_hold_diagnostics = {}
         simulation.completed_route = {}
         simulation.count = 1
-        simulation._collect_metsr_vehicle_data = lambda objects: {
-            obj: vehicle_state
-        }
+        simulation._collect_metsr_vehicle_data = lambda objects: {obj: vehicle_state}
+        helper_patch = patch.object(
+            native,
+            "collect_metsr_vehicle_data",
+            lambda _simulation, *args, **kwargs: simulation._collect_metsr_vehicle_data(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         simulation.getMetsrPrivateVehId = lambda target: 7
         simulation._mapped_carla_observation = lambda location: ("-29", 3)
         simulation.check_client_synchronization = lambda: None
+        helper_patch = patch.object(
+            runtime,
+            "check_client_synchronization",
+            lambda _simulation, *args, **kwargs: simulation.check_client_synchronization(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
 
         def teleport(*args, **kwargs):
             teleport_calls.append((args, kwargs))
@@ -5106,6 +2781,8 @@ class AdapterStateTests(unittest.TestCase):
                 "data": [
                     {
                         "vehicleId": 7,
+                        "controlMode": "cosim",
+                        "releasedFromCoSim": False,
                         "segmentId": "-29",
                         "laneIndex": 3,
                     }
@@ -5133,11 +2810,9 @@ class AdapterStateTests(unittest.TestCase):
         args, kwargs = teleport_calls[0]
         self.assertEqual(args[:3], (7, 10.0, 2.0))
         self.assertEqual(kwargs["z"], 0.5)
-        self.assertEqual(
-            kwargs["bearing"], cosim_utils.get_metsr_rotation(15.0)
-        )
-        self.assertEqual(kwargs["segment_id"], "-29")
-        self.assertEqual(kwargs["lane_index"], 3)
+        self.assertEqual(kwargs["bearing"], cosim_utils.get_metsr_rotation(15.0))
+        self.assertNotIn("segment_id", kwargs)
+        self.assertNotIn("lane_index", kwargs)
         self.assertEqual(kwargs["speed"], 5.0)
         self.assertIs(kwargs["private_veh"], True)
         self.assertIs(kwargs["transform_coords"], True)
@@ -5147,26 +2822,30 @@ class AdapterStateTests(unittest.TestCase):
     def test_pcla_shadow_accepts_new_road_without_route_queries_or_updates(self):
         simulation, obj, calls = self._sync_guard_fixture(
             {"segmentId": "A", "destinationRoadId": "Z", "laneIndex": 0},
-            "B", ["D", "Z"], controlled_roads={"A", "B"},
+            "B",
+            ["D", "Z"],
+            controlled_roads={"A", "B"},
             lane_connections={("A", "B"): [("A_0", "B_0")]},
             observed_lane=0,
         )
         simulation.ego = obj
         obj.pcla = object()
-        simulation.metsr_client.query_route_between_roads = (
-            lambda *args: self.fail("METS-R replans its own route on handoff")
+        simulation.metsr_client.query_route_between_roads = lambda *args: self.fail(
+            "METS-R replans its own route on handoff"
         )
-        simulation.metsr_client.update_vehicle_route = (
-            lambda *args, **kwargs: self.fail("CARLA shadow needs no route rewrite")
+        simulation.metsr_client.update_vehicle_route = lambda *args, **kwargs: self.fail(
+            "CARLA shadow needs no route rewrite"
         )
         simulation.synchronize_clients()
         self.assertEqual(len(calls["teleport"]), 1)
-        self.assertEqual(calls["teleport"][0][1]["segment_id"], "B")
+        self.assertNotIn("segment_id", calls["teleport"][0][1])
         self.assertEqual(obj.route, ["D", "Z"])
         self.assertEqual(calls["path"], [])
 
     def test_pcla_ego_cannot_be_destroyed_or_demoted_during_sync(self):
         class Actor:
+            is_alive = True
+
             def __init__(self):
                 self.destroy_calls = 0
 
@@ -5182,7 +2861,7 @@ class AdapterStateTests(unittest.TestCase):
             autopilot_action=False,
             active_autopilot=False,
         )
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.ego = obj
         simulation.carla_actors = [obj]
         simulation.metsr_actors = []
@@ -5191,14 +2870,62 @@ class AdapterStateTests(unittest.TestCase):
             SimulationCreationError, "cannot be destroyed during ordinary"
         ):
             simulation.destroy_carla_obj(obj)
-        with self.assertRaisesRegex(
-            SimulationCreationError, "cannot be demoted"
-        ):
+        with self.assertRaisesRegex(SimulationCreationError, "cannot be demoted"):
             simulation.remove_bubble_object(obj)
 
         self.assertEqual(actor.destroy_calls, 0)
         self.assertEqual(simulation.carla_actors, [obj])
         self.assertEqual(simulation.metsr_actors, [])
+
+    def test_native_actions_use_per_vehicle_routes_and_requested_acceleration(self):
+        class Vehicle(SimpleNamespace):
+            __hash__ = object.__hash__
+
+        vehicles = [
+            Vehicle(
+                carla_actor_flag=False,
+                autopilot_action=False,
+                target_acceleration=acc,
+                trajectory=[Vehicle(road=SimpleNamespace(id=str(index)), id=-1)],
+                trajectory_is_active=False,
+            )
+            for index, acc in enumerate((1.5, -1.0))
+        ]
+        simulation = make_simulation()
+        simulation.agents = vehicles
+        controls, routes = [], []
+        simulation.metsr_client = SimpleNamespace(
+            control_vehicle=lambda vehicle, acc, **kwargs: controls.append((vehicle, acc))
+            or metsr_response("controlVeh"),
+            update_vehicle_route=lambda vehicle, route, **kwargs: routes.append(
+                (vehicle, route)
+            )
+            or metsr_response("updateVehicleRoute"),
+        )
+        simulation.metsr_state = METSRCosimState(
+            metadata=NetworkMetadata(lane_mapping={"0_-1": ["0_0"], "1_-1": ["1_0"]}),
+            valid_roads=["0", "1"],
+        )
+        with patch(
+            "scenic.simulators.cosim.simulator.DrivingSimulation.executeActions"
+        ), patch.object(
+            metsr_network,
+            "generate_metsr_trajectory",
+            wraps=metsr_network.generate_metsr_trajectory,
+        ) as generate:
+            simulation.executeActions({obj: () for obj in vehicles})
+            simulation.executeActions({obj: () for obj in vehicles})
+        self.assertEqual(controls, [(0, 1.5), (1, -1.0)] * 2)
+        self.assertEqual(routes, [(0, ["0"]), (1, ["1"])])
+        self.assertEqual(
+            [call.args for call in generate.call_args_list],
+            [(simulation.metsr_state, obj.trajectory) for obj in vehicles],
+        )
+        self.assertTrue(all(obj.trajectory_is_active for obj in vehicles))
+        self.assertEqual(
+            simulation.metsr_state.metadata.lane_mapping,
+            {"0_-1": ("0_0",), "1_-1": ("1_0",)},
+        )
 
 
 class CosimCleanupTests(unittest.TestCase):
@@ -5221,7 +2948,7 @@ class CosimCleanupTests(unittest.TestCase):
     @staticmethod
     def _simulation(obj):
         recorder_calls = []
-        simulation = object.__new__(CosimSimulation)
+        simulation = make_simulation()
         simulation.run_name = None
         simulation.metsr_client = SimpleNamespace(verbose=False)
         simulation.carla_actors = [obj]
@@ -5246,6 +2973,15 @@ class CosimCleanupTests(unittest.TestCase):
         simulation._destroy_attached_carla_sensors = lambda actor: self.fail(
             "The last CARLA snapshot still lists sensors which PCLA already destroyed"
         )
+        helper_patch = patch.object(
+            runtime,
+            "destroy_attached_carla_sensors",
+            lambda _simulation, *args, **kwargs: simulation._destroy_attached_carla_sensors(
+                *args, **kwargs
+            ),
+        )
+        self.addCleanup(helper_patch.stop)
+        helper_patch.start()
         with patch.object(carla, "Vehicle", self.Actor):
             simulation.tm = SimpleNamespace(get_port=lambda: 8000)
             actor.set_autopilot = lambda *args: None
@@ -5346,9 +3082,7 @@ class CosimCleanupTests(unittest.TestCase):
                 self.vehicle = actor
 
             def cleanup(self):
-                cleanup_observations.append(
-                    (self.vehicle.id, self.vehicle.is_alive)
-                )
+                cleanup_observations.append((self.vehicle.id, self.vehicle.is_alive))
                 if self.vehicle.is_alive:
                     self.vehicle.destroy()
                 self.vehicle = None
@@ -5378,9 +3112,7 @@ class CosimCleanupTests(unittest.TestCase):
 
             def cleanup(self):
                 provider = globals()["CarlaDataProvider"]
-                cleanup_pool_observations.append(
-                    tuple(provider._carla_actor_pool)
-                )
+                cleanup_pool_observations.append(tuple(provider._carla_actor_pool))
                 for pooled_actor in provider._carla_actor_pool.values():
                     pooled_actor.destroy()
                 provider._carla_actor_pool.clear()
@@ -5467,7 +3199,7 @@ class CosimCleanupTests(unittest.TestCase):
         actor = self.Actor()
         obj = SimpleNamespace(carlaActor=actor, pcla=None)
         simulation, recorder_calls = self._simulation(obj)
-        simulation.carla_control_roads = {"B": True, "A": True}
+        simulation.metsr_state.controlled_roads = {"B": True, "A": True}
         releases = []
         simulation.release_roads = lambda roads: releases.append(set(roads))
 
@@ -5488,8 +3220,9 @@ class CosimCleanupTests(unittest.TestCase):
         def reject_release(roads):
             raise METSRControlError("release contract violated")
 
+        simulation.metsr_client.reset = lambda: None
         simulation.release_roads = reject_release
-        with redirect_stdout(StringIO()), self.assertRaises(METSRControlError):
+        with redirect_stdout(StringIO()):
             simulation.destroy()
         simulation.destroy()
 
@@ -5504,28 +3237,33 @@ class CosimCleanupTests(unittest.TestCase):
         actor = self.Actor()
         obj = HashableObject(carlaActor=actor, pcla=None)
         simulation, _ = self._simulation(obj)
-        simulation.carla_control_roads = {}
-        simulation._carla_authoritative_segments = {obj: "A"}
+        simulation.metsr_state.controlled_roads = {}
+        simulation.metsr_state.authoritative_segments = {obj: "A"}
 
         with redirect_stdout(StringIO()):
             simulation.destroy()
 
-        self.assertEqual(simulation._carla_authoritative_segments, {})
+        self.assertEqual(simulation.metsr_state.authoritative_segments, {})
         self.assertIsNone(obj.carlaActor)
 
-    def test_destroy_propagates_road_release_failure_after_local_cleanup(self):
+    def test_destroy_propagates_failed_reset_after_local_cleanup(self):
         actor = self.Actor()
         obj = SimpleNamespace(carlaActor=actor, pcla=None)
         simulation, recorder_calls = self._simulation(obj)
-        simulation.carla_control_roads = {"A": True}
+        simulation.metsr_state.controlled_roads = {"A": True}
 
         def reject_release(roads):
             raise METSRControlError("release contract violated")
 
         simulation.release_roads = reject_release
 
+        def reject_reset():
+            raise METSRControlError("reset failed")
+
+        simulation.metsr_client.reset = reject_reset
+
         with redirect_stdout(StringIO()), self.assertRaisesRegex(
-            METSRControlError, "release contract violated"
+            METSRControlError, "reset failed"
         ):
             simulation.destroy()
 

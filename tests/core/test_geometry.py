@@ -36,6 +36,12 @@ def test_triangulation():
     assert len(tris) == 2
 
 
+@pytest.mark.parametrize("points", [[], [(0, 0), (1, 1), (2, 2)]])
+def test_triangulation_empty_or_collinear(points):
+    polygon = shapely.geometry.Polygon(points)
+    assert len(geometry.triangulatePolygon(polygon)) == 0
+
+
 def test_triangulation_hole():
     p = shapely.geometry.Polygon(
         [(0, 0), (0, 3), (3, 3), (3, 0)], holes=[[(1, 1), (1, 2), (2, 2), (2, 1)]]

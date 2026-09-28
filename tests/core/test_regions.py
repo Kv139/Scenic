@@ -278,6 +278,22 @@ def test_polygon_sampling():
     assert sum(y >= 1.5 for y in ys) >= 1250
 
 
+def test_polygon_sampling_with_precision_sliver():
+    # Actual fragment from Town05 roads minus Demo4's moving co-simulation bubble.
+    # It is valid but too thin for Earcut to consistently produce a triangle.
+    sliver = shapely.geometry.Polygon([
+        (-254.69498237751995, -79.80372301077854),
+        (-254.69498237755778, -79.80372301076515),
+        (-254.6949823775578, -79.80372301076514),
+    ])
+    assert sliver.is_valid and sliver.area > 0
+    road = shapely.geometry.box(0, 0, 10, 10)
+    region = PolygonalRegion(polygon=shapely.geometry.MultiPolygon([road, sliver]))
+    for _ in range(20):
+        point = region.uniformPointInner()
+        assert region.containsPoint(point)
+
+
 def test_polygon_trueContainsPoint():
     r = CircularRegion((0, 0), 1, resolution=64)
 

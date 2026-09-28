@@ -101,6 +101,49 @@ def _batch_field_values(value, count, name, batch_name="vehID"):
     return [value] * count
 
 
+def _resolve_alias(value, name, **aliases):
+    supplied = [(name, value)] if value is not None else []
+    supplied.extend(
+        (alias, candidate)
+        for alias, candidate in aliases.items()
+        if candidate is not None
+    )
+    if len(supplied) > 1:
+        names = ", ".join(key for key, _ in supplied)
+        raise ValueError(f"{names} are aliases; use only one")
+    return supplied[0][1] if supplied else None
+
+
+def _vehicle_batch_records(vehicle_ids, **fields):
+    """Build complete rows after validating every scalar-or-sequence field."""
+    vehicle_ids = _as_list(vehicle_ids)
+    columns = {
+        name: _batch_field_values(value, len(vehicle_ids), name)
+        for name, value in fields.items()
+    }
+    return [
+        dict(
+            vehicleId=vehicle_id,
+            **{name: values[index] for name, values in columns.items()}
+        )
+        for index, vehicle_id in enumerate(vehicle_ids)
+    ]
+
+
+def _pose_record(values):
+    """Serialize fields shared by initialization and authoritative pose updates."""
+    return {
+        "vehicleId": values["vehicleId"],
+        "isPrivate": values["private_veh"],
+        "x": values["x"],
+        "y": values["y"],
+        "z": values["z"],
+        "bearing": values["bearing"],
+        "speed": values["speed"],
+        "transformCoordinates": values["transform_coords"],
+    }
+
+
 def _optional_vehicle_lengths(value, count, batch_name):
     """Broadcast and validate optional vehicle lengths in meters."""
     values = _batch_field_values(value, count, "length", batch_name=batch_name)
@@ -1778,7 +1821,7 @@ class METSRClient:
 
     # QUERY: inspect the state of the simulator
     # By default query public vehicles
-    def query_vehicle(self, id = None, private_veh = False, transform_coords = False):
+    def query_vehicle(self, id=None, private_veh=False, transform_coords=False):
         """Query the full kinematic state of one or more vehicles.
 
         Without ``id`` the server returns two lists::
@@ -1857,15 +1900,16 @@ class METSRClient:
         """
         msg = {"messageType": "vehicle"}
         if id is not None:
-            msg["data"] = []
-            if not isinstance(id, list):
-                id = [id]
-            if not isinstance(private_veh, list):
-                private_veh = [private_veh] * len(id)
-            if not isinstance(transform_coords, list):
-                transform_coords = [transform_coords] * len(id)
-            for veh_id, prv, tran in zip(id, private_veh, transform_coords):
-                msg["data"].append({"vehicleId": veh_id, "isPrivate": prv, "transformCoordinates": tran})
+            msg["data"] = [
+                {
+                    "vehicleId": values["vehicleId"],
+                    "isPrivate": values["private_veh"],
+                    "transformCoordinates": values["transform_coords"],
+                }
+                for values in _vehicle_batch_records(
+                    id, private_veh=private_veh, transform_coords=transform_coords
+                )
+            ]
 
         res = self.send_receive_msg(msg, ignore_heartbeats=True)
         assert res["messageType"] == "vehicle", res["messageType"]
@@ -4044,7 +4088,8 @@ class METSRClient:
     def release_cosim_road(self, roadID):
         """Return one or more roads to native METS-R SIM control.
 
-        Valid roads are always released. Successful records partition the
+        Occupied roads may report a retryable RELEASE_BLOCKED result.
+        Successful records partition the
         road's previously controlled incident connectors into
         ``releasedConnectorIds``/``releasedConnectors`` and the connectors
         which remain controlled through the other endpoint in
@@ -4133,25 +4178,26 @@ class METSRClient:
         return res
 
     def initialize_cosim_vehicle(
-            self,
-            vehID,
-            x,
-            y,
-            bearing,
-            destination_road_id = None,
-            speed = 0,
-            z = 0.0,
-            private_veh = True,
-            transform_coords = False,
-            length = None,
-            segment_id = None,
-            connector_path_id = None,
-            road_id = None,
-            destinationRoadID = None,
-            destRoadID = None,
-            segmentID = None,
-            roadID = None,
-            connectorPathID = None):
+        self,
+        vehID,
+        x,
+        y,
+        bearing,
+        destination_road_id=None,
+        speed=0,
+        z=0.0,
+        private_veh=True,
+        transform_coords=False,
+        length=None,
+        segment_id=None,
+        connector_path_id=None,
+        road_id=None,
+        destinationRoadID=None,
+        destRoadID=None,
+        segmentID=None,
+        roadID=None,
+        connectorPathID=None,
+    ):
         """Create private EVs directly at authoritative co-simulation poses.
 
         The latest METS-R SIM map-matches each front-bumper pose against the
@@ -4167,85 +4213,54 @@ class METSRClient:
         are not supported by this command and produce a per-record
         ``UNSUPPORTED_VEHICLE_TYPE`` response.
         """
-        if destinationRoadID is not None:
-            if destination_road_id is not None:
-                raise ValueError(
-                    "Use either destination_road_id or destinationRoadID, not both"
-                )
-            destination_road_id = destinationRoadID
-        if destRoadID is not None:
-            if destination_road_id is not None:
-                raise ValueError(
-                    "Use only one of destination_road_id, destinationRoadID, or destRoadID"
-                )
-            destination_road_id = destRoadID
-        if segmentID is not None:
-            if segment_id is not None:
-                raise ValueError("Use either segment_id or segmentID, not both")
-            segment_id = segmentID
-        if roadID is not None:
-            if road_id is not None:
-                raise ValueError("Use either road_id or roadID, not both")
-            road_id = roadID
-        if connectorPathID is not None:
-            if connector_path_id is not None:
-                raise ValueError(
-                    "Use either connector_path_id or connectorPathID, not both"
-                )
-            connector_path_id = connectorPathID
+        destination_road_id = _resolve_alias(
+            destination_road_id,
+            "destination_road_id",
+            destinationRoadID=destinationRoadID,
+            destRoadID=destRoadID,
+        )
+        segment_id = _resolve_alias(segment_id, "segment_id", segmentID=segmentID)
+        road_id = _resolve_alias(road_id, "road_id", roadID=roadID)
+        connector_path_id = _resolve_alias(
+            connector_path_id, "connector_path_id", connectorPathID=connectorPathID
+        )
         if destination_road_id is None:
             raise ValueError("destination_road_id is required")
 
         msg = {"messageType": "initializeCoSimVeh", "data": []}
-        veh_ids = _as_list(vehID)
-        count = len(veh_ids)
-        xs = _batch_field_values(x, count, "x")
-        ys = _batch_field_values(y, count, "y")
-        zs = _batch_field_values(z, count, "z")
-        bearings = _batch_field_values(bearing, count, "bearing")
-        speeds = _batch_field_values(speed, count, "speed")
-        private_flags = _batch_field_values(private_veh, count, "private_veh")
-        transform_flags = _batch_field_values(
-            transform_coords, count, "transform_coords"
-        )
+        vehicle_ids = _as_list(vehID)
         vehicle_lengths = _optional_vehicle_lengths(
-            length, count, batch_name="vehicleId"
+            length, len(vehicle_ids), batch_name="vehicleId"
         )
-        segment_ids = _batch_field_values(segment_id, count, "segment_id")
-        road_ids = _batch_field_values(road_id, count, "road_id")
-        connector_path_ids = _batch_field_values(
-            connector_path_id, count, "connector_path_id"
-        )
-        destination_ids = _batch_field_values(
-            destination_road_id, count, "destination_road_id"
-        )
-
-        for (veh_id, x_value, y_value, z_value, bearing_value, speed_value,
-             private_flag, transform_flag, vehicle_length, segment_hint,
-             road_hint, connector_path, destination_id) in zip(
-                veh_ids, xs, ys, zs, bearings, speeds, private_flags,
-                transform_flags, vehicle_lengths, segment_ids, road_ids,
-                connector_path_ids, destination_ids):
-            record = {
-                "vehicleId": veh_id,
-                "isPrivate": private_flag,
-                "x": x_value,
-                "y": y_value,
-                "z": z_value,
-                "bearing": bearing_value,
-                "speed": speed_value,
-                "transformCoordinates": transform_flag,
-                "destinationRoadId": destination_id,
-            }
-            if vehicle_length is not None:
-                record["vehicleLength"] = vehicle_length
-            selected_segment = segment_hint if segment_hint is not None else road_hint
+        for values in _vehicle_batch_records(
+            vehicle_ids,
+            x=x,
+            y=y,
+            z=z,
+            bearing=bearing,
+            speed=speed,
+            private_veh=private_veh,
+            transform_coords=transform_coords,
+            segment_id=segment_id,
+            road_id=road_id,
+            connector_path_id=connector_path_id,
+            destination_road_id=destination_road_id,
+            length=vehicle_lengths,
+        ):
+            record = _pose_record(values)
+            record["destinationRoadId"] = values["destination_road_id"]
+            if values["length"] is not None:
+                record["vehicleLength"] = values["length"]
+            selected_segment = (
+                values["segment_id"]
+                if values["segment_id"] is not None
+                else values["road_id"]
+            )
+            connector_path = values["connector_path_id"]
             if connector_path is not None and selected_segment is None:
                 raise ValueError("connector_path_id requires segment_id")
-            if segment_hint is not None:
-                record["segmentId"] = segment_hint
-            elif road_hint is not None:
-                record["segmentId"] = road_hint
+            if selected_segment is not None:
+                record["segmentId"] = selected_segment
             if connector_path is not None:
                 record["connectorPathId"] = connector_path
             msg["data"].append(record)
@@ -4259,27 +4274,28 @@ class METSRClient:
 
     # Teleport a vehicle to an authoritative pose on a controlled segment.
     def teleport_cosim_vehicle(
-            self,
-            vehID,
-            x,
-            y,
-            bearing,
-            speed = 0,
-            z = 0.0,
-            private_veh = False,
-            transform_coords = False,
-            observed_road_id = None,
-            observedRoadID = None,
-            observed_lane_id = None,
-            observedLaneID = None,
-            segment_id = None,
-            segmentID = None,
-            road_id = None,
-            roadID = None,
-            lane_index = None,
-            laneIndex = None,
-            connector_path_id = None,
-            connectorPathID = None):
+        self,
+        vehID,
+        x,
+        y,
+        bearing,
+        speed=0,
+        z=0.0,
+        private_veh=False,
+        transform_coords=False,
+        observed_road_id=None,
+        observedRoadID=None,
+        observed_lane_id=None,
+        observedLaneID=None,
+        segment_id=None,
+        segmentID=None,
+        road_id=None,
+        roadID=None,
+        lane_index=None,
+        laneIndex=None,
+        connector_path_id=None,
+        connectorPathID=None,
+    ):
         """Apply an authoritative external pose to a co-simulation vehicle.
 
         Without ``segment_id``, METS-R map-matches only against co-simulation
@@ -4298,117 +4314,50 @@ class METSRClient:
         ``status='error'`` with ``errorCode``; the top-level status may be
         ``partial``.
         """
-        if observedRoadID is not None:
-            if observed_road_id is not None:
-                raise ValueError(
-                    "Use either observed_road_id or observedRoadID, not both"
-                )
-            observed_road_id = observedRoadID
-        if observedLaneID is not None:
-            if observed_lane_id is not None:
-                raise ValueError(
-                    "Use either observed_lane_id or observedLaneID, not both"
-                )
-            observed_lane_id = observedLaneID
-        if segmentID is not None:
-            if segment_id is not None:
-                raise ValueError("Use either segment_id or segmentID, not both")
-            segment_id = segmentID
-        if roadID is not None:
-            if road_id is not None:
-                raise ValueError("Use either road_id or roadID, not both")
-            road_id = roadID
-        if laneIndex is not None:
-            if lane_index is not None:
-                raise ValueError("Use either lane_index or laneIndex, not both")
-            lane_index = laneIndex
-        if observed_lane_id is not None:
-            if lane_index is not None:
-                raise ValueError(
-                    "observed_lane_id is a legacy alias for lane_index; use only one"
-                )
-            lane_index = observed_lane_id
-        if connectorPathID is not None:
-            if connector_path_id is not None:
-                raise ValueError(
-                    "Use either connector_path_id or connectorPathID, not both"
-                )
-            connector_path_id = connectorPathID
-        segment_source_count = sum(
-            value is not None
-            for value in (segment_id, road_id, observed_road_id)
+        segment_id = _resolve_alias(
+            segment_id,
+            "segment_id",
+            segmentID=segmentID,
+            road_id=road_id,
+            roadID=roadID,
+            observed_road_id=observed_road_id,
+            observedRoadID=observedRoadID,
         )
-        if segment_source_count > 1:
-            raise ValueError(
-                "segment_id, road_id, and observed_road_id are aliases; use only one"
-            )
-
-        msg = {
-                "messageType": "teleportCoSimVeh",
-                "data": []
-                }
-        veh_ids = _as_list(vehID)
-        count = len(veh_ids)
-        xs = _batch_field_values(x, count, "x")
-        ys = _batch_field_values(y, count, "y")
-        zs = _batch_field_values(z, count, "z")
-        bearings = _batch_field_values(bearing, count, "bearing")
-        speeds = _batch_field_values(speed, count, "speed")
-        private_flags = _batch_field_values(private_veh, count, "private_veh")
-        transform_flags = _batch_field_values(
-            transform_coords, count, "transform_coords"
+        lane_index = _resolve_alias(
+            lane_index,
+            "lane_index",
+            laneIndex=laneIndex,
+            observed_lane_id=observed_lane_id,
+            observedLaneID=observedLaneID,
         )
-        observed_road_ids = _batch_field_values(
-            observed_road_id, count, "observed_road_id"
-        )
-        segment_ids = _batch_field_values(segment_id, count, "segment_id")
-        road_ids = _batch_field_values(road_id, count, "road_id")
-        lane_indices = _batch_field_values(lane_index, count, "lane_index")
-        connector_path_ids = _batch_field_values(
-            connector_path_id, count, "connector_path_id"
+        connector_path_id = _resolve_alias(
+            connector_path_id, "connector_path_id", connectorPathID=connectorPathID
         )
 
-        for (veh_id, x_value, y_value, z_value, bearing_value, speed_value,
-             private_flag, transform_flag, observed_road, segment_hint,
-             road_hint, selected_lane, selected_connector_path) in zip(
-                veh_ids,
-                xs,
-                ys,
-                zs,
-                bearings,
-                speeds,
-                private_flags,
-                transform_flags,
-                observed_road_ids,
-                segment_ids,
-                road_ids,
-                lane_indices,
-                connector_path_ids):
-            record = {
-                "vehicleId": veh_id,
-                "x": x_value,
-                "y": y_value,
-                "z": z_value,
-                "bearing": bearing_value,
-                "speed": speed_value,
-                "isPrivate": private_flag,
-                "transformCoordinates": transform_flag,
-            }
-            selected_segment = next(
-                (candidate for candidate in
-                 (segment_hint, road_hint, observed_road)
-                 if candidate is not None),
-                None,
-            )
+        msg = {"messageType": "teleportCoSimVeh", "data": []}
+        for values in _vehicle_batch_records(
+            vehID,
+            x=x,
+            y=y,
+            z=z,
+            bearing=bearing,
+            speed=speed,
+            private_veh=private_veh,
+            transform_coords=transform_coords,
+            segment_id=segment_id,
+            lane_index=lane_index,
+            connector_path_id=connector_path_id,
+        ):
+            record = _pose_record(values)
+            selected_segment = values["segment_id"]
+            selected_lane = values["lane_index"]
+            selected_connector_path = values["connector_path_id"]
             if selected_lane is not None and selected_connector_path is not None:
-                raise ValueError(
-                    "lane_index and connector_path_id are mutually exclusive"
-                )
-            if (selected_lane is not None or selected_connector_path is not None) \
-                    and selected_segment is None:
-                raise ValueError(
-                    "lane_index and connector_path_id require segment_id"
-                )
+                raise ValueError("lane_index and connector_path_id are mutually exclusive")
+            if (
+                selected_lane is not None or selected_connector_path is not None
+            ) and selected_segment is None:
+                raise ValueError("lane_index and connector_path_id require segment_id")
             if selected_segment is not None:
                 record["segmentId"] = selected_segment
             if selected_lane is not None:
@@ -4421,25 +4370,26 @@ class METSRClient:
         return res
 
     def _teleport_digital_twin_vehicle(
-            self,
-            message_type,
-            vehID,
-            segment_id = None,
-            lane_index = None,
-            distance_to_segment_end = None,
-            private_veh = False,
-            x = None,
-            y = None,
-            transform_coords = False,
-            z = None,
-            connector_path_id = None,
-            position_type = None,
-            roadID = None,
-            laneID = None,
-            dist = None,
-            segmentID = None,
-            laneIndex = None,
-            connectorPathID = None):
+        self,
+        message_type,
+        vehID,
+        segment_id=None,
+        lane_index=None,
+        distance_to_segment_end=None,
+        private_veh=False,
+        x=None,
+        y=None,
+        transform_coords=False,
+        z=None,
+        connector_path_id=None,
+        position_type=None,
+        roadID=None,
+        laneID=None,
+        dist=None,
+        segmentID=None,
+        laneIndex=None,
+        connectorPathID=None,
+    ):
         """Implement digital-twin teleport for the current and legacy names.
 
         Each record uses exactly one position mode. Coordinate mode takes
@@ -4455,66 +4405,40 @@ class METSRClient:
         vehicles, invalid geometry, and overlapping placements. Record errors
         make the top-level response ``partial``.
         """
-        if segmentID is not None:
-            if segment_id is not None:
-                raise ValueError("Use either segment_id or segmentID, not both")
-            segment_id = segmentID
-        if roadID is not None:
-            if segment_id is not None:
-                raise ValueError("roadID is a legacy alias for segment_id; use only one")
-            segment_id = roadID
-        if laneIndex is not None:
-            if lane_index is not None:
-                raise ValueError("Use either lane_index or laneIndex, not both")
-            lane_index = laneIndex
-        if laneID is not None:
-            if lane_index is not None:
-                raise ValueError("laneID is a legacy alias for lane_index; use only one")
-            lane_index = laneID
-        if dist is not None:
-            if distance_to_segment_end is not None:
-                raise ValueError(
-                    "dist is a legacy alias for distance_to_segment_end; use only one"
-                )
-            distance_to_segment_end = dist
-        if connectorPathID is not None:
-            if connector_path_id is not None:
-                raise ValueError(
-                    "Use either connector_path_id or connectorPathID, not both"
-                )
-            connector_path_id = connectorPathID
-
-        msg = {
-                "messageType": message_type,
-                "data": []
-                }
-        veh_ids = _as_list(vehID)
-        count = len(veh_ids)
-
-        segment_ids = _batch_field_values(segment_id, count, "segment_id")
-        lane_indices = _batch_field_values(lane_index, count, "lane_index")
-        distances = _batch_field_values(
-            distance_to_segment_end, count, "distance_to_segment_end"
+        segment_id = _resolve_alias(
+            segment_id, "segment_id", segmentID=segmentID, roadID=roadID
         )
-        private_flags = _batch_field_values(private_veh, count, "private_veh")
-        xs = _batch_field_values(x, count, "x")
-        ys = _batch_field_values(y, count, "y")
-        zs = _batch_field_values(z, count, "z")
-        transform_flags = _batch_field_values(
-            transform_coords, count, "transform_coords"
+        lane_index = _resolve_alias(
+            lane_index, "lane_index", laneIndex=laneIndex, laneID=laneID
         )
-        connector_path_ids = _batch_field_values(
-            connector_path_id, count, "connector_path_id"
+        distance_to_segment_end = _resolve_alias(
+            distance_to_segment_end, "distance_to_segment_end", dist=dist
         )
-        position_types = _batch_field_values(
-            position_type, count, "position_type"
+        connector_path_id = _resolve_alias(
+            connector_path_id, "connector_path_id", connectorPathID=connectorPathID
         )
 
-        for (veh_id, segment, lane, distance, private_flag, x_value, y_value,
-             z_value, transform_flag, connector_path, requested_mode) in zip(
-                veh_ids, segment_ids, lane_indices, distances, private_flags,
-                xs, ys, zs, transform_flags, connector_path_ids,
-                position_types):
+        msg = {"messageType": message_type, "data": []}
+        for values in _vehicle_batch_records(
+            vehID,
+            segment_id=segment_id,
+            lane_index=lane_index,
+            distance_to_segment_end=distance_to_segment_end,
+            private_veh=private_veh,
+            x=x,
+            y=y,
+            z=z,
+            transform_coords=transform_coords,
+            connector_path_id=connector_path_id,
+            position_type=position_type,
+        ):
+            segment = values["segment_id"]
+            lane = values["lane_index"]
+            distance = values["distance_to_segment_end"]
+            x_value, y_value, z_value = values["x"], values["y"], values["z"]
+            transform_flag = values["transform_coords"]
+            connector_path = values["connector_path_id"]
+            requested_mode = values["position_type"]
             if lane == -1:
                 lane = None
 
@@ -4522,8 +4446,7 @@ class METSRClient:
                 value is not None for value in (x_value, y_value, z_value)
             )
             has_segment_position = any(
-                value is not None
-                for value in (segment, lane, connector_path, distance)
+                value is not None for value in (segment, lane, connector_path, distance)
             )
             if requested_mode is None:
                 if has_coordinates and has_segment_position:
@@ -4547,8 +4470,8 @@ class METSRClient:
                 raise ValueError("position_type must be 'coordinate' or 'segment'")
 
             record = {
-                "vehicleId": veh_id,
-                "isPrivate": private_flag,
+                "vehicleId": values["vehicleId"],
+                "isPrivate": values["private_veh"],
                 "positionType": mode,
             }
 
@@ -4573,9 +4496,7 @@ class METSRClient:
                         "segment digital-twin teleport cannot include x, y, or z"
                     )
                 if transform_flag:
-                    raise ValueError(
-                        "transform_coords applies only to coordinate teleport"
-                    )
+                    raise ValueError("transform_coords applies only to coordinate teleport")
                 if segment is None or distance is None:
                     raise ValueError(
                         "segment digital-twin teleport requires segment_id and "

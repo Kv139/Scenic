@@ -1,9 +1,6 @@
 import pathlib
-from scenic.core.regions import PolygonalRegion
 from scenic.simulators.carla.model import Vehicle, is2DMode, network
-from scenic.simulators.cosim.utils.utils import (
-    generate_map, generate_metsr_lane_index_map
-)
+from scenic.simulators.metsr.network import load_network_metadata, mapped_driving_region
 
 import scenic.simulators.carla.blueprints as blueprints
 from scenic.simulators.carla.behaviors import *
@@ -18,26 +15,8 @@ from scenic.simulators.cosim.simulator import CosimSimulator
 map_town = pathlib.Path(globalParameters.map).stem
 param xml_path = pathlib.Path(globalParameters.xml_map)
 
-_scenicToMetsrLaneMap = generate_map(globalParameters.xml_path)
-_metsrDrivingLaneIDs = frozenset(
-    generate_metsr_lane_index_map(globalParameters.xml_path)
-)
-metsrMappedLaneKeys = frozenset(
-    scenic_lane
-    for scenic_lane, sumo_lanes in _scenicToMetsrLaneMap.items()
-    if any(sumo_lane in _metsrDrivingLaneIDs for sumo_lane in sumo_lanes)
-)
-_metsrMappedLanes = tuple(
-    lane
-    for lane in network.lanes
-    if f"{lane.road.id}_{lane.id}" in metsrMappedLaneKeys
-)
-if not _metsrMappedLanes:
-    raise RuntimeError(
-        f"SUMO map {globalParameters.xml_path} contains no physical driving "
-        "lanes mapped from the Scenic/OpenDRIVE network"
-    )
-metsrMappedRoad = PolygonalRegion.unionAll(_metsrMappedLanes)
+_metsrNetworkMetadata = load_network_metadata(globalParameters.xml_path)
+metsrMappedLaneKeys, metsrMappedRoad = mapped_driving_region(network, _metsrNetworkMetadata)
 
 param carla_map = map_town
 param metsr_host = "localhost"
@@ -60,6 +39,7 @@ simulator CosimSimulator(
     carla_port = globalParameters.carla_port,
     carla_map = map_town,
     xml_map = globalParameters.xml_path,
+    network_metadata = _metsrNetworkMetadata,
     map_path = globalParameters.map,
     timestep = globalParameters.timestep,
     bubble_size = globalParameters.bubble_size,

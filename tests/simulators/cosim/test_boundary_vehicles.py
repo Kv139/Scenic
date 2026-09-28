@@ -1,10 +1,14 @@
 """Boundary occupancy is visible in CARLA while METS-R retains motion control."""
+
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from scenic.core.simulators import SimulationCreationError
-from scenic.simulators.cosim.simulator import CosimSimulation, METSRControlError, carla
+from scenic.simulators.cosim import cosim_utils
+from scenic.simulators.cosim.simulator import CosimSimulation, carla
+from scenic.simulators.metsr.cosim_utils import METSRControlError, METSRCosimState
 
 
 def response(message_type, data):
@@ -70,10 +74,9 @@ class World:
         return next((a for a in self.actors if a.id == actor_id and a.is_alive), None)
 
     def tick(self):
-        self.tick_poses.append([
-            (a.id, a.transform.location.x, a.physics)
-            for a in self.actors if a.is_alive
-        ])
+        self.tick_poses.append(
+            [(a.id, a.transform.location.x, a.physics) for a in self.actors if a.is_alive]
+        )
 
 
 class ScenicObject(SimpleNamespace):
@@ -83,15 +86,23 @@ class ScenicObject(SimpleNamespace):
 @pytest.fixture
 def boundary_simulation(monkeypatch):
     simulation = object.__new__(CosimSimulation)
+    simulation.metsr_state = METSRCosimState()
     simulation.boundary_actors = {}
-    simulation.pv_id_map = {}
+    simulation.metsr_state.private_vehicle_ids = {}
     simulation.objects = []
     simulation.carla_actors = []
     simulation.metsr_actors = []
-    simulation.carla_control_roads = {}
-    simulation.map = SimpleNamespace(get_waypoint=lambda location, **kwargs: SimpleNamespace(
-        transform=carla.Transform(carla.Location(location.x, location.y, 3.0))
-    ))
+    simulation.metsr_state.controlled_roads = {}
+    simulation.metsr_state.controlled_segments = set()
+    simulation.metsr_state.connector_records = {}
+    simulation.metsr_state.road_connectors = {}
+    simulation.metsr_state.internal_edge_to_connector = {}
+    simulation._carla_spawn_property_seeds = {}
+    simulation.map = SimpleNamespace(
+        get_waypoint=lambda location, **kwargs: SimpleNamespace(
+            transform=carla.Transform(carla.Location(location.x, location.y, 3.0))
+        )
+    )
     simulation.carla_world = World()
     simulation.tm = SimpleNamespace(get_port=lambda: 8000)
     available = {"vehicle.test.car", "vehicle.test.bus", "vehicle.test.scenic"}
@@ -102,36 +113,61 @@ def boundary_simulation(monkeypatch):
         return Blueprint(model)
 
     simulation.blueprintLib = SimpleNamespace(find=find)
-    monkeypatch.setattr("scenic.simulators.cosim.simulator.carModels", ["vehicle.test.car"])
-    monkeypatch.setattr("scenic.simulators.cosim.simulator.busModels", ["vehicle.test.bus"])
-    records = [{
-        "vehicleId": 42, "isPrivate": True,
-        "segmentId": "exit", "segmentType": "road", "controlMode": "native",
-        "onRoad": True, "onConnector": False, "laneIndex": 0,
-        # These are upcoming route vertices, deliberately far from the vehicle.
-        "coordinateTrail": [[900.0, 800.0], [901.0, 801.0]],
-    }]
-    states = {(True, "42"): {
-        "vehicleId": 42, "vehicleClass": 3,
-        "x": 10.0, "y": 20.0, "z": None, "bearing": 90.0, "speed": 8.0,
-    }}
+    monkeypatch.setattr(
+        "scenic.simulators.cosim.cosim_utils.carModels", ["vehicle.test.car"]
+    )
+    monkeypatch.setattr(
+        "scenic.simulators.cosim.cosim_utils.busModels", ["vehicle.test.bus"]
+    )
+    records = [
+        {
+            "vehicleId": 42,
+            "isPrivate": True,
+            "segmentId": "exit",
+            "segmentType": "road",
+            "controlMode": "native",
+            "onRoad": True,
+            "onConnector": False,
+            "laneIndex": 0,
+            # These are upcoming route vertices, deliberately far from the vehicle.
+            "coordinateTrail": [[900.0, 800.0], [901.0, 801.0]],
+        }
+    ]
+    states = {
+        (True, "42"): {
+            "vehicleId": 42,
+            "vehicleClass": 3,
+            "x": 10.0,
+            "y": 20.0,
+            "z": None,
+            "bearing": 90.0,
+            "speed": 8.0,
+        }
+    }
     queries = []
 
     def query_vehicle(ids, private_veh, transform_coords):
         queries.append((ids, private_veh, transform_coords))
-        return response("vehicle", [states[(private, str(vid))]
-                                    for vid, private in zip(ids, private_veh)])
+        return response(
+            "vehicle",
+            [states[(private, str(vid))] for vid, private in zip(ids, private_veh)],
+        )
 
     simulation.metsr_client = SimpleNamespace(
-        query_boundary_vehicle=lambda: response("boundaryVehicle", records),
+        query_boundary_vehicle=Mock(return_value=response("boundaryVehicle", records)),
         query_vehicle=query_vehicle,
     )
     return simulation, records, states, queries
 
 
-def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(boundary_simulation):
+def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(
+    boundary_simulation,
+):
     simulation, _, states, queries = boundary_simulation
     simulation._synchronize_boundary_vehicles()
+    simulation.metsr_client.query_boundary_vehicle.assert_called_once_with(
+        boundary_dist=15.0
+    )
     actor = simulation.boundary_actors[(True, "42")]
     assert actor.type_id.startswith("vehicle.")
     assert actor.attributes["role_name"] == "metsr_boundary_private_42"
@@ -144,13 +180,19 @@ def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(boundar
     assert actor.transform.rotation.yaw == pytest.approx(0.0)
     assert queries == [([42], [True], True)]
     assert simulation.objects == simulation.carla_actors == simulation.metsr_actors == []
-    assert simulation.pv_id_map == simulation.carla_control_roads == {}
+    assert (
+        simulation.metsr_state.private_vehicle_ids
+        == simulation.metsr_state.controlled_roads
+        == {}
+    )
 
     states[(True, "42")].update(x=12.0, bearing=180.0)
     simulation.sim_ticks_per_carla = 3
     simulation.tick_carla()
     assert simulation.carla_world.tick_poses == [[(actor.id, 10.0, False)]] * 3
     simulation._synchronize_boundary_vehicles()
+    simulation.metsr_client.query_boundary_vehicle.assert_called_with(boundary_dist=15.0)
+    assert simulation.metsr_client.query_boundary_vehicle.call_count == 2
     assert simulation.boundary_actors[(True, "42")] is actor
     assert len(simulation.carla_world.actors) == 1
     assert actor.transform.location.x == pytest.approx(12.0)
@@ -158,7 +200,9 @@ def test_current_pose_is_visible_as_static_vehicle_across_carla_substeps(boundar
     assert states[(True, "42")]["speed"] == 8.0
 
 
-def test_vehicle_leaving_boundary_is_removed_without_an_extra_pose_query(boundary_simulation):
+def test_vehicle_leaving_boundary_is_removed_without_an_extra_pose_query(
+    boundary_simulation,
+):
     simulation, records, _, queries = boundary_simulation
     simulation._synchronize_boundary_vehicles()
     actor = simulation.boundary_actors[(True, "42")]
@@ -175,7 +219,7 @@ def test_road_takeover_removes_obstacle_before_dynamic_promotion(boundary_simula
     simulation._synchronize_boundary_vehicles()
     actor = simulation.boundary_actors[(True, "42")]
     # Defensively handle even an old boundary snapshot during road takeover.
-    simulation.carla_control_roads = {"exit": True}
+    simulation.metsr_state.controlled_roads = {"exit": True}
     simulation._synchronize_boundary_vehicles()
     assert simulation.boundary_actors == {}
     assert actor.destroy_calls == 1
@@ -186,7 +230,7 @@ def test_existing_dynamic_vehicle_is_never_duplicated(boundary_simulation):
     simulation, _, _, queries = boundary_simulation
     dynamic_actor = object()
     obj = ScenicObject(carlaActor=dynamic_actor)
-    simulation.pv_id_map[obj] = 42
+    simulation.metsr_state.private_vehicle_ids[obj] = 42
     simulation.carla_actors = [obj]
     simulation._synchronize_boundary_vehicles()
     assert simulation.boundary_actors == {}
@@ -212,10 +256,13 @@ def test_private_and_public_ids_and_native_buses_are_distinct(boundary_simulatio
 def test_known_scenic_model_and_elevation_are_preserved(boundary_simulation):
     simulation, _, states, _ = boundary_simulation
     obj = ScenicObject(
-        carlaActor=None, blueprint="vehicle.test.scenic", snapToGround=False,
-        color=SimpleNamespace(r=1.0, g=0.0, b=0.0), carla_actor_flag=False,
+        carlaActor=None,
+        blueprint="vehicle.test.scenic",
+        snapToGround=False,
+        color=SimpleNamespace(r=1.0, g=0.0, b=0.0),
+        carla_actor_flag=False,
     )
-    simulation.pv_id_map[obj] = 42
+    simulation.metsr_state.private_vehicle_ids[obj] = 42
     states[(True, "42")]["z"] = 7.0
     simulation._synchronize_boundary_vehicles()
     actor = simulation.boundary_actors[(True, "42")]
@@ -234,26 +281,37 @@ def test_duplicate_membership_creates_one_obstacle(boundary_simulation):
     assert queries == [([42], [True], True)]
 
 
-@pytest.mark.parametrize("bad_response", [
-    None,
-    {"messageType": "boundaryVehicle", "status": "error", "data": []},
-    {"messageType": "boundaryVehicle", "status": "partial", "data": []},
-    {"messageType": "boundaryVehicle", "status": "ok"},
-])
-def test_query_failure_does_not_clear_existing_blockers(boundary_simulation, bad_response):
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        None,
+        {"messageType": "boundaryVehicle", "status": "error", "data": []},
+        {"messageType": "boundaryVehicle", "status": "partial", "data": []},
+        {"messageType": "boundaryVehicle", "status": "ok"},
+    ],
+)
+def test_query_failure_does_not_clear_existing_blockers(
+    boundary_simulation, bad_response
+):
     simulation, _, _, _ = boundary_simulation
     simulation._synchronize_boundary_vehicles()
     actor = simulation.boundary_actors[(True, "42")]
-    simulation.metsr_client.query_boundary_vehicle = lambda: bad_response
+    simulation.metsr_client.query_boundary_vehicle.return_value = bad_response
     with pytest.raises(METSRControlError):
         simulation._synchronize_boundary_vehicles()
     assert simulation.boundary_actors[(True, "42")] is actor
     assert actor.is_alive
 
 
-@pytest.mark.parametrize("changes", [
-    {"x": float("nan")}, {"bearing": None}, {"vehicleId": 99}, {"vehicleClass": 2},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"x": float("nan")},
+        {"bearing": None},
+        {"vehicleId": 99},
+        {"vehicleClass": 2},
+    ],
+)
 def test_invalid_pose_does_not_move_or_remove_an_obstacle(boundary_simulation, changes):
     simulation, _, states, _ = boundary_simulation
     simulation._synchronize_boundary_vehicles()
@@ -284,7 +342,9 @@ def test_externally_destroyed_obstacle_is_recreated(boundary_simulation):
     assert actor.destroy_calls == 0
 
 
-def test_failed_obstacle_configuration_remains_tracked_for_cleanup(boundary_simulation, monkeypatch):
+def test_failed_obstacle_configuration_remains_tracked_for_cleanup(
+    boundary_simulation, monkeypatch
+):
     simulation, _, _, _ = boundary_simulation
 
     def reject_physics(self, enabled):
@@ -294,5 +354,5 @@ def test_failed_obstacle_configuration_remains_tracked_for_cleanup(boundary_simu
     with pytest.raises(RuntimeError, match="CARLA configuration failed"):
         simulation._synchronize_boundary_vehicles()
     assert len(simulation.boundary_actors) == 1
-    simulation._remove_boundary_actor((True, "42"))
+    cosim_utils.remove_boundary_actor(simulation, (True, "42"))
     assert simulation.carla_world.actors[0].destroy_calls == 1

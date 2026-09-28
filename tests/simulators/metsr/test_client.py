@@ -86,7 +86,7 @@ def test_receive_rejects_retired_v1_response_fields():
         client.receive_msg(ignore_heartbeats=True, waiting_forever=False)
 
 
-def test_readiness_handshake_requires_explicit_ready_response():
+def test_readiness_handshake_accepts_explicit_ready_response():
     response = {"messageType": "ready", "status": "ok", "tick": 0}
     client = readiness_client(response)
 
@@ -99,11 +99,17 @@ def test_readiness_handshake_requires_explicit_ready_response():
     "response,error_type,message",
     [
         (None, TimeoutError, "did not report ready"),
-        (
-            {"messageType": "step", "status": "ok", "tick": 0},
-            RuntimeError,
-            "Expected METS-R SIM ready response",
-        ),
+        *[
+            (response, RuntimeError, "Expected METS-R SIM ready response")
+            for response in (
+                {"messageType": "step", "status": "error", "tick": 42},
+                {"messageType": "step", "status": "partial", "tick": 42},
+                {"messageType": "step", "tick": 42},
+                {"messageType": "step", "status": "ok"},
+                {"messageType": "step", "status": "ok", "tick": None},
+                {"messageType": "vehicle", "status": "ok", "tick": 42},
+            )
+        ],
     ],
 )
 def test_readiness_handshake_fails_closed(response, error_type, message):
@@ -116,6 +122,41 @@ def test_readiness_handshake_fails_closed(response, error_type, message):
     assert client.state == "failed"
     assert websocket.closed is True
     assert client.ws is None
+
+
+@pytest.mark.parametrize("tick", [0, 42])
+def test_readiness_handshake_accepts_late_connection_heartbeat(tick):
+    response = {"messageType": "step", "status": "ok", "tick": tick}
+    client = readiness_client(response)
+
+    assert client._await_simulator_ready() is response
+    assert client.state == "connected"
+    assert client.ws.closed is False
+
+
+@pytest.mark.parametrize("message_type,tick", [("ready", 0), ("step", 0), ("step", 42)])
+def test_constructor_initializes_tick_and_can_query_after_handshake(
+    monkeypatch, message_type, tick
+):
+    responses = iter([
+        {"messageType": message_type, "status": "ok", "tick": tick},
+        {"messageType": "tick", "status": "ok", "tick": tick},
+    ])
+    sent = []
+    websocket = CloseTrackingWebSocket()
+    websocket.recv = lambda timeout: json.dumps(next(responses))
+    websocket.send = lambda message: sent.append(json.loads(message))
+    monkeypatch.setattr(client_module, "connect", lambda *args, **kwargs: websocket)
+
+    client = METSRClient(host="test", port=4000, timeout=0.1)
+    try:
+        assert client.state == "connected"
+        assert client.current_tick == tick
+        assert client.query_tick() == tick
+        assert sent == [{"messageType": "tick"}]
+    finally:
+        client.close()
+    assert websocket.closed
 
 
 @pytest.mark.parametrize("include_tick_mismatch", [False, True])
@@ -659,7 +700,12 @@ def test_visualization_discovers_cosim_only_vehicle():
 
 
 @pytest.mark.parametrize("method", ["query_boundary_vehicle", "queryBoundaryVeh"])
-def test_boundary_vehicle_query_uses_native_read_only_protocol(method):
+@pytest.mark.parametrize("kwargs,distance", [
+    ({}, 10.0),
+    ({"boundary_dist": 0}, 0.0),
+    ({"boundary_dist": 25.5}, 25.5),
+])
+def test_boundary_vehicle_query_uses_native_read_only_protocol(method, kwargs, distance):
     response = ok_response("boundaryVehicle", [{
         "vehicleId": 17,
         "isPrivate": False,
@@ -670,5 +716,18 @@ def test_boundary_vehicle_query_uses_native_read_only_protocol(method):
     sent = []
     client = make_client(response, sent)
 
-    assert getattr(client, method)() is response
-    assert sent == [({"messageType": "boundaryVehicle"}, True)]
+    assert getattr(client, method)(**kwargs) is response
+    assert sent == [({"messageType": "boundaryVehicle", "boundaryDist": distance}, True)]
+
+
+@pytest.mark.parametrize("distance", [
+    -1, float("nan"), float("inf"), float("-inf"), None, True, "invalid",
+])
+def test_boundary_vehicle_query_rejects_invalid_distance_before_sending(distance):
+    sent = []
+    client = make_client(ok_response("boundaryVehicle"), sent)
+
+    with pytest.raises(ValueError, match="boundary_dist must be a finite, non-negative"):
+        client.query_boundary_vehicle(boundary_dist=distance)
+
+    assert sent == []
