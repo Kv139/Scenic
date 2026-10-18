@@ -24,13 +24,14 @@ def currentTOD():
     return (simulation().currentTime * simulation().timestep + globalParameters.startTime)%_DAY_MOD
 
 class PrivateCar:
-    pass
+    # If true, origin and destination are METS-R roadOrigID values instead of zones.
+    isRoad: False
 
-scenario GeneratePrivateTrip(origin, destination):
-    new PrivateCar with origin origin, with destination destination
+scenario GeneratePrivateTrip(origin, destination, isRoad=False):
+    new PrivateCar with origin origin, with destination destination, with isRoad isRoad
     terminate after 1 steps
 
-scenario TrafficStream(origin, destination, traffic_flow):
+scenario TrafficStream(origin, destination, traffic_flow, isRoad=False):
     compose:
         while True:
             raw_prob_spawn = traffic_flow.expected_vehs(
@@ -39,23 +40,26 @@ scenario TrafficStream(origin, destination, traffic_flow):
                 warnings.warn(f"raw_prob_spawn (={raw_prob_spawn}) fell outside [0,1] and will be clamped.")
             prob_spawn = min(1, max(raw_prob_spawn, 0))
             if Range(0,1) < prob_spawn:
-                do GeneratePrivateTrip(origin, destination)
+                do GeneratePrivateTrip(origin, destination, isRoad=isRoad)
             else:
                 wait
 
-scenario ConstantTrafficStream(origin, destination, num_vehicles, stime=None, etime=None):
+scenario ConstantTrafficStream(origin, destination, num_vehicles, stime=None, etime=None,
+    isRoad=False):
     compose:
         tf = ConstantTrafficFlow(num_vehicles, stime, etime)
-        do TrafficStream(origin, destination, tf)
+        do TrafficStream(origin, destination, tf, isRoad=isRoad)
 
-scenario NormalTrafficStream(origin, destination, num_vehicles, peak_time, stddev):
+scenario NormalTrafficStream(origin, destination, num_vehicles, peak_time, stddev,
+    isRoad=False):
     compose:
         tf = NormalTrafficFlow(num_vehicles, peak_time, stddev)
-        do TrafficStream(origin, destination, tf)
+        do TrafficStream(origin, destination, tf, isRoad=isRoad)
 
 scenario CommuterTrafficStream(origin, destination, num_vehicles, 
-    peak_time_1, peak_time_2, stddev):
+    peak_time_1, peak_time_2, stddev, isRoad=False):
     compose:
         tf1 = NormalTrafficFlow(num_vehicles, peak_time_1, stddev)
         tf2 = NormalTrafficFlow(num_vehicles, peak_time_2, stddev)
-        do TrafficStream(origin, destination, tf1), TrafficStream(destination, origin, tf2)
+        do TrafficStream(origin, destination, tf1, isRoad=isRoad), \
+            TrafficStream(destination, origin, tf2, isRoad=isRoad)

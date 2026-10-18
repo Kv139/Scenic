@@ -63,7 +63,10 @@ class METSRSimulation(Simulation):
             "destination": obj.destination,
         }
 
-        self.client.generate_trip(**call_kwargs)
+        if getattr(obj, "isRoad", False):
+            self.client.generate_trip_between_roads(**call_kwargs)
+        else:
+            self.client.generate_trip(**call_kwargs)
 
     def step(self):
         self.count += 1

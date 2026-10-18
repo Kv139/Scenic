@@ -1,3 +1,10 @@
+"""Vehicle arrival rates shared by zone and road traffic streams.
+
+The Scenic traffic-stream scenarios select endpoint interpretation with
+``isRoad=False`` (zone IDs) or ``isRoad=True`` (METS-R ``roadOrigID`` values).
+The rate calculations here are independent of that choice.
+"""
+
 from abc import abstractmethod
 import math
 
