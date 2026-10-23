@@ -128,6 +128,17 @@ def record_step_statistics(simulation):
         "bubble_actors": len(simulation.carla_actors),
         "bubble_queue": len(simulation.bubble_spawn_queue),
         "completed_routes": len(simulation.completed_route),
+        "road_population_scope": (
+            "pre_step_observed_scenic_objects" if getattr(
+                getattr(simulation, "_neighborhood_tracker", None), "has_background", False
+            ) else "all_scenic_objects"
+        ),
+        "completed_routes_scope": (
+            "observed_scenic_objects" if getattr(
+                getattr(simulation, "_neighborhood_tracker", None), "has_background", False
+            ) else "all_scenic_objects"
+        ),
+        "vehicle_count_scope": "registered_scenic_objects_minus_queue",
         **simulation.road_pop_density,
     }
     if simulation.count == 0:
@@ -273,7 +284,10 @@ def log_trip_times(simulation, file_name=None):
     trip_dict = {
         obj.name: (
             obj.finished_route - obj.trip_start
-            if hasattr(obj, "finished_route")
+            if hasattr(obj, "finished_route") and (
+                not getattr(obj, "cosim_background", False)
+                or obj in simulation.completed_route
+            )
             else None
         )
         for obj in simulation.objects[1:]
@@ -285,35 +299,46 @@ def log_trip_times(simulation, file_name=None):
 
 
 def check_client_synchronization(simulation, objs=None, expected=None):
-    """
-    Docstring for synchronize_clients
+    """Compare current CARLA-owned poses with their native mirrored positions.
 
-    :param obj: Cosimulation car object
-    :type obj: Scenic Object[s]
-
-    Default : updates all CoSimulated object states in the METSR simulator
-        (1) Can choose to specify which objects should be updated with obj arguement
+    Scenic property values can intentionally be held, including the previous
+    step's ego pose before the next Scenic property refresh. Read the
+    current CARLA pose instead. Native background and retired actors are excluded
+    even from an explicit object list; this diagnostic never queries the fleet.
     """
-    all_actors = simulation.objects if not objs else objs
+    owned = set(simulation.carla_actors)
+    candidates = list(simulation.carla_actors if objs is None else objs)
+    if expected is not None and len(expected) != len(candidates):
+        raise ValueError("Expected one diagnostic position per requested object")
+    positions = {}
+    for index, obj in enumerate(candidates):
+        if obj not in owned or obj in simulation.completed_route:
+            continue
+        actor = getattr(obj, "carlaActor", None)
+        if actor is None or not carla_actor_is_alive(actor):
+            continue
+        positions[obj] = (
+            expected[index] if expected is not None
+            else utils.carlaToScenicPosition(actor.get_location())
+        )
+    if not positions:
+        return
     all_veh_data = bridge_utils.collect_metsr_vehicle_data(
         simulation.metsr_client,
-        {obj: simulation.getMetsrPrivateVehId(obj) for obj in simulation.objects},
+        {obj: simulation.getMetsrPrivateVehId(obj) for obj in positions},
     )
-    for i, obj in enumerate(all_actors):
+    for obj, current_pos in positions.items():
         veh_data = all_veh_data[obj]
-        if expected:
-            expected_pos = expected[i]
-        else:
-            expected_pos = [veh_data["x"], veh_data["y"]]
-
-        if not math.isclose(obj.position.x, expected_pos[0]) or not math.isclose(
-            obj.position.y, expected_pos[1]
+        if not math.isclose(current_pos[0], veh_data["x"]) or not math.isclose(
+            current_pos[1], veh_data["y"]
         ):
             print(
-                f"Obj: {obj.name} on road: {bridge_utils.metsr_vehicle_road(veh_data)} is out of sync discrepancy is:"
+                f"Obj: {obj.name} on road: {bridge_utils.metsr_vehicle_road(veh_data)} "
+                "has a native/CARLA synchronization discrepancy:"
             )
             print(
-                f'(METSR : SCENIC) : x: {veh_data["x"], obj.position.x} y: {veh_data["y"], obj.position.y} z {veh_data["y"], obj.position.y}'
+                f'(METSR : CARLA) : x: {veh_data["x"], current_pos[0]} '
+                f'y: {veh_data["y"], current_pos[1]}'
             )
 
 

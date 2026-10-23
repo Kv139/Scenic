@@ -681,13 +681,22 @@ class Simulation(abc.ABC):
         """
         raise NotImplementedError
 
+    def objectsToUpdate(self):
+        """Objects whose dynamic properties should be read this step.
+
+        The default preserves full Scenic semantics. A backend may narrow this
+        only for explicitly opted-in passive objects, keeping the full object
+        registry for behaviors, cleanup, and native identity bookkeeping.
+        """
+        return self.objects
+
     def updateObjects(self):
         """Update the positions and other properties of objects from the simulation.
 
         Subclasses likely do not need to override this method: they should implement its
         subroutine `getProperties` below.
         """
-        for obj in self.objects:
+        for obj in self.objectsToUpdate():
             # Get latest values of dynamic properties from simulation and assign them
             dynTypes = obj._simulatorProvidedProperties
             properties = set(dynTypes)

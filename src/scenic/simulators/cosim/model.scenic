@@ -63,6 +63,14 @@ class Car(Vehicle):
     """
     blueprint: Uniform(*blueprints.carModels)
 
+    # Passive background traffic refreshes at background_tracking_hz. Default -1
+    # disables distant periodic/final refreshes; nearby actors refresh every step.
+    # Setup/new actors still get their first observation. All vehicles remain in
+    # records, with held-state timestamps/ages available from the simulation.
+    # Leave False for requirements/custom behaviors needing fresh distant state.
+    # Native motion is continuous. Replay requires matching frequency/inputs.
+    cosim_background: False
+
     origin: -1
     destination: -1
 

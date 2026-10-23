@@ -18,6 +18,9 @@ from scenic.domains.driving.simulators import DrivingSimulation, DrivingSimulato
 from scenic.simulators.carla import actor_utils, coordinate_utils
 from scenic.simulators.carla.global_route_planner import GlobalRoutePlanner
 from scenic.simulators.cosim import pcla_utils, runtime_utils
+from scenic.simulators.cosim.tracking import (
+    BackgroundRefreshSchedule, NeighborhoodTracker, neighborhood_keys,
+)
 from scenic.simulators.metsr import bridge_utils, network_utils, routing_utils
 from scenic.simulators.metsr.bridge_utils import METSRControlError, METSRCosimState
 from scenic.simulators.metsr.client import METSRClient
@@ -215,6 +218,10 @@ class CosimSimulation(DrivingSimulation):
         self.carla_client = carla_client
         self.metsr_client = metsr_client
         self.timestep = timestep  # Timestep for each step
+        self._background_refresh = BackgroundRefreshSchedule(
+            scene.params.get("background_tracking_hz", -1), timestep
+        )
+        self._pending_background_observation = None
         self.sim_ticks_per_carla = sim_ticks_per_carla
         self.sim_ticks_per_metsr = sim_ticks_per_metsr
         # Initializing CARLA params
@@ -241,6 +248,8 @@ class CosimSimulation(DrivingSimulation):
         self.bubble_roads = []
         self.workspace = scene.workspace
         self.bubble_spawn_queue = set()
+        self._neighborhood_tracker = NeighborhoodTracker()
+        self._boundary_vehicle_keys = set()
         self.metsr_actors = []
         self.carla_actors = []
         # Native METS-R vehicles represented as static CARLA obstacles. These
@@ -328,14 +337,10 @@ class CosimSimulation(DrivingSimulation):
 
         self.carla_world.tick()  ## allowing manualgearshift to take effect
 
-        # The core reads every object's properties immediately after setup,
-        # including native NPCs which have not reached the first step yet.
-        self.obj_data_cache = bridge_utils.collect_metsr_vehicle_data(
-            self.metsr_client,
-            {
-                obj: self.getMetsrPrivateVehId(obj)
-                for obj in self.metsr_actors + self.carla_actors
-            },
+        # Seed every currently tracked object's properties before the first
+        # Scenic update, including unmarked native scenario actors.
+        self.obj_data_cache = self._collect_tracked_vehicle_data(
+            force_all=True, observation_time_s=0.0
         )
 
         for obj in self.scene.objects:
@@ -549,7 +554,151 @@ class CosimSimulation(DrivingSimulation):
         if obj not in self.metsr_state.private_vehicle_ids:
             self.metsr_state.private_vehicle_ids[obj] = self.metsr_state.next_vehicle_id
             self.metsr_state.next_vehicle_id += 1
-        return self.metsr_state.private_vehicle_ids[obj]
+        vehicle_id = self.metsr_state.private_vehicle_ids[obj]
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        if tracker is not None:
+            tracker.register(obj, vehicle_id, ego=obj is getattr(self, "ego", None))
+        return vehicle_id
+
+    @property
+    def tracked_objects(self):
+        """All registered Scenic objects, including periodically refreshed traffic."""
+        return tuple(self.objects)
+
+    @property
+    def background_observation_times_s(self):
+        """Object-to-time mapping; None means no native observation has succeeded."""
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        observed = tracker.observation_times_s if tracker is not None else {}
+        return {obj: observed.get(obj) for obj in self.objects}
+
+    @property
+    def background_observation_ages_s(self):
+        now = self.currentTime * self.timestep
+        return {
+            obj: None if time_s is None else max(0.0, now - time_s)
+            for obj, time_s in self.background_observation_times_s.items()
+        }
+
+    def objectsToUpdate(self):
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        if tracker is None or not tracker.has_background:
+            return self.objects
+        return tracker.selected
+
+    def currentState(self):
+        # Every registered vehicle remains in every trajectory snapshot. Distant
+        # background values may be held; the observation-time records expose age.
+        return tuple(obj.position for obj in self.objects)
+
+    def updateObjects(self):
+        super().updateObjects()
+        pending = getattr(self, "_pending_background_observation", None)
+        if pending is None:
+            return
+        objects, time_s, full = pending
+        self._neighborhood_tracker.mark_updated(objects, time_s)
+        if full:
+            self._background_refresh.commit(time_s)
+        self._pending_background_observation = None
+        # Full background snapshots can reveal native completions away from the
+        # bubble. Absence from either neighborhood index never implies completion.
+        for obj in objects:
+            if obj is self.ego or obj in self.carla_actors:
+                continue
+            record = self.obj_data_cache[obj]
+            if (
+                bridge_utils.metsr_vehicle_road(record) is None
+                and record.get("queuedRoadId") is None
+            ):
+                self._commit_retirement(obj)
+
+    def _collect_tracked_vehicle_data(
+        self, *, before_step=False, force_all=False, observation_time_s=None
+    ):
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        schedule = getattr(self, "_background_refresh", None)
+        if observation_time_s is None:
+            observation_time_s = getattr(self, "currentTime", 0) * getattr(self, "timestep", 0.0)
+        if not before_step:
+            self._pending_background_observation = None
+        full = not before_step and (
+            force_all or schedule is not None and schedule.due(observation_time_s)
+        )
+        if tracker is not None and tracker.has_background:
+            if full:
+                objects = tracker.selected = tuple(self.objects)
+            else:
+                keys = neighborhood_keys(
+                    self.metsr_client.query_cosim_vehicle(), "coSimVehicle"
+                )
+                if before_step:
+                    # Already validated immediately before this call; METS-R
+                    # has not advanced since the boundary actor synchronization.
+                    keys.update(self._boundary_vehicle_keys)
+                else:
+                    keys.update(neighborhood_keys(
+                        self.metsr_client.query_boundary_vehicle(), "boundaryVehicle"
+                    ))
+                objects = tracker.select(
+                    keys, owned=self.carla_actors,
+                    pending_ids=self.metsr_state.admitted_vehicles,
+                    completed=self.completed_route,
+                )
+        elif before_step:
+            objects = dict.fromkeys((*self.objects[1:], *self.carla_actors))
+        else:
+            objects = self.metsr_actors + self.carla_actors
+            full = True
+        data = bridge_utils.collect_metsr_vehicle_data(
+            self.metsr_client,
+            {obj: self.getMetsrPrivateVehId(obj) for obj in objects},
+        )
+        if not before_step and tracker is not None and schedule is not None:
+            # A partial/failed batch never advances timestamps or the schedule.
+            self._pending_background_observation = (tuple(objects), observation_time_s, full)
+        return data
+
+    def _run(self, dynamicScenario, maxSteps):
+        termination = super()._run(dynamicScenario, maxSteps)
+        # Only normal termination reaches this point. Failures/cancellation retain
+        # the original exception and their last successful observation timestamps.
+        self._record_final_background_observation()
+        return termination
+
+    def _record_final_background_observation(self):
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        if tracker is None:
+            return
+        now = self.currentTime * self.timestep
+        refresh_final = self._background_refresh.enabled
+        if refresh_final:
+            self.obj_data_cache = self._collect_tracked_vehicle_data(
+                force_all=True, observation_time_s=now
+            )
+            self.updateObjects()
+        # Disabled background observation keeps held values at termination too;
+        # timestamps/ages describe them without issuing a hidden full-fleet query.
+        ids = {obj: str(self.getMetsrPrivateVehId(obj)) for obj in self.objects}
+        final_observation = {
+            "time_s": now,
+            "background_tracking_hz": self._background_refresh.hz,
+            "full_refresh": refresh_final,
+            "names": {ids[obj]: getattr(obj, "name", ids[obj]) for obj in self.objects},
+            "positions": {ids[obj]: tuple(obj.position) for obj in self.objects},
+            "velocities": {ids[obj]: tuple(obj.velocity) for obj in self.objects},
+            "last_update_times_s": {
+                ids[obj]: tracker.observation_times_s.get(obj) for obj in self.objects
+            },
+            "last_update_ages_s": {
+                ids[obj]: age for obj, age in self.background_observation_ages_s.items()
+            },
+        }
+        # Match the existing time-series CSV exporter; a bare mapping would be
+        # expanded into unrelated DataFrame rows and lose its field labels.
+        self.records["background_final_observation"] = [(self.currentTime, final_observation)]
+        if self.trajectory:
+            self.trajectory[-1] = self.currentState()
 
     def tick_carla(self) -> None:
         """Advance CARLA and retire admission seeds after its first snapshot."""
@@ -565,19 +714,25 @@ class CosimSimulation(DrivingSimulation):
         batched vehicle query supplies the current pose. Obstacles stay fixed
         throughout all CARLA substeps.
         """
-        scenic_objects = {
-            (True, str(vehicle_id)): obj
-            for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
-        }
+        tracker = getattr(self, "_neighborhood_tracker", None)
+        scenic_objects = (
+            tracker.objects_by_key if tracker is not None else {
+                (True, str(vehicle_id)): obj
+                for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
+            }
+        )
         states = bridge_utils.native_boundary_states(
             self.metsr_client,
             self.metsr_state,
             {
-                vehicle_id
-                for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
+                self.getMetsrPrivateVehId(obj)
+                for obj in self.carla_actors
                 if getattr(obj, "carlaActor", None) is not None
             },
         )
+        # Excluded boundary records are either owned by CARLA or in the co-sim
+        # index, both selected independently by the tracking snapshot.
+        self._boundary_vehicle_keys = set(states)
         # Validate every pose before changing obstacle membership.
         for key, state in states.items():
             runtime_utils.boundary_vehicle_transform(self, state, scenic_objects.get(key))
@@ -653,11 +808,7 @@ class CosimSimulation(DrivingSimulation):
         # METS-R. This removes the stale-snapshot boundary heuristic.
         # METS-R has not advanced between promotion and CARLA publication, so
         # one batched snapshot can serve promotion and synchronization.
-        state_objects = list(dict.fromkeys((*self.objects[1:], *self.carla_actors)))
-        step_vehicle_data = bridge_utils.collect_metsr_vehicle_data(
-            self.metsr_client,
-            {obj: self.getMetsrPrivateVehId(obj) for obj in state_objects},
-        )
+        step_vehicle_data = self._collect_tracked_vehicle_data(before_step=True)
         self.update_bubble_objects(vehicle_data=step_vehicle_data)
 
         self._refresh_carla_destination_paths(step_vehicle_data)
@@ -670,12 +821,9 @@ class CosimSimulation(DrivingSimulation):
         if releasable_roads:
             self.release_roads(releasable_roads, allow_defer=True)
         self.tick_metsr()
-        self.obj_data_cache = bridge_utils.collect_metsr_vehicle_data(
-            self.metsr_client,
-            {
-                obj: self.getMetsrPrivateVehId(obj)
-                for obj in self.metsr_actors + self.carla_actors
-            },
+        self.obj_data_cache = self._collect_tracked_vehicle_data(
+            observation_time_s=(getattr(self, "currentTime", self.count) + 1)
+            * getattr(self, "timestep", 0.0)
         )
 
         if self.render and self.count % self.metsr_render_freq == 0:
@@ -733,8 +881,8 @@ class CosimSimulation(DrivingSimulation):
             self.metsr_state,
             self.count,
             {
-                vehicle_id
-                for obj, vehicle_id in self.metsr_state.private_vehicle_ids.items()
+                self.getMetsrPrivateVehId(obj)
+                for obj in self.carla_actors
                 if getattr(obj, "carla_actor_flag", False)
             },
         )
@@ -958,15 +1106,11 @@ class CosimSimulation(DrivingSimulation):
         all_veh_data = (
             vehicle_data
             if vehicle_data is not None
-            else bridge_utils.collect_metsr_vehicle_data(
-                self.metsr_client,
-                {obj: self.getMetsrPrivateVehId(obj) for obj in self.objects[1:]},
-            )
+            else self._collect_tracked_vehicle_data(before_step=True)
         )
-        for obj in self.objects[1:]:
-            if obj in self.completed_route:
+        for obj, veh_data in all_veh_data.items():
+            if obj is self.ego or obj in self.completed_route:
                 continue
-            veh_data = all_veh_data[obj]
             metsr_road = bridge_utils.metsr_vehicle_road(veh_data)
             if metsr_road is not None:
                 self.road_pop_density[metsr_road] += 1
